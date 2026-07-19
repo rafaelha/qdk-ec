@@ -524,6 +524,40 @@ impl JitController {
         coordinator.wait_for_detectors(gid).await
     }
 
+    pub async fn drain_dem(&self) -> crate::coordinator::dem::DemDrain {
+        let coordinator_guard = self.coordinator.read().await;
+        match coordinator_guard.as_ref() {
+            Some(coordinator) => coordinator.drain_dem(false).await,
+            None => Default::default(),
+        }
+    }
+
+    pub async fn drain_dem_predictions(&self) -> Vec<crate::coordinator::dem::DemPrediction> {
+        let coordinator_guard = self.coordinator.read().await;
+        match coordinator_guard.as_ref() {
+            Some(coordinator) => coordinator.drain_dem_predictions(),
+            None => vec![],
+        }
+    }
+
+    pub async fn drain_dem_predictions_for(&self, gid: u64) -> Vec<crate::coordinator::dem::DemPrediction> {
+        let coordinator_guard = self.coordinator.read().await;
+        match coordinator_guard.as_ref() {
+            Some(coordinator) => coordinator.drain_dem_predictions_for(gid),
+            None => vec![],
+        }
+    }
+
+    /// Final DEM drain. Only call after the walk and all decodes have completed.
+    pub async fn dem_flush(&self) -> crate::coordinator::dem::DemDrain {
+        self.task_counter.wait_for_zero().await;
+        let coordinator_guard = self.coordinator.read().await;
+        match coordinator_guard.as_ref() {
+            Some(coordinator) => coordinator.drain_dem(true).await,
+            None => Default::default(),
+        }
+    }
+
     /// Fire the cancellation token to abort any pending error-model loads and
     /// in-flight decodes. Used by [`crate::server::LocalServer::shutdown`] to
     /// propagate runtime shutdown into the service layer. Unlike [`Self::reset`],

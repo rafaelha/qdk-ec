@@ -90,6 +90,9 @@ pub use decoder_cache_key::{
     DecoderCacheKey, ErrorModelFingerprint, FingerprintSource, ProbabilityModifierBits, build_modifier_fingerprints,
 };
 
+pub mod dem;
+pub use dem::{DemDetectorGroup, DemDrain, DemEdge, DemLog, DemPrediction};
+
 impl CoordinatorType {
     pub fn create(&self, config: serde_json::Value, black_box_decoder: Option<BlackBoxDecoderClient>) -> DynCoordinator {
         match self {
@@ -312,6 +315,57 @@ impl CoordinatorClient {
             apply_loss_random_imputation(bits, &mask, &mut *rng);
         }
     }
+
+    /// Enable/disable DEM recording on the target coordinator. The server
+    /// starts disabled; the playground turns it on per replay shot. Only the
+    /// real coordinators (monolithic/window) own a DEM log — the other Local
+    /// arms are no-ops. The Remote arm's gRPC wiring lands in Task 8.
+    pub fn set_dem_enabled(&self, enabled: bool) {
+        match self {
+            #[cfg(feature = "cli")]
+            CoordinatorClient::Remote(_) => {} // TODO(task-8): SetDemEnabled RPC
+            CoordinatorClient::Local(DynCoordinator::Monolithic(c)) => c.set_dem_enabled(enabled),
+            CoordinatorClient::Local(DynCoordinator::Window(c)) => c.set_dem_enabled(enabled),
+            CoordinatorClient::Local(_) => {}
+        }
+    }
+
+    /// Drain DEM growth increments. `final_flush` waits for expansion tasks and
+    /// should only be used after all decodes have completed. Only the
+    /// monolithic/window coordinators record DEM; the other Local arms return an
+    /// empty drain. The Remote arm's gRPC wiring lands in Task 8.
+    pub async fn drain_dem(&self, final_flush: bool) -> dem::DemDrain {
+        match self {
+            #[cfg(feature = "cli")]
+            CoordinatorClient::Remote(_) => dem::DemDrain::default(), // TODO(task-8): DrainDem RPC
+            CoordinatorClient::Local(DynCoordinator::Monolithic(c)) => c.drain_dem(final_flush).await,
+            CoordinatorClient::Local(DynCoordinator::Window(c)) => c.drain_dem(final_flush).await,
+            CoordinatorClient::Local(_) => dem::DemDrain::default(),
+        }
+    }
+
+    /// Drain every queued DEM prediction. Intended for final leftover flushes.
+    pub fn drain_dem_predictions(&self) -> Vec<dem::DemPrediction> {
+        match self {
+            #[cfg(feature = "cli")]
+            CoordinatorClient::Remote(_) => Vec::new(), // TODO(task-8): DrainDemPredictions RPC
+            CoordinatorClient::Local(DynCoordinator::Monolithic(c)) => c.drain_dem_predictions(),
+            CoordinatorClient::Local(DynCoordinator::Window(c)) => c.drain_dem_predictions(),
+            CoordinatorClient::Local(_) => Vec::new(),
+        }
+    }
+
+    /// Drain only predictions produced for one decoded gadget, preserving other
+    /// queued predictions for their owning decode task.
+    pub fn drain_dem_predictions_for(&self, gid: u64) -> Vec<dem::DemPrediction> {
+        match self {
+            #[cfg(feature = "cli")]
+            CoordinatorClient::Remote(_) => Vec::new(), // TODO(task-8): DrainDemPredictionsFor RPC
+            CoordinatorClient::Local(DynCoordinator::Monolithic(c)) => c.drain_dem_predictions_for(gid),
+            CoordinatorClient::Local(DynCoordinator::Window(c)) => c.drain_dem_predictions_for(gid),
+            CoordinatorClient::Local(_) => Vec::new(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -502,5 +556,116 @@ mod tests {
             BitVector { size: 8, data: vec![0] },
             "disabled imputation leaves outcome bits untouched",
         );
+    }
+
+    // ─── DEM client passthroughs (ported from fork DEM family) ───────────
+
+    fn mock_decoder_client() -> BlackBoxDecoderClient {
+        BlackBoxDecoderClient::from_mock(Arc::new(crate::decoder::MockDecoder::new()))
+    }
+
+    /// All Local arms the client can dispatch DEM drains over. The two real
+    /// coordinators own a DemLog; naive/mock do not (client returns defaults).
+    fn client_arms() -> Vec<CoordinatorClient> {
+        vec![
+            CoordinatorClient::Local(DynCoordinator::Monolithic(Arc::new(MonolithicCoordinator::new(
+                serde_json::json!({}),
+                mock_decoder_client(),
+            )))),
+            CoordinatorClient::Local(DynCoordinator::Window(Arc::new(WindowCoordinator::new(
+                serde_json::json!({}),
+                mock_decoder_client(),
+            )))),
+            CoordinatorClient::Local(DynCoordinator::Naive(Arc::new(NaiveCoordinator::new(serde_json::json!({
+                "disable_random_readouts": true
+            }))))),
+        ]
+    }
+
+    /// The two real coordinators paired with their DemLog handle (enabled for
+    /// the test, since the server default is disabled).
+    fn prediction_client_arms() -> Vec<(CoordinatorClient, Arc<DemLog>)> {
+        let monolithic = Arc::new(MonolithicCoordinator::new(serde_json::json!({}), mock_decoder_client()));
+        let window = Arc::new(WindowCoordinator::new(serde_json::json!({}), mock_decoder_client()));
+        monolithic.dem_log.set_enabled(true);
+        window.dem_log.set_enabled(true);
+        vec![
+            (
+                CoordinatorClient::Local(DynCoordinator::Monolithic(monolithic.clone())),
+                monolithic.dem_log.clone(),
+            ),
+            (
+                CoordinatorClient::Local(DynCoordinator::Window(window.clone())),
+                window.dem_log.clone(),
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn dem_drain_passthroughs_dispatch_all_coordinator_arms() {
+        for client in client_arms() {
+            assert_eq!(client.drain_dem(false).await, DemDrain::default());
+            assert!(client.drain_dem_predictions().is_empty());
+            assert!(client.drain_dem_predictions_for(42).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn dem_prediction_drain_passthroughs_dispatch_non_empty_real_coordinators() {
+        for (client, dem_log) in prediction_client_arms() {
+            dem_log.push_prediction(DemPrediction {
+                gid: 7,
+                fired: vec![(70, 0)],
+                fired_buffer: vec![],
+                flips: vec![],
+                ..Default::default()
+            });
+            dem_log.push_prediction(DemPrediction {
+                gid: 8,
+                fired: vec![(80, 1)],
+                fired_buffer: vec![],
+                flips: vec![],
+                ..Default::default()
+            });
+
+            assert_eq!(
+                client.drain_dem_predictions_for(7),
+                vec![DemPrediction {
+                    gid: 7,
+                    seq: 0,
+                    fired: vec![(70, 0)],
+                    fired_buffer: vec![],
+                    flips: vec![],
+                    ..Default::default()
+                }]
+            );
+            assert_eq!(
+                client.drain_dem_predictions(),
+                vec![DemPrediction {
+                    gid: 8,
+                    seq: 1,
+                    fired: vec![(80, 1)],
+                    fired_buffer: vec![],
+                    flips: vec![],
+                    ..Default::default()
+                }]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn jit_controller_dem_passthroughs_dispatch_to_naive_coordinator() {
+        let controller =
+            crate::controller::jit_controller::JitController::new_from_library(crate::jit::JitLibrary::default(), true);
+        controller
+            .start(CoordinatorClient::Local(DynCoordinator::Naive(Arc::new(
+                NaiveCoordinator::new(serde_json::json!({ "disable_random_readouts": true })),
+            ))))
+            .await;
+
+        assert_eq!(controller.drain_dem().await, DemDrain::default());
+        assert!(controller.drain_dem_predictions().await.is_empty());
+        assert!(controller.drain_dem_predictions_for(42).await.is_empty());
+        assert_eq!(controller.dem_flush().await, DemDrain::default());
     }
 }
