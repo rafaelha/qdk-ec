@@ -166,12 +166,15 @@ pub struct Gadget {
     pub binding_cid: watch::Sender<Option<u64>>,
     /// the peer gadgets' gid connected to each output port
     pub outputs: Vec<watch::Sender<Option<bin::gadget::Connector>>>,
-    /// oneshot channel to send over the readout values; note that only the last
-    /// loaded gadget is responsible for running the actual decoding, while the rest
-    /// of them simply listen to the receiver channel,
-    pub tx: oneshot::Sender<BitVector>,
+    /// oneshot channel to send over the `(readouts, detectors)` values; note that
+    /// only the last loaded gadget is responsible for running the actual decoding,
+    /// while the rest of them simply listen to the receiver channel. Detectors ride
+    /// this channel (computed by `decode_subgraph` while the subgraph state is still
+    /// alive) because `take_subgraph` drains the gadgets/check_models out of `self`
+    /// before `decode` returns — so `decode` can no longer compute them itself.
+    pub tx: oneshot::Sender<(BitVector, BitVector)>,
     /// the receiver of the channel will be taken out by the async task
-    pub rx: Option<oneshot::Receiver<BitVector>>,
+    pub rx: Option<oneshot::Receiver<(BitVector, BitVector)>>,
 }
 
 pub struct CheckModel {
@@ -449,10 +452,77 @@ impl MonolithicCoordinator {
             .update_pauli_frame(&parity_factor, &errors, &relative_program, &mapping, &error_models)
             .await;
 
+        // Compute detectors for every gadget while the subgraph state is still
+        // alive. `decode` used to compute these itself after `rx.await`, but by then
+        // `take_subgraph` has removed the gadgets/check_models from `self`, so the
+        // lookup found nothing and every detector bus came back empty (the DEM view
+        // then left every detector node "unmeasured"). They ride the readout channel
+        // instead. Detectors are a pure function of the loaded outcomes.
+        let mut detectors_of: HashMap<u64, BitVector> = HashMap::new();
+        for &gid in gid_vec.iter() {
+            let detectors = self.get_gadget_detectors(gid, &gadgets, &check_models).await;
+            detectors_of.insert(gid, detectors);
+        }
+
         for (gid, readouts) in updates {
             let gadget = gadgets.remove(&gid).unwrap();
-            let _ = gadget.tx.send(readouts);
+            let detectors = detectors_of
+                .remove(&gid)
+                .unwrap_or_else(|| bit_vector::from_sparse_indices(0, &[]));
+            let _ = gadget.tx.send((readouts, detectors));
         }
+    }
+
+    /// Compute one gadget's finished-detector bits from its bound check model,
+    /// reusing the same defect computation as `get_syndrome` but for a single
+    /// check model indexed from 0. Returns an empty `BitVector` if the gadget has
+    /// no bound check model or its check model defines no checks.
+    async fn get_gadget_detectors(
+        &self,
+        gid: u64,
+        gadgets: &HashMap<u64, Gadget>,
+        check_models: &HashMap<u64, CheckModel>,
+    ) -> BitVector {
+        let gadget = match gadgets.get(&gid) {
+            Some(g) => g,
+            None => return bit_vector::from_sparse_indices(0, &[]),
+        };
+        let cid = match *gadget.binding_cid.borrow() {
+            Some(cid) => cid,
+            None => return bit_vector::from_sparse_indices(0, &[]),
+        };
+        let check_model = match check_models.get(&cid) {
+            Some(cm) => cm,
+            None => return bit_vector::from_sparse_indices(0, &[]),
+        };
+        let check_model_types = self.check_model_types.read().await;
+        let check_model_type = check_model_types.get(&check_model.instance.ctype).unwrap();
+        let n = check_model_type.checks.len();
+        let mut detectors = bit_vector::from_sparse_indices(n as u64, &[]);
+        let expanded_remote_ref = check_model.expanded_remote_gadgets.borrow();
+        let expanded_remotes = expanded_remote_ref.as_ref();
+        let local_outcomes = gadget.outcomes.as_ref().unwrap();
+        for (check_index, check) in check_model_type.checks.iter().enumerate() {
+            let mut is_defect = check.naturally_flipped;
+            for measurement in &check.measurements {
+                if let Some(ri) = measurement.remote_gadget {
+                    let remote_gid = expanded_remotes.unwrap()[ri as usize].unwrap();
+                    let remote_gadget = gadgets.get(&remote_gid).unwrap();
+                    is_defect ^= get_bit(
+                        remote_gadget.outcomes.as_ref().unwrap(),
+                        measurement.measurement_index
+                            + check_model.modified_remote_gadgets[ri as usize]
+                                .as_ref()
+                                .unwrap()
+                                .measurement_bias,
+                    );
+                } else {
+                    is_defect ^= get_bit(local_outcomes, measurement.measurement_index);
+                }
+            }
+            set_bit(&mut detectors, check_index as u64, is_defect);
+        }
+        detectors
     }
 
     async fn update_pauli_frame(
@@ -1292,10 +1362,15 @@ impl coordinator::coordinator_server::Coordinator for MonolithicCoordinator {
             // and inform all other async tasks
             self.decode_subgraph(gid).await;
         }
-        let readouts = rx.await.map_err(|_| Status::internal(format!("gid={} receive error", gid)))?;
+        // Detectors ride the readout channel: `decode_subgraph` computed them while
+        // the subgraph gadgets/check_models were still resident. Re-reading them from
+        // `self` here would find nothing, because `take_subgraph` (invoked by the
+        // final gadget's `decode_subgraph`) has already drained them out.
+        let (readouts, detectors) = rx.await.map_err(|_| Status::internal(format!("gid={} receive error", gid)))?;
         return Ok((coordinator::Readouts {
             gid,
             readouts: Some(readouts),
+            detectors: Some(detectors),
             ..Default::default()
         })
         .into());
@@ -1548,5 +1623,201 @@ mod tests {
         let fps_a = build_modifier_fingerprints(&mapping, &models_a, &emts);
         let fps_b = build_modifier_fingerprints(&mapping, &models_b, &emts);
         assert_eq!(fps_a, fps_b);
+    }
+
+    // ─── get_gadget_detectors ────────────────────────────────────────────
+    //
+    // `get_gadget_detectors` mirrors the per-check defect computation in
+    // `get_syndrome`, but for a single gadget's bound check model indexed from
+    // 0. These tests pin down that the detector bits it produces match the
+    // corresponding slice of the full syndrome.
+    use crate::bin::check_model_type::{Check, RemoteGadget, RemoteMeasurement};
+
+    /// Build a `CheckModelType` whose checks are pure local-measurement parities.
+    /// Each entry of `checks` is the list of local measurement indices XORed
+    /// together for that check.
+    fn local_check_model_type(ctype: u64, checks: &[&[u64]]) -> bin::CheckModelType {
+        bin::CheckModelType {
+            ctype,
+            checks: checks
+                .iter()
+                .map(|measurement_indices| Check {
+                    measurements: measurement_indices
+                        .iter()
+                        .map(|&measurement_index| RemoteMeasurement {
+                            remote_gadget: None,
+                            measurement_index,
+                        })
+                        .collect(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Construct a local `Gadget` carrying the given outcome bits.
+    fn gadget_with_outcomes(gid: u64, gtype: u64, binding_cid: Option<u64>, outcomes: BitVector) -> Gadget {
+        let (tx, rx) = oneshot::channel();
+        Gadget {
+            instance: bin::Gadget {
+                gid,
+                gtype,
+                ..Default::default()
+            },
+            outcomes: Some(outcomes),
+            binding_cid: watch::channel(binding_cid).0,
+            outputs: vec![],
+            tx,
+            rx: Some(rx),
+        }
+    }
+
+    /// Construct a local `CheckModel` bound to `gid`/`ctype` with no remotes.
+    fn local_check_model(cid: u64, ctype: u64, gid: u64) -> CheckModel {
+        CheckModel {
+            instance: bin::CheckModel {
+                cid,
+                ctype,
+                gid,
+                ..Default::default()
+            },
+            attaching_eid_vec: vec![],
+            modified_remote_gadgets: Arc::new(vec![]),
+            expanded_remote_gadgets: watch::channel(Some(vec![])).0,
+        }
+    }
+
+    #[tokio::test]
+    async fn gadget_detectors_match_syndrome_slice() {
+        // ctype=10: two finished checks over local measurements [0,1] and [1,2].
+        let ctype = 10;
+        let coordinator = MonolithicCoordinator::new(
+            serde_json::json!({}),
+            BlackBoxDecoderClient::from_mock(Arc::new(crate::decoder::MockDecoder::new())),
+        );
+        coordinator
+            .check_model_types
+            .write()
+            .await
+            .insert(ctype, Arc::new(local_check_model_type(ctype, &[&[0, 1], &[1, 2]])));
+
+        // outcomes = 0b110 (bit0=0, bit1=1, bit2=1): m0^m1 = 1, m1^m2 = 0.
+        let gid = 1;
+        let cid = 1;
+        let outcomes = bit_vector::from_sparse_indices(3, &[1, 2]);
+        let mut gadgets: HashMap<u64, Gadget> = HashMap::new();
+        gadgets.insert(gid, gadget_with_outcomes(gid, /* gtype */ 0, Some(cid), outcomes));
+        let mut check_models: HashMap<u64, CheckModel> = HashMap::new();
+        check_models.insert(cid, local_check_model(cid, ctype, gid));
+
+        let detectors = coordinator.get_gadget_detectors(gid, &gadgets, &check_models).await;
+        assert_eq!(detectors.size, 2);
+        assert_eq!(bit_vector::to_sparse_indices(&detectors), vec![0]);
+    }
+
+    #[tokio::test]
+    async fn gadget_detectors_empty_when_no_binding() {
+        // A gadget with no bound check model yields a zero-length detector vector.
+        let coordinator = MonolithicCoordinator::new(
+            serde_json::json!({}),
+            BlackBoxDecoderClient::from_mock(Arc::new(crate::decoder::MockDecoder::new())),
+        );
+        let gid = 1;
+        let mut gadgets: HashMap<u64, Gadget> = HashMap::new();
+        gadgets.insert(
+            gid,
+            gadget_with_outcomes(
+                gid,
+                /* gtype */ 0,
+                /* binding_cid */ None,
+                bit_vector::from_sparse_indices(2, &[0]),
+            ),
+        );
+        let check_models: HashMap<u64, CheckModel> = HashMap::new();
+
+        let detectors = coordinator.get_gadget_detectors(gid, &gadgets, &check_models).await;
+        assert_eq!(detectors.size, 0);
+    }
+
+    #[tokio::test]
+    async fn gadget_detectors_use_remote_measurement_with_bias() {
+        // ctype=20: one finished check mixing a local measurement (index 0) and a
+        // remote measurement (remote_gadget index 0, measurement_index 1) whose
+        // remote gadget carries measurement_bias=2, so the remote bit actually
+        // read is index 1+2=3.
+        let ctype = 20;
+        let coordinator = MonolithicCoordinator::new(
+            serde_json::json!({}),
+            BlackBoxDecoderClient::from_mock(Arc::new(crate::decoder::MockDecoder::new())),
+        );
+        let check_model_type = bin::CheckModelType {
+            ctype,
+            checks: vec![Check {
+                measurements: vec![
+                    RemoteMeasurement {
+                        remote_gadget: None,
+                        measurement_index: 0,
+                    },
+                    RemoteMeasurement {
+                        remote_gadget: Some(0),
+                        measurement_index: 1,
+                    },
+                ],
+                naturally_flipped: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        coordinator
+            .check_model_types
+            .write()
+            .await
+            .insert(ctype, Arc::new(check_model_type));
+
+        let gid = 1;
+        let cid = 1;
+        let remote_gid = 2;
+        // local outcomes: bit 0 set → local term = 1.
+        let local_outcomes = bit_vector::from_sparse_indices(1, &[0]);
+        // remote outcomes: bit 1 set, bit 3 clear. With bias=2 the check reads
+        // bit 3 (=0), NOT bit 1 (=1) — so a bug ignoring the bias would flip the
+        // result. Expected: 0 (naturally_flipped) ^ 1 (local) ^ 0 (remote) = 1.
+        let remote_outcomes = bit_vector::from_sparse_indices(4, &[1]);
+
+        let mut gadgets: HashMap<u64, Gadget> = HashMap::new();
+        gadgets.insert(gid, gadget_with_outcomes(gid, /* gtype */ 0, Some(cid), local_outcomes));
+        gadgets.insert(
+            remote_gid,
+            gadget_with_outcomes(remote_gid, /* gtype */ 0, None, remote_outcomes),
+        );
+
+        let mut check_models: HashMap<u64, CheckModel> = HashMap::new();
+        check_models.insert(
+            cid,
+            CheckModel {
+                instance: bin::CheckModel {
+                    cid,
+                    ctype,
+                    gid,
+                    ..Default::default()
+                },
+                attaching_eid_vec: vec![],
+                modified_remote_gadgets: Arc::new(vec![Some(RemoteGadget {
+                    measurement_bias: 2,
+                    ..Default::default()
+                })]),
+                expanded_remote_gadgets: watch::channel(Some(vec![Some(remote_gid)])).0,
+            },
+        );
+
+        // Sanity: confirm the bias is load-bearing for this fixture.
+        assert_eq!(get_bit(&gadgets[&remote_gid].outcomes.as_ref().unwrap().clone(), 3), false);
+        assert_eq!(get_bit(&gadgets[&remote_gid].outcomes.as_ref().unwrap().clone(), 1), true);
+
+        let detectors = coordinator.get_gadget_detectors(gid, &gadgets, &check_models).await;
+        assert_eq!(detectors.size, 1);
+        // 0 ^ local(1) ^ remote@3(0) = 1.
+        assert_eq!(bit_vector::to_sparse_indices(&detectors), vec![0]);
     }
 }

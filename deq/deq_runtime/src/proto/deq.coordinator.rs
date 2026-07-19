@@ -73,6 +73,10 @@ pub struct Readouts {
     /// the number of readouts in the gadget
     #[prost(double, repeated, tag = "3")]
     pub probabilities: ::prost::alloc::vec::Vec<f64>,
+    /// the gadget's finished-detector parities (its check-model syndrome),
+    /// populated by Decode and WaitForDetectors
+    #[prost(message, optional, tag = "4")]
+    pub detectors: ::core::option::Option<super::util::BitVector>,
 }
 /// Generated client implementations.
 #[cfg(feature = "cli")]

@@ -85,4 +85,7 @@ message Readouts {
   // of a logical readout being wrong; if provided, the length must be equal to
   // the number of readouts in the gadget
   repeated double probabilities = 3;
+  // the gadget's finished-detector parities (its check-model syndrome),
+  // populated by Decode and WaitForDetectors
+  deq.util.BitVector detectors = 4;
 }

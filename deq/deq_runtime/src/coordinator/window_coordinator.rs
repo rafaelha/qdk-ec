@@ -457,12 +457,69 @@ impl WindowCoordinator {
             Err(handle) => handle.await.unwrap_or(None),
         }
         .ok_or_else(|| Status::cancelled("decode cancelled by reset"))?;
+        let detectors = {
+            let gadgets = self.gadgets.read().await;
+            let check_models = self.check_models.read().await;
+            self.get_gadget_detectors(gid, &gadgets, &check_models).await
+        };
         Ok((coordinator::Readouts {
             gid,
             readouts: Some(readouts),
+            detectors: Some(detectors),
             ..Default::default()
         })
         .into())
+    }
+
+    /// Compute one gadget's finished-detector bits from its bound check model,
+    /// reusing the same defect computation as the window syndrome pass but for a
+    /// single check model indexed from 0. Returns an empty `BitVector` if the
+    /// gadget has no bound check model or its check model defines no checks.
+    async fn get_gadget_detectors(
+        &self,
+        gid: u64,
+        gadgets: &HashMap<u64, Gadget>,
+        check_models: &HashMap<u64, CheckModel>,
+    ) -> BitVector {
+        let gadget = match gadgets.get(&gid) {
+            Some(g) => g,
+            None => return bit_vector::from_sparse_indices(0, &[]),
+        };
+        let cid = match gadget.binding_cid {
+            Some(cid) => cid,
+            None => return bit_vector::from_sparse_indices(0, &[]),
+        };
+        let check_model = match check_models.get(&cid) {
+            Some(cm) => cm,
+            None => return bit_vector::from_sparse_indices(0, &[]),
+        };
+        let check_model_types = self.check_model_types.read().await;
+        let check_model_type = check_model_types.get(&check_model.instance.ctype).unwrap();
+        let n = check_model_type.checks.len();
+        let mut detectors = bit_vector::from_sparse_indices(n as u64, &[]);
+        let expanded_remotes = check_model.expanded_remote_gadgets.as_ref();
+        let local_outcomes = gadget.outcomes.borrow().clone().unwrap();
+        for (check_index, check) in check_model_type.checks.iter().enumerate() {
+            let mut is_defect = check.naturally_flipped;
+            for measurement in &check.measurements {
+                if let Some(ri) = measurement.remote_gadget {
+                    let remote_gid = expanded_remotes.unwrap()[ri as usize].unwrap();
+                    let remote_gadget = gadgets.get(&remote_gid).unwrap();
+                    is_defect ^= get_bit(
+                        remote_gadget.outcomes.borrow().as_ref().unwrap(),
+                        measurement.measurement_index
+                            + check_model.modified_remote_gadgets[ri as usize]
+                                .as_ref()
+                                .unwrap()
+                                .measurement_bias,
+                    );
+                } else {
+                    is_defect ^= get_bit(&local_outcomes, measurement.measurement_index);
+                }
+            }
+            set_bit(&mut detectors, check_index as u64, is_defect);
+        }
+        detectors
     }
 
     // ────────────────────────────────────────────────────────────────────────
@@ -3074,5 +3131,115 @@ mod tests {
             committing_local_cids: committing_local_cids_sorted(&[10, 20].into_iter().collect(), &mapping),
         };
         assert_ne!(k_all, k_partial);
+    }
+
+    // ─── get_gadget_detectors ────────────────────────────────────────────
+
+    /// Build a `CheckModelType` whose checks are pure local-measurement parities.
+    fn local_check_model_type(ctype: u64, checks: &[&[u64]]) -> bin::CheckModelType {
+        use bin::check_model_type::{Check, RemoteMeasurement};
+        bin::CheckModelType {
+            ctype,
+            checks: checks
+                .iter()
+                .map(|measurement_indices| Check {
+                    measurements: measurement_indices
+                        .iter()
+                        .map(|&measurement_index| RemoteMeasurement {
+                            remote_gadget: None,
+                            measurement_index,
+                        })
+                        .collect(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Construct a window `Gadget` carrying the given outcome bits.
+    fn gadget_with_outcomes(gid: u64, gtype: u64, binding_cid: Option<u64>, outcomes: Option<BitVector>) -> Gadget {
+        Gadget {
+            instance: bin::Gadget {
+                gid,
+                gtype,
+                ..Default::default()
+            },
+            outcomes: watch::channel(outcomes).0,
+            binding_cid,
+            outputs: vec![],
+            pauli_frame: watch::channel(None).0,
+            is_free_hop: false,
+            state: watch::channel(GadgetState::Uncommitted).0,
+        }
+    }
+
+    /// Construct a window `CheckModel` bound to `gid`/`ctype` with no remotes.
+    fn local_check_model(cid: u64, ctype: u64, gid: u64) -> CheckModel {
+        CheckModel {
+            instance: bin::CheckModel {
+                cid,
+                ctype,
+                gid,
+                ..Default::default()
+            },
+            attaching_eid_vec: vec![],
+            modified_remote_gadgets: Arc::new(vec![]),
+            expanded_remote_gadgets: Some(vec![]),
+            syndrome: watch::channel(None).0,
+            referring_eids: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn gadget_detectors_match_syndrome_slice() {
+        // ctype=10: two finished checks over local measurements [0,1] and [1,2].
+        let ctype = 10;
+        let coordinator = WindowCoordinator::new(
+            serde_json::json!({ "buffer_radius": 0 }),
+            BlackBoxDecoderClient::from_mock(Arc::new(crate::decoder::MockDecoder::new())),
+        );
+        coordinator
+            .check_model_types
+            .write()
+            .await
+            .insert(ctype, Arc::new(local_check_model_type(ctype, &[&[0, 1], &[1, 2]])));
+
+        // outcomes = 0b110 (bit0=0, bit1=1, bit2=1): m0^m1 = 1, m1^m2 = 0.
+        let gid = 1;
+        let cid = 1;
+        let outcomes = bit_vector::from_sparse_indices(3, &[1, 2]);
+        let mut gadgets: HashMap<u64, Gadget> = HashMap::new();
+        gadgets.insert(gid, gadget_with_outcomes(gid, /* gtype */ 0, Some(cid), Some(outcomes)));
+        let mut check_models: HashMap<u64, CheckModel> = HashMap::new();
+        check_models.insert(cid, local_check_model(cid, ctype, gid));
+
+        let detectors = coordinator.get_gadget_detectors(gid, &gadgets, &check_models).await;
+        assert_eq!(detectors.size, 2);
+        assert_eq!(bit_vector::to_sparse_indices(&detectors), vec![0]);
+    }
+
+    #[tokio::test]
+    async fn gadget_detectors_empty_when_no_binding() {
+        // A gadget with no bound check model yields a zero-length detector vector.
+        let coordinator = WindowCoordinator::new(
+            serde_json::json!({ "buffer_radius": 0 }),
+            BlackBoxDecoderClient::from_mock(Arc::new(crate::decoder::MockDecoder::new())),
+        );
+        let gid = 1;
+        let mut gadgets: HashMap<u64, Gadget> = HashMap::new();
+        gadgets.insert(
+            gid,
+            gadget_with_outcomes(
+                gid,
+                /* gtype */ 0,
+                /* binding_cid */ None,
+                Some(bit_vector::from_sparse_indices(2, &[0])),
+            ),
+        );
+        let check_models: HashMap<u64, CheckModel> = HashMap::new();
+
+        let detectors = coordinator.get_gadget_detectors(gid, &gadgets, &check_models).await;
+        assert_eq!(detectors.size, 0);
     }
 }
