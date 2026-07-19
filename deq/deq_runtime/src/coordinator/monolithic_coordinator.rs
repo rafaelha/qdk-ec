@@ -1648,6 +1648,32 @@ impl coordinator::coordinator_server::Coordinator for MonolithicCoordinator {
             ..Default::default()
         }))
     }
+
+    // ─── DEM gRPC surface (Task 8) ───────────────────────────────────────
+    // Non-blocking drain (see the WindowCoordinator handler for the rationale
+    // — the Empty request carries no `final_flush` flag).
+
+    async fn drain_dem(&self, _request: Request<()>) -> Result<Response<coordinator::DemDrainResponse>, Status> {
+        Ok(Response::new(self.drain_dem(false).await.into()))
+    }
+
+    async fn drain_dem_predictions(
+        &self,
+        request: Request<coordinator::DemPredictionsRequest>,
+    ) -> Result<Response<coordinator::DemPredictionsResponse>, Status> {
+        let predictions = match request.into_inner().gid {
+            Some(gid) => self.drain_dem_predictions_for(gid),
+            None => self.drain_dem_predictions(),
+        };
+        Ok(Response::new(coordinator::DemPredictionsResponse {
+            predictions: predictions.into_iter().map(Into::into).collect(),
+        }))
+    }
+
+    async fn set_dem_enabled(&self, request: Request<coordinator::DemEnabledRequest>) -> Result<Response<()>, Status> {
+        self.set_dem_enabled(request.into_inner().enabled);
+        Ok(Response::new(()))
+    }
 }
 
 /// define your own union-find node data structure like this

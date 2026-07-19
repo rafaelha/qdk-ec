@@ -32,6 +32,75 @@ service Coordinator {
   rpc WaitForDetectors(DetectorRequest) returns (Readouts);
   // reset the system
   rpc Reset(ResetRequest) returns (google.protobuf.Empty);
+  // drain the DEM growth increments (detector groups + resolved error edges)
+  // that became visible since the previous drain — the decoding-graph view's
+  // structural data source. Recording must be enabled via SetDemEnabled.
+  rpc DrainDem(google.protobuf.Empty) returns (DemDrainResponse);
+  // drain the queued per-decode DEM predictions. An absent `gid` drains every
+  // queued prediction; a present `gid` drains only that decoded gadget's,
+  // leaving the rest queued for their owning decode.
+  rpc DrainDemPredictions(DemPredictionsRequest) returns (DemPredictionsResponse);
+  // enable/disable DEM recording. The server starts with recording DISABLED;
+  // the playground turns it on per replay shot.
+  rpc SetDemEnabled(DemEnabledRequest) returns (google.protobuf.Empty);
+}
+
+// A global DEM id pair — (cid, check_index) for a detector, or
+// (eid, error_index) for an error mechanism.
+message DemGlobalId {
+  uint64 a = 1;
+  uint64 b = 2;
+}
+
+// One Create::CheckModel: `count` new detectors (cid, 0..count) owned by
+// gadget `gid`.
+message DemDetectorGroup {
+  uint64 gid = 1;
+  uint64 cid = 2;
+  uint64 count = 3;
+}
+
+// One error mechanism, fully resolved to global detector ids.
+message DemEdge {
+  uint64 gid = 1;
+  uint64 eid = 2;
+  uint64 error_index = 3;
+  // global detector ids (cid, check_index) — check_bias already applied
+  repeated DemGlobalId detectors = 4;
+  double probability = 5;
+}
+
+// Everything that became visible since the previous DrainDem.
+message DemDrainResponse {
+  repeated DemDetectorGroup detector_groups = 1;
+  repeated DemEdge edges = 2;
+}
+
+// One BP decode's window report, in global ids, for the decoding-graph view.
+message DemPrediction {
+  uint64 gid = 1;
+  uint64 seq = 2;
+  repeated uint64 window_gids = 3;
+  // (eid, error_index)
+  repeated DemGlobalId committed_edges = 4;
+  repeated DemGlobalId buffer_edges = 5;
+  repeated DemGlobalId fired = 6;
+  repeated DemGlobalId fired_buffer = 7;
+  // (cid, check_index)
+  repeated DemGlobalId flips = 8;
+}
+
+// absent `gid` = drain all queued predictions
+message DemPredictionsRequest {
+  optional uint64 gid = 1;
+}
+
+message DemPredictionsResponse {
+  repeated DemPrediction predictions = 1;
+}
+
+message DemEnabledRequest {
+  bool enabled = 1;
 }
 
 message DetectorRequest {

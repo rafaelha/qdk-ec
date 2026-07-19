@@ -200,4 +200,23 @@ impl coordinator::coordinator_server::Coordinator for NaiveCoordinator {
             ..Default::default()
         }))
     }
+
+    // ─── DEM gRPC surface (Task 8) ───────────────────────────────────────
+    // The naive coordinator owns no DemLog, so every drain is empty and the
+    // enable switch is a no-op.
+
+    async fn drain_dem(&self, _request: Request<()>) -> Result<Response<coordinator::DemDrainResponse>, Status> {
+        Ok(Response::new(coordinator::DemDrainResponse::default()))
+    }
+
+    async fn drain_dem_predictions(
+        &self,
+        _request: Request<coordinator::DemPredictionsRequest>,
+    ) -> Result<Response<coordinator::DemPredictionsResponse>, Status> {
+        Ok(Response::new(coordinator::DemPredictionsResponse::default()))
+    }
+
+    async fn set_dem_enabled(&self, _request: Request<coordinator::DemEnabledRequest>) -> Result<Response<()>, Status> {
+        Ok(Response::new(()))
+    }
 }

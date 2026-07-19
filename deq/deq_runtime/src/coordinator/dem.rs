@@ -82,6 +82,128 @@ pub struct DemPrediction {
     pub flips: Vec<(u64, u64)>,
 }
 
+// ─── gRPC conversions (Task 8) ───────────────────────────────────────────
+//
+// The proto messages live one module up (`super`, i.e. `coordinator`), generated
+// by prost from `coordinator.proto` and named identically to these structs. The
+// field lists mirror the structs 1:1; the only representational difference is the
+// global id pairs, which travel as a `DemGlobalId { a, b }` message rather than a
+// bare `(u64, u64)` tuple (protobuf has no tuple type).
+
+impl From<(u64, u64)> for super::DemGlobalId {
+    fn from((a, b): (u64, u64)) -> Self {
+        Self { a, b }
+    }
+}
+
+impl From<super::DemGlobalId> for (u64, u64) {
+    fn from(id: super::DemGlobalId) -> Self {
+        (id.a, id.b)
+    }
+}
+
+/// `Vec<(u64, u64)>` -> `Vec<DemGlobalId>` for the repeated proto fields.
+fn to_global_ids(pairs: Vec<(u64, u64)>) -> Vec<super::DemGlobalId> {
+    pairs.into_iter().map(Into::into).collect()
+}
+
+/// `Vec<DemGlobalId>` -> `Vec<(u64, u64)>` on the way back.
+fn from_global_ids(ids: Vec<super::DemGlobalId>) -> Vec<(u64, u64)> {
+    ids.into_iter().map(Into::into).collect()
+}
+
+impl From<DemDetectorGroup> for super::DemDetectorGroup {
+    fn from(g: DemDetectorGroup) -> Self {
+        Self {
+            gid: g.gid,
+            cid: g.cid,
+            count: g.count,
+        }
+    }
+}
+
+impl From<super::DemDetectorGroup> for DemDetectorGroup {
+    fn from(g: super::DemDetectorGroup) -> Self {
+        Self {
+            gid: g.gid,
+            cid: g.cid,
+            count: g.count,
+        }
+    }
+}
+
+impl From<DemEdge> for super::DemEdge {
+    fn from(e: DemEdge) -> Self {
+        Self {
+            gid: e.gid,
+            eid: e.eid,
+            error_index: e.error_index,
+            detectors: to_global_ids(e.detectors),
+            probability: e.probability,
+        }
+    }
+}
+
+impl From<super::DemEdge> for DemEdge {
+    fn from(e: super::DemEdge) -> Self {
+        Self {
+            gid: e.gid,
+            eid: e.eid,
+            error_index: e.error_index,
+            detectors: from_global_ids(e.detectors),
+            probability: e.probability,
+        }
+    }
+}
+
+impl From<DemDrain> for super::DemDrainResponse {
+    fn from(d: DemDrain) -> Self {
+        Self {
+            detector_groups: d.detector_groups.into_iter().map(Into::into).collect(),
+            edges: d.edges.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<super::DemDrainResponse> for DemDrain {
+    fn from(d: super::DemDrainResponse) -> Self {
+        Self {
+            detector_groups: d.detector_groups.into_iter().map(Into::into).collect(),
+            edges: d.edges.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<DemPrediction> for super::DemPrediction {
+    fn from(p: DemPrediction) -> Self {
+        Self {
+            gid: p.gid,
+            seq: p.seq,
+            window_gids: p.window_gids,
+            committed_edges: to_global_ids(p.committed_edges),
+            buffer_edges: to_global_ids(p.buffer_edges),
+            fired: to_global_ids(p.fired),
+            fired_buffer: to_global_ids(p.fired_buffer),
+            flips: to_global_ids(p.flips),
+        }
+    }
+}
+
+impl From<super::DemPrediction> for DemPrediction {
+    fn from(p: super::DemPrediction) -> Self {
+        Self {
+            gid: p.gid,
+            seq: p.seq,
+            window_gids: p.window_gids,
+            committed_edges: from_global_ids(p.committed_edges),
+            buffer_edges: from_global_ids(p.buffer_edges),
+            fired: from_global_ids(p.fired),
+            fired_buffer: from_global_ids(p.fired_buffer),
+            flips: from_global_ids(p.flips),
+        }
+    }
+}
+
 /// XOR-reduce the fired hyperedges' vertex sets to the detector flips this
 /// decode explains, in global (cid, check_index) ids, sorted for deterministic
 /// event output.
@@ -485,6 +607,67 @@ pub fn effective_errors(
 mod tests {
     use super::*;
     use crate::bin::error_model_type::{Error, RemoteCheck, RemoteCheckModel};
+
+    #[test]
+    fn dem_prediction_survives_proto_wire_round_trip() {
+        use prost::Message;
+        // Every field populated (incl. multi-entry global-id vecs) so the
+        // struct <-> proto conversions and the DemGlobalId (a, b) pairing are
+        // fully exercised on the wire.
+        let original = DemPrediction {
+            gid: 42,
+            seq: 7,
+            window_gids: vec![42, 43, 44],
+            committed_edges: vec![(301, 0), (301, 1)],
+            buffer_edges: vec![(302, 5)],
+            fired: vec![(301, 1)],
+            fired_buffer: vec![(302, 5)],
+            flips: vec![(201, 0), (202, 3)],
+        };
+        // struct -> proto -> bytes -> proto -> struct
+        let proto: super::super::DemPrediction = original.clone().into();
+        let bytes = proto.encode_to_vec();
+        let decoded = super::super::DemPrediction::decode(bytes.as_slice()).expect("decode DemPrediction");
+        let round_tripped: DemPrediction = decoded.into();
+        assert_eq!(
+            round_tripped, original,
+            "every DemPrediction field survives the proto wire round trip"
+        );
+    }
+
+    #[test]
+    fn dem_drain_survives_proto_wire_round_trip() {
+        use prost::Message;
+        let original = DemDrain {
+            detector_groups: vec![
+                DemDetectorGroup {
+                    gid: 1,
+                    cid: 1,
+                    count: 3,
+                },
+                DemDetectorGroup {
+                    gid: 2,
+                    cid: 5,
+                    count: 1,
+                },
+            ],
+            edges: vec![DemEdge {
+                gid: 1,
+                eid: 10,
+                error_index: 2,
+                detectors: vec![(1, 0), (5, 1)],
+                probability: 0.0125,
+            }],
+        };
+        let proto: super::super::DemDrainResponse = original.clone().into();
+        let bytes = proto.encode_to_vec();
+        let decoded = super::super::DemDrainResponse::decode(bytes.as_slice()).expect("decode DemDrainResponse");
+        let round_tripped: DemDrain = decoded.into();
+        assert_eq!(
+            round_tripped, original,
+            "DemDrain (detector groups + edges) survives the proto wire round trip"
+        );
+    }
 
     fn local_error(p: f64, idxs: &[u64]) -> Error {
         Error {

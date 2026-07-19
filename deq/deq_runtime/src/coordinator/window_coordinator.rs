@@ -3284,6 +3284,35 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
             ..Default::default()
         }))
     }
+
+    // ─── DEM gRPC surface (Task 8) ───────────────────────────────────────
+    // Non-blocking drain: the `DrainDem` request carries no `final_flush`
+    // flag (google.protobuf.Empty), so the handler never waits on the task
+    // counter — draining over the wire is safe to interleave with in-flight
+    // decodes. Remote callers that need a settled final flush await their
+    // decodes before draining (the Task 9 integration flow does this).
+
+    async fn drain_dem(&self, _request: Request<()>) -> Result<Response<coordinator::DemDrainResponse>, Status> {
+        Ok(Response::new(self.drain_dem(false).await.into()))
+    }
+
+    async fn drain_dem_predictions(
+        &self,
+        request: Request<coordinator::DemPredictionsRequest>,
+    ) -> Result<Response<coordinator::DemPredictionsResponse>, Status> {
+        let predictions = match request.into_inner().gid {
+            Some(gid) => self.drain_dem_predictions_for(gid),
+            None => self.drain_dem_predictions(),
+        };
+        Ok(Response::new(coordinator::DemPredictionsResponse {
+            predictions: predictions.into_iter().map(Into::into).collect(),
+        }))
+    }
+
+    async fn set_dem_enabled(&self, request: Request<coordinator::DemEnabledRequest>) -> Result<Response<()>, Status> {
+        self.set_dem_enabled(request.into_inner().enabled);
+        Ok(Response::new(()))
+    }
 }
 
 #[cfg(test)]
@@ -4188,6 +4217,165 @@ mod tests {
                 .count();
             assert_eq!(commits, 1, "late mechanism {mechanism:?} commits exactly once");
         }
+    }
+
+    /// End-to-end DEM gRPC surface (Task 8): a window coordinator hosted over a
+    /// real gRPC channel via `LocalServer::bind_grpc`, driven entirely through a
+    /// `Remote` `CoordinatorClient`. Exercises `SetDemEnabled` (recording starts
+    /// DISABLED on the server) and `DrainDemPredictions`, and asserts a decode's
+    /// prediction — `seq`/`gid`/`flips` included — survives the round trip.
+    #[cfg(feature = "cli")]
+    #[tokio::test]
+    async fn dem_predictions_round_trip_over_grpc_channel() {
+        use crate::coordinator::CoordinatorClient;
+        use crate::decoder::DynDecoder;
+        use crate::misc::bit_matrix::zeros;
+        use crate::server::ServerConfigs;
+        use clap::Parser;
+        use tonic::transport::Endpoint;
+
+        // In-process window coordinator + mock decoder, exposed over gRPC.
+        let server = ServerConfigs::parse_from([
+            "test",
+            "--coordinator",
+            "window",
+            "--coordinator-config",
+            r#"{"buffer_radius":1,"persistent_decoder":false}"#,
+            "--decoder",
+            "mock",
+        ])
+        .build_local()
+        .await;
+
+        // Make the mock fire hyperedge 0 for the fixture's all-zero window
+        // syndrome (every measurement is 0 → the syndrome bytes are all-zero),
+        // so the recorded prediction carries non-empty fired/flips to prove
+        // those fields survive the wire. Cover 1- and 2-byte all-zero keys.
+        let DynDecoder::Mock(mock) = server.decoder() else {
+            panic!("expected the mock decoder");
+        };
+        for key in [Vec::<u8>::new(), vec![0u8], vec![0u8, 0u8]] {
+            mock.set_response(key, vec![0]).await;
+        }
+
+        let url = server.bind_grpc("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let remote = CoordinatorClient::from_endpoint(Endpoint::from_shared(url).unwrap()).await;
+
+        // Recording starts DISABLED on the server; enable it over the channel.
+        remote.set_dem_enabled(true).await;
+        if let CoordinatorClient::Local(coordinator::DynCoordinator::Window(wc)) = server.coordinator_client() {
+            assert!(
+                wc.dem_log.is_enabled(),
+                "SetDemEnabled(true) RPC must enable recording server-side"
+            );
+        } else {
+            panic!("expected a local window coordinator handle");
+        }
+
+        // Load the Task 7 commit-region fixture library and drive the whole
+        // two-gadget decode over the gRPC channel.
+        let mut library = dem_execute_library();
+        for gt in library.gadget_types.iter_mut() {
+            gt.measurements = vec![Default::default()];
+            let rows = gt.physical_correction.as_ref().unwrap().rows as usize;
+            gt.physical_correction = Some(zeros(rows, 1));
+        }
+        remote.load_library(library).await.unwrap();
+
+        let execute = |create: bin::instruction::Create| {
+            let remote = remote.clone();
+            async move { remote.execute(bin::Instruction { create: Some(create) }).await.unwrap().id }
+        };
+        let g1 = execute(bin::instruction::Create::Gadget(bin::Gadget {
+            gtype: 100,
+            ..Default::default()
+        }))
+        .await;
+        execute(bin::instruction::Create::CheckModel(bin::CheckModel {
+            ctype: 10,
+            gid: g1,
+            ..Default::default()
+        }))
+        .await;
+        let g2 = execute(bin::instruction::Create::Gadget(bin::Gadget {
+            gtype: 101,
+            connectors: vec![bin::gadget::Connector { gid: g1, port: 0 }],
+            ..Default::default()
+        }))
+        .await;
+        let c2 = execute(bin::instruction::Create::CheckModel(bin::CheckModel {
+            ctype: 10,
+            gid: g2,
+            ..Default::default()
+        }))
+        .await;
+
+        let one_bit = bit_vector::from_sparse_indices(1, &[]);
+        remote
+            .submit_outcomes(coordinator::Outcomes {
+                gid: g2,
+                outcomes: Some(one_bit.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Leader decode blocks until the neighbor becomes decode-ready.
+        let leader_remote = remote.clone();
+        let leader_bits = one_bit.clone();
+        let leader = tokio::spawn(async move {
+            leader_remote
+                .decode(coordinator::Outcomes {
+                    gid: g1,
+                    outcomes: Some(leader_bits),
+                    ..Default::default()
+                })
+                .await
+        });
+
+        let eid = execute(bin::instruction::Create::ErrorModel(bin::ErrorModel {
+            etype: 20,
+            cid: c2,
+            ..Default::default()
+        }))
+        .await;
+
+        let follower_remote = remote.clone();
+        let follower = tokio::spawn(async move {
+            follower_remote
+                .decode(coordinator::Outcomes {
+                    gid: g2,
+                    outcomes: Some(one_bit),
+                    ..Default::default()
+                })
+                .await
+        });
+        leader.await.unwrap().unwrap();
+        follower.await.unwrap().unwrap();
+        let _ = eid;
+
+        // Drain predictions over the channel and assert the round trip.
+        let predictions = remote.drain_dem_predictions().await;
+        assert!(!predictions.is_empty(), "the decode recorded predictions, drained over gRPC");
+        assert!(
+            predictions.iter().all(|p| p.gid == g1 || p.gid == g2),
+            "gid survives the round trip",
+        );
+        let mut seqs: Vec<u64> = predictions.iter().map(|p| p.seq).collect();
+        seqs.sort_unstable();
+        assert_eq!(
+            seqs,
+            (0..predictions.len() as u64).collect::<Vec<_>>(),
+            "monotone seq survives the round trip",
+        );
+        assert!(
+            predictions.iter().any(|p| !p.flips.is_empty()),
+            "a fired decode's flips survive the gRPC round trip",
+        );
+        // A second drain is empty — the predictions were moved out over the wire.
+        assert!(remote.drain_dem_predictions().await.is_empty());
+
+        server.shutdown().await.unwrap();
     }
 
     #[tokio::test]

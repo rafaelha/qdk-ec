@@ -91,7 +91,13 @@ pub use decoder_cache_key::{
 };
 
 pub mod dem;
-pub use dem::{DemDetectorGroup, DemDrain, DemEdge, DemLog, DemPrediction};
+// NOTE: `DemDetectorGroup`, `DemEdge` and `DemPrediction` are NOT re-exported
+// here: Task 8 adds gRPC messages of the same names (generated into this same
+// `coordinator` module via the `include!` above), so re-exporting the dem
+// structs would collide (E0255). Reach them via `dem::DemPrediction` etc.; the
+// proto types keep the bare `DemPrediction` name. `DemDrain` has no proto twin
+// (the message is `DemDrainResponse`), so it stays re-exported.
+pub use dem::{DemDrain, DemLog};
 
 impl CoordinatorType {
     pub fn create(&self, config: serde_json::Value, black_box_decoder: Option<BlackBoxDecoderClient>) -> DynCoordinator {
@@ -319,11 +325,18 @@ impl CoordinatorClient {
     /// Enable/disable DEM recording on the target coordinator. The server
     /// starts disabled; the playground turns it on per replay shot. Only the
     /// real coordinators (monolithic/window) own a DEM log — the other Local
-    /// arms are no-ops. The Remote arm's gRPC wiring lands in Task 8.
-    pub fn set_dem_enabled(&self, enabled: bool) {
+    /// arms are no-ops. The Remote arm issues the `SetDemEnabled` RPC (async so
+    /// it can await the round-trip); transport errors are swallowed to match the
+    /// no-op contract of the Local arms.
+    pub async fn set_dem_enabled(&self, enabled: bool) {
         match self {
             #[cfg(feature = "cli")]
-            CoordinatorClient::Remote(_) => {} // TODO(task-8): SetDemEnabled RPC
+            CoordinatorClient::Remote(client) => {
+                let _ = client
+                    .clone()
+                    .set_dem_enabled(Request::new(DemEnabledRequest { enabled }))
+                    .await;
+            }
             CoordinatorClient::Local(DynCoordinator::Monolithic(c)) => c.set_dem_enabled(enabled),
             CoordinatorClient::Local(DynCoordinator::Window(c)) => c.set_dem_enabled(enabled),
             CoordinatorClient::Local(_) => {}
@@ -333,11 +346,22 @@ impl CoordinatorClient {
     /// Drain DEM growth increments. `final_flush` waits for expansion tasks and
     /// should only be used after all decodes have completed. Only the
     /// monolithic/window coordinators record DEM; the other Local arms return an
-    /// empty drain. The Remote arm's gRPC wiring lands in Task 8.
+    /// empty drain.
+    ///
+    /// The `DrainDem` RPC request is `google.protobuf.Empty`, so `final_flush`
+    /// cannot cross the wire: the Remote arm always performs the server's plain
+    /// (non-blocking) drain regardless of the flag. Remote callers that need a
+    /// settled flush simply await their decodes before draining. Transport
+    /// errors fall back to an empty drain.
     pub async fn drain_dem(&self, final_flush: bool) -> dem::DemDrain {
         match self {
             #[cfg(feature = "cli")]
-            CoordinatorClient::Remote(_) => dem::DemDrain::default(), // TODO(task-8): DrainDem RPC
+            CoordinatorClient::Remote(client) => client
+                .clone()
+                .drain_dem(Request::new(()))
+                .await
+                .map(|r| r.into_inner().into())
+                .unwrap_or_default(),
             CoordinatorClient::Local(DynCoordinator::Monolithic(c)) => c.drain_dem(final_flush).await,
             CoordinatorClient::Local(DynCoordinator::Window(c)) => c.drain_dem(final_flush).await,
             CoordinatorClient::Local(_) => dem::DemDrain::default(),
@@ -345,10 +369,12 @@ impl CoordinatorClient {
     }
 
     /// Drain every queued DEM prediction. Intended for final leftover flushes.
-    pub fn drain_dem_predictions(&self) -> Vec<dem::DemPrediction> {
+    /// The Remote arm sends `DrainDemPredictions` with an absent `gid` (drain
+    /// all); transport errors fall back to an empty vector.
+    pub async fn drain_dem_predictions(&self) -> Vec<dem::DemPrediction> {
         match self {
             #[cfg(feature = "cli")]
-            CoordinatorClient::Remote(_) => Vec::new(), // TODO(task-8): DrainDemPredictions RPC
+            CoordinatorClient::Remote(client) => Self::remote_drain_predictions(client, None).await,
             CoordinatorClient::Local(DynCoordinator::Monolithic(c)) => c.drain_dem_predictions(),
             CoordinatorClient::Local(DynCoordinator::Window(c)) => c.drain_dem_predictions(),
             CoordinatorClient::Local(_) => Vec::new(),
@@ -356,21 +382,44 @@ impl CoordinatorClient {
     }
 
     /// Drain only predictions produced for one decoded gadget, preserving other
-    /// queued predictions for their owning decode task.
-    pub fn drain_dem_predictions_for(&self, gid: u64) -> Vec<dem::DemPrediction> {
+    /// queued predictions for their owning decode task. The Remote arm sends
+    /// `DrainDemPredictions` with `gid` set; transport errors fall back to an
+    /// empty vector.
+    pub async fn drain_dem_predictions_for(&self, gid: u64) -> Vec<dem::DemPrediction> {
         match self {
             #[cfg(feature = "cli")]
-            CoordinatorClient::Remote(_) => Vec::new(), // TODO(task-8): DrainDemPredictionsFor RPC
+            CoordinatorClient::Remote(client) => Self::remote_drain_predictions(client, Some(gid)).await,
             CoordinatorClient::Local(DynCoordinator::Monolithic(c)) => c.drain_dem_predictions_for(gid),
             CoordinatorClient::Local(DynCoordinator::Window(c)) => c.drain_dem_predictions_for(gid),
             CoordinatorClient::Local(_) => Vec::new(),
         }
+    }
+
+    /// Shared `DrainDemPredictions` RPC call for both the drain-all (`gid=None`)
+    /// and drain-one (`gid=Some`) client methods, converting the proto
+    /// predictions back to `dem::DemPrediction` and falling back to empty on
+    /// transport error.
+    #[cfg(feature = "cli")]
+    async fn remote_drain_predictions(
+        client: &coordinator_client::CoordinatorClient<tonic::transport::Channel>,
+        gid: Option<u64>,
+    ) -> Vec<dem::DemPrediction> {
+        client
+            .clone()
+            .drain_dem_predictions(Request::new(DemPredictionsRequest { gid }))
+            .await
+            .map(|r| r.into_inner().predictions.into_iter().map(Into::into).collect())
+            .unwrap_or_default()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Explicit import shadows the glob's proto `DemPrediction` (Task 8 added a
+    // gRPC message of the same name in this module); the DEM tests build the
+    // `dem` struct with `(u64, u64)` tuple ids, not the proto's `DemGlobalId`.
+    use crate::coordinator::dem::DemPrediction;
     use crate::misc::bit_vector;
     use crate::simulator::DeterministicRng;
     use crate::util::BitVector;
@@ -605,8 +654,8 @@ mod tests {
     async fn dem_drain_passthroughs_dispatch_all_coordinator_arms() {
         for client in client_arms() {
             assert_eq!(client.drain_dem(false).await, DemDrain::default());
-            assert!(client.drain_dem_predictions().is_empty());
-            assert!(client.drain_dem_predictions_for(42).is_empty());
+            assert!(client.drain_dem_predictions().await.is_empty());
+            assert!(client.drain_dem_predictions_for(42).await.is_empty());
         }
     }
 
@@ -629,7 +678,7 @@ mod tests {
             });
 
             assert_eq!(
-                client.drain_dem_predictions_for(7),
+                client.drain_dem_predictions_for(7).await,
                 vec![DemPrediction {
                     gid: 7,
                     seq: 0,
@@ -640,7 +689,7 @@ mod tests {
                 }]
             );
             assert_eq!(
-                client.drain_dem_predictions(),
+                client.drain_dem_predictions().await,
                 vec![DemPrediction {
                     gid: 8,
                     seq: 1,

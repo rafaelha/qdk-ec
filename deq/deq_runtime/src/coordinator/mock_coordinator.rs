@@ -562,4 +562,23 @@ impl coordinator_server::Coordinator for MockCoordinator {
             ..Default::default()
         }))
     }
+
+    // ─── DEM gRPC surface (Task 8) ───────────────────────────────────────
+    // The mock coordinator owns no DemLog: every drain is empty and the
+    // enable switch is a no-op.
+
+    async fn drain_dem(&self, _request: Request<()>) -> Result<Response<coordinator::DemDrainResponse>, Status> {
+        Ok(Response::new(coordinator::DemDrainResponse::default()))
+    }
+
+    async fn drain_dem_predictions(
+        &self,
+        _request: Request<coordinator::DemPredictionsRequest>,
+    ) -> Result<Response<coordinator::DemPredictionsResponse>, Status> {
+        Ok(Response::new(coordinator::DemPredictionsResponse::default()))
+    }
+
+    async fn set_dem_enabled(&self, _request: Request<coordinator::DemEnabledRequest>) -> Result<Response<()>, Status> {
+        Ok(Response::new(()))
+    }
 }

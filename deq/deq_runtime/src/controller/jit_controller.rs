@@ -535,7 +535,7 @@ impl JitController {
     pub async fn drain_dem_predictions(&self) -> Vec<crate::coordinator::dem::DemPrediction> {
         let coordinator_guard = self.coordinator.read().await;
         match coordinator_guard.as_ref() {
-            Some(coordinator) => coordinator.drain_dem_predictions(),
+            Some(coordinator) => coordinator.drain_dem_predictions().await,
             None => vec![],
         }
     }
@@ -543,7 +543,7 @@ impl JitController {
     pub async fn drain_dem_predictions_for(&self, gid: u64) -> Vec<crate::coordinator::dem::DemPrediction> {
         let coordinator_guard = self.coordinator.read().await;
         match coordinator_guard.as_ref() {
-            Some(coordinator) => coordinator.drain_dem_predictions_for(gid),
+            Some(coordinator) => coordinator.drain_dem_predictions_for(gid).await,
             None => vec![],
         }
     }
