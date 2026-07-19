@@ -262,12 +262,26 @@ impl CoordinatorClient {
     /// same outcome bits twice (early [`Self::submit_outcomes`] for
     /// measurement-time detectors, then [`Self::decode`]); imputing once up
     /// front keeps the two loads bit-identical, preserving that idempotency
-    /// invariant. The mask is always consumed; imputation only runs for the
-    /// Local monolithic/window arms (the ones that own a `loss_imputation_rng`).
-    /// For every other arm — including a `Remote` coordinator, whose RNG lives
-    /// on the server — the mask is dropped as a no-op, which keeps both loads
-    /// bit-identical rather than risking a divergent server-side re-imputation.
+    /// invariant. Imputation runs (and the mask is consumed) only for the
+    /// Local monolithic/window arms — the ones that own a `loss_imputation_rng`
+    /// (imputation disabled ⇒ `loss_imputation_rng` is `None`, so the mask is
+    /// still consumed but the bits are left untouched).
+    ///
+    /// The `Remote` arm is a **pass-through**: it leaves both the outcome bits
+    /// and the `loss_mask` untouched, so the mask travels over the wire in both
+    /// [`Self::submit_outcomes`] and [`Self::decode`]. The RNG lives on the
+    /// server, so the server imputes on arrival — once, in its `submit_outcomes`
+    /// handler — and its idempotent decode guards keep those submit-time bits
+    /// (see `WindowCoordinator::submit_outcomes` / `decode`). Imputing client
+    /// side here would either double-impute against the server's own draw or
+    /// drop the mask before it ever reached the server.
     pub async fn impute_loss_outcomes(&self, outcomes: &mut Outcomes) {
+        // Remote: pass through untouched — the server owns the RNG and imputes
+        // on arrival. Do this BEFORE taking the mask so it survives the wire.
+        #[cfg(feature = "cli")]
+        if let CoordinatorClient::Remote(_) = self {
+            return;
+        }
         let Some(mask) = outcomes.loss_mask.take() else {
             return;
         };
@@ -417,6 +431,38 @@ mod tests {
             outcomes.outcomes.unwrap(),
             imputed,
             "second call is a no-op once the mask is gone",
+        );
+    }
+
+    #[cfg(feature = "cli")]
+    #[tokio::test]
+    async fn impute_loss_outcomes_remote_passes_through_untouched() {
+        // Remote: the server owns the RNG, so the client must leave both the
+        // outcome bits and the loss_mask intact — the mask travels over the wire
+        // and the server imputes on arrival. connect_lazy() builds the channel
+        // without touching the network; impute_loss_outcomes returns immediately
+        // for the Remote arm, so no RPC is issued.
+        use tonic::transport::Endpoint;
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let client = CoordinatorClient::Remote(coordinator_client::CoordinatorClient::new(channel));
+        let mut outcomes = Outcomes {
+            gid: 1,
+            outcomes: Some(BitVector { size: 8, data: vec![0] }),
+            loss_mask: Some(BitVector {
+                size: 8,
+                data: vec![0xff],
+            }),
+            ..Default::default()
+        };
+        client.impute_loss_outcomes(&mut outcomes).await;
+        assert!(
+            outcomes.loss_mask.is_some(),
+            "Remote must pass the loss_mask through untouched so the server can impute on arrival",
+        );
+        assert_eq!(
+            outcomes.outcomes.unwrap(),
+            BitVector { size: 8, data: vec![0] },
+            "Remote must not mutate outcome bits client-side",
         );
     }
 

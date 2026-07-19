@@ -2677,15 +2677,30 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
             let mut outcome_data = outcomes
                 .outcomes
                 .ok_or_else(|| Status::invalid_argument("missing outcomes"))?;
-            // Apply loss-random-imputation before storing the outcomes so
-            // every downstream consumer (syndrome calc, pauli-frame tracker,
-            // window decoder) reads a single consistent imputed value per
-            // measurement bit.
-            if let (Some(rng_lock), Some(loss_mask)) = (self.loss_imputation_rng.as_ref(), outcomes.loss_mask.as_ref()) {
-                let mut rng = rng_lock.lock().await;
-                coordinator::apply_loss_random_imputation(&mut outcome_data, loss_mask, &mut *rng);
+            // If outcomes were already published at measurement time (via
+            // `submit_outcomes`), those bits — already imputed once with this
+            // coordinator's RNG — win. A remote client sends the loss_mask on
+            // both the SubmitOutcomes and Decode requests, so if we imputed
+            // again here we would draw fresh random bits for the lost
+            // measurements: they would diverge from the submit-time draw already
+            // stored in the tracker (whose `load_raw` is idempotent) AND
+            // overwrite the watch channel, corrupting the syndrome. So only
+            // impute + publish when no prior submit exists (the naive /
+            // monolithic-style decode-without-submit path). This is the guard
+            // that protects the `outcomes` watch channel; `load_raw` protects
+            // the frame tracker.
+            let already_submitted = gadget.outcomes.borrow().is_some();
+            if !already_submitted {
+                // Apply loss-random-imputation before storing the outcomes so
+                // every downstream consumer (syndrome calc, pauli-frame tracker,
+                // window decoder) reads a single consistent imputed value per
+                // measurement bit.
+                if let (Some(rng_lock), Some(loss_mask)) = (self.loss_imputation_rng.as_ref(), outcomes.loss_mask.as_ref()) {
+                    let mut rng = rng_lock.lock().await;
+                    coordinator::apply_loss_random_imputation(&mut outcome_data, loss_mask, &mut *rng);
+                }
+                gadget.outcomes.send_replace(Some(outcome_data));
             }
-            gadget.outcomes.send_replace(Some(outcome_data));
             // decode() has been entered: the caller's error model (if any) has
             // finished loading, so this gadget is now safe to commit. This is the
             // gate `decode_and_commit` waits on in addition to `outcomes`; a bare
@@ -2960,9 +2975,21 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
     async fn submit_outcomes(&self, request: Request<coordinator::Outcomes>) -> Result<Response<()>, Status> {
         let outcomes = request.into_inner();
         let gid = outcomes.gid;
-        let data = outcomes
+        let mut data = outcomes
             .outcomes
             .ok_or_else(|| Status::invalid_argument("missing outcomes"))?;
+        // Impute lost measurements on arrival, once, using this coordinator's
+        // RNG — the same source the decode path uses. A remote client passes the
+        // loss_mask over the wire (its RNG lives here, on the server) rather than
+        // imputing client-side, so this is where a masked submission is resolved.
+        // The internal `submit_outcomes` publishes these imputed bits to the
+        // watch channel and the frame tracker; `decode` then keeps them via its
+        // idempotent guards (channel `already_submitted` check + tracker
+        // `load_raw` early-return), so it never re-draws over these bits.
+        if let (Some(rng_lock), Some(loss_mask)) = (self.loss_imputation_rng.as_ref(), outcomes.loss_mask.as_ref()) {
+            let mut rng = rng_lock.lock().await;
+            coordinator::apply_loss_random_imputation(&mut data, loss_mask, &mut *rng);
+        }
         self.submit_outcomes(gid, data).await?;
         Ok(Response::new(()))
     }
@@ -3426,6 +3453,109 @@ mod tests {
                 .borrow()
                 .is_none(),
             "submit_outcomes alone must not mark the gadget decode-ready",
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_outcomes_imputes_on_arrival_and_decode_does_not_redraw() {
+        // Remote clients pass the loss_mask over the wire on BOTH SubmitOutcomes
+        // and Decode; the server imputes on arrival in submit_outcomes and must
+        // NOT re-draw when the same masked outcomes come back through decode.
+        use crate::coordinator::coordinator_server::Coordinator as CoordinatorTrait;
+        use crate::simulator::DeterministicRng;
+        use rand::SeedableRng;
+
+        let seed = 7u64;
+        // buffer_radius=1 so a free-hop gadget takes decode()'s early
+        // `wait_for_pauli_frame` return (which we pre-satisfy) instead of the
+        // full window-exploration path — this keeps the test focused on the
+        // impute/channel-overwrite block at the top of decode().
+        let coordinator = WindowCoordinator::new(
+            serde_json::json!({ "buffer_radius": 1, "loss_random_imputation_seed": seed }),
+            BlackBoxDecoderClient::from_mock(Arc::new(crate::decoder::MockDecoder::new())),
+        );
+        let gid = 1;
+        register_submit_fixture(&coordinator, gid).await;
+        // Free-hop gadget with pauli_frame pre-set so decode()'s free-hop branch
+        // returns immediately.
+        let gadget = Gadget {
+            instance: bin::Gadget {
+                gid,
+                gtype: 0,
+                ..Default::default()
+            },
+            outcomes: watch::channel(None).0,
+            decode_ready: watch::channel(None).0,
+            binding_cid: None,
+            outputs: vec![],
+            pauli_frame: watch::channel(Some(bit_vector::from_sparse_indices(0, &[]))).0,
+            is_free_hop: true,
+            state: watch::channel(GadgetState::Uncommitted).0,
+        };
+        coordinator.gadgets.write().await.insert(gid, gadget);
+
+        // Raw (all-zero) outcomes + a mask marking all 3 measurements as lost.
+        let raw = bit_vector::from_sparse_indices(3, &[]);
+        let mask = bit_vector::from_sparse_indices(3, &[0, 1, 2]);
+
+        CoordinatorTrait::submit_outcomes(
+            &coordinator,
+            Request::new(coordinator::Outcomes {
+                gid,
+                outcomes: Some(raw.clone()),
+                loss_mask: Some(mask.clone()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("submit_outcomes");
+
+        // The stored/published outcomes must be imputed: exactly the first draw
+        // of a DeterministicRng seeded identically to the coordinator's.
+        let mut expected = raw.clone();
+        let mut rng = DeterministicRng::seed_from_u64(seed);
+        coordinator::apply_loss_random_imputation(&mut expected, &mask, &mut rng);
+        let stored = coordinator
+            .gadgets
+            .read()
+            .await
+            .get(&gid)
+            .unwrap()
+            .outcomes
+            .borrow()
+            .clone()
+            .unwrap();
+        assert_eq!(
+            stored, expected,
+            "submit_outcomes must impute lost bits on arrival (mask consumed)"
+        );
+
+        // Decode with the SAME masked outcomes: the submit-time bits win, so a
+        // second RNG draw (which would differ) must NOT happen.
+        CoordinatorTrait::decode(
+            &coordinator,
+            Request::new(coordinator::Outcomes {
+                gid,
+                outcomes: Some(raw.clone()),
+                loss_mask: Some(mask.clone()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("decode");
+        let after_decode = coordinator
+            .gadgets
+            .read()
+            .await
+            .get(&gid)
+            .unwrap()
+            .outcomes
+            .borrow()
+            .clone()
+            .unwrap();
+        assert_eq!(
+            after_decode, stored,
+            "decode must not re-impute over the submit-time outcomes (no second RNG draw)",
         );
     }
 
