@@ -2066,8 +2066,8 @@ mod tests {
         );
 
         // Sanity: confirm the bias is load-bearing for this fixture.
-        assert_eq!(get_bit(&gadgets[&remote_gid].outcomes.as_ref().unwrap().clone(), 3), false);
-        assert_eq!(get_bit(&gadgets[&remote_gid].outcomes.as_ref().unwrap().clone(), 1), true);
+        assert!(!get_bit(&gadgets[&remote_gid].outcomes.as_ref().unwrap().clone(), 3));
+        assert!(get_bit(&gadgets[&remote_gid].outcomes.as_ref().unwrap().clone(), 1));
 
         let detectors = coordinator.get_gadget_detectors(gid, &gadgets, &check_models).await;
         assert_eq!(detectors.size, 1);
