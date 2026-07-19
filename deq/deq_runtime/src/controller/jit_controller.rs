@@ -47,7 +47,7 @@ pub struct JitController {
     /// Track when error models are loaded for each gid.
     /// Decode must wait for the error model before forwarding to coordinator.
     /// Stores the receiver; the sender is passed to the spawned error model task.
-    error_model_loaded: RwLock<HashMap<u64, oneshot::Receiver<()>>>,
+    error_model_loaded: RwLock<HashMap<u64, oneshot::Receiver<Result<(), tonic::Status>>>>,
     /// Cancelled on reset()/drop to abort pending error-model and batch tasks.
     cancellation: RwLock<CancellationToken>,
     /// Tracks active spawned tasks; reset() waits for all to finish.
@@ -269,7 +269,7 @@ impl JitController {
             let etype = this.get_or_load_etype(&mut error_model_type, coordinator).await;
 
             let error_model_modifier = build_error_model_modifier(&error_model_type, &error_model);
-            let _ = coordinator
+            let result = coordinator
                 .execute(bin::Instruction {
                     create: Some(bin::instruction::Create::ErrorModel(bin::ErrorModel {
                         etype,
@@ -279,10 +279,11 @@ impl JitController {
                         eid: error_model.eid,
                     })),
                 })
-                .await;
+                .await
+                .map(|_| ());
 
             // Notify that the error model has been loaded
-            let _ = error_model_tx.send(());
+            let _ = error_model_tx.send(result);
         });
 
         gid
@@ -461,7 +462,10 @@ impl JitController {
         // promptly rather than blocking forever.
         let token = self.cancellation.read().await.clone();
         tokio::select! {
-            _ = rx => {}
+            result = rx => {
+                result
+                    .map_err(|_| tonic::Status::cancelled(format!("error-model load task ended for gid {gid}")))??;
+            }
             _ = token.cancelled() => {
                 return Err(tonic::Status::cancelled(format!(
                     "decode for gid={gid} cancelled by runtime shutdown or reset"
@@ -865,5 +869,28 @@ impl TypeCache {
     pub fn clear(&mut self) {
         self.check_model_types.clear();
         self.error_model_types.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coordinator;
+
+    #[tokio::test]
+    async fn decode_single_rejects_a_dropped_error_model_loader() {
+        let controller = JitController::new_from_library(Default::default(), true);
+        let (tx, rx) = oneshot::channel();
+        controller.error_model_loaded.write().await.insert(7, rx);
+        drop(tx);
+
+        let error = controller
+            .decode_single(coordinator::Outcomes {
+                gid: 7,
+                ..Default::default()
+            })
+            .await
+            .expect_err("dropped model loader must stop decode");
+        assert_eq!(error.message(), "error-model load task ended for gid 7");
     }
 }
