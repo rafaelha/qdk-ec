@@ -546,4 +546,8 @@ impl coordinator_server::Coordinator for MockCoordinator {
         state.next_eid = 1;
         Ok(Response::new(()))
     }
+
+    async fn submit_outcomes(&self, _request: Request<coordinator::Outcomes>) -> Result<Response<()>, Status> {
+        Ok(Response::new(()))
+    }
 }

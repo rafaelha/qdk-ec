@@ -22,6 +22,10 @@ service Coordinator {
   // note that the readouts generally depend on adjacent gadgets' outcomes so
   // it may not return immediately (unless the number of readouts are zero)
   rpc Decode(Outcomes) returns (Readouts);
+  // publish a gadget's raw measurement outcomes as soon as they exist, before
+  // its decode is requested — lets detector-conditioned control flow resolve
+  // at measurement time. decode() later re-sends the same bits idempotently.
+  rpc SubmitOutcomes(Outcomes) returns (google.protobuf.Empty);
   // reset the system
   rpc Reset(ResetRequest) returns (google.protobuf.Empty);
 }

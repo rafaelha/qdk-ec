@@ -239,6 +239,48 @@ impl CoordinatorClient {
         })
         .map(|v| v.into_inner())
     }
+
+    /// Publish a gadget's raw outcomes so its finished-detector syndrome can be
+    /// computed at measurement time, independent of the error-model-gated
+    /// [`Self::decode`]. Only the window coordinator surfaces detectors early;
+    /// monolithic/naive/mock surface them through `decode`, so this is a no-op
+    /// there. `decode` re-sends the same outcomes idempotently.
+    pub async fn submit_outcomes(&self, outcomes: Outcomes) -> std::result::Result<(), Status> {
+        let request = Request::new(outcomes);
+        (match self {
+            #[cfg(feature = "cli")]
+            CoordinatorClient::Remote(client) => client.clone().submit_outcomes(request).await,
+            CoordinatorClient::Local(local) => local.inner().submit_outcomes(request).await,
+        })
+        .map(|v| v.into_inner())
+    }
+
+    /// Apply loss-random-imputation to `outcomes.outcomes` in place using the
+    /// target coordinator's RNG, and TAKE `outcomes.loss_mask` so downstream
+    /// consumers (the coordinator's own `decode`) cannot re-impute with a
+    /// different random draw. The controller's `decode_single` publishes the
+    /// same outcome bits twice (early [`Self::submit_outcomes`] for
+    /// measurement-time detectors, then [`Self::decode`]); imputing once up
+    /// front keeps the two loads bit-identical, preserving that idempotency
+    /// invariant. The mask is always consumed; imputation only runs for the
+    /// Local monolithic/window arms (the ones that own a `loss_imputation_rng`).
+    /// For every other arm — including a `Remote` coordinator, whose RNG lives
+    /// on the server — the mask is dropped as a no-op, which keeps both loads
+    /// bit-identical rather than risking a divergent server-side re-imputation.
+    pub async fn impute_loss_outcomes(&self, outcomes: &mut Outcomes) {
+        let Some(mask) = outcomes.loss_mask.take() else {
+            return;
+        };
+        let rng_lock = match self {
+            CoordinatorClient::Local(DynCoordinator::Monolithic(c)) => c.loss_imputation_rng.as_ref(),
+            CoordinatorClient::Local(DynCoordinator::Window(c)) => c.loss_imputation_rng.as_ref(),
+            _ => None,
+        };
+        if let (Some(rng_lock), Some(bits)) = (rng_lock, outcomes.outcomes.as_mut()) {
+            let mut rng = rng_lock.lock().await;
+            apply_loss_random_imputation(bits, &mask, &mut *rng);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -345,5 +387,57 @@ mod tests {
         };
         let mut rng = DeterministicRng::seed_from_u64(0);
         apply_loss_random_imputation(&mut outcomes, &loss_mask, &mut rng);
+    }
+
+    fn monolithic_client(config: serde_json::Value) -> CoordinatorClient {
+        CoordinatorClient::Local(DynCoordinator::Monolithic(Arc::new(MonolithicCoordinator::new(
+            config,
+            BlackBoxDecoderClient::from_mock(Arc::new(crate::decoder::MockDecoder::new())),
+        ))))
+    }
+
+    #[tokio::test]
+    async fn impute_loss_outcomes_takes_the_mask_and_randomizes_marked_bits() {
+        let client = monolithic_client(serde_json::json!({ "loss_random_imputation_seed": 7 }));
+        // All 8 bits lost: with a fixed seed the imputed value is deterministic.
+        let mut outcomes = Outcomes {
+            gid: 1,
+            outcomes: Some(BitVector { size: 8, data: vec![0] }),
+            loss_mask: Some(BitVector {
+                size: 8,
+                data: vec![0xff],
+            }),
+            ..Default::default()
+        };
+        client.impute_loss_outcomes(&mut outcomes).await;
+        assert!(outcomes.loss_mask.is_none(), "mask must be taken so decode cannot re-impute");
+        let imputed = outcomes.outcomes.clone().unwrap();
+        client.impute_loss_outcomes(&mut outcomes).await;
+        assert_eq!(
+            outcomes.outcomes.unwrap(),
+            imputed,
+            "second call is a no-op once the mask is gone",
+        );
+    }
+
+    #[tokio::test]
+    async fn impute_loss_outcomes_respects_disabled_imputation() {
+        let client = monolithic_client(serde_json::json!({ "loss_random_imputation": false }));
+        let mut outcomes = Outcomes {
+            gid: 1,
+            outcomes: Some(BitVector { size: 8, data: vec![0] }),
+            loss_mask: Some(BitVector {
+                size: 8,
+                data: vec![0xff],
+            }),
+            ..Default::default()
+        };
+        client.impute_loss_outcomes(&mut outcomes).await;
+        assert!(outcomes.loss_mask.is_none(), "mask is still consumed when imputation is off");
+        assert_eq!(
+            outcomes.outcomes.unwrap(),
+            BitVector { size: 8, data: vec![0] },
+            "disabled imputation leaves outcome bits untouched",
+        );
     }
 }

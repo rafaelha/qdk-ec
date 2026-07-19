@@ -262,6 +262,12 @@ pub enum GadgetState {
 pub struct Gadget {
     pub instance: bin::Gadget,
     pub outcomes: watch::Sender<Option<BitVector>>,
+    /// Set when `decode()` is entered. For JIT callers this means the gadget's
+    /// asynchronous error model has finished loading. `submit_outcomes` does NOT
+    /// set this, so a gadget whose outcomes arrived at measurement time cannot be
+    /// committed by a neighbor until its own `decode()` (gated on the error
+    /// model) fires.
+    pub decode_ready: watch::Sender<Option<()>>,
     /// the check model's cid that is binding to this gadget
     pub binding_cid: Option<u64>,
     /// the peer gadgets' gid connected to each output port
@@ -520,6 +526,49 @@ impl WindowCoordinator {
             set_bit(&mut detectors, check_index as u64, is_defect);
         }
         detectors
+    }
+
+    /// Publish a gadget's raw measurement outcomes to its `outcomes` channel
+    /// WITHOUT running the decode. This is what the per-check-model syndrome task
+    /// (spawned in `execute`) waits on, so calling this makes a gadget's finished
+    /// detectors resolvable at measurement time — before, and independent of, the
+    /// error-model load that gates the full `decode`. Decoupling the two is what
+    /// lets an `if` conditioned on a gadget's detector bus resolve even when the
+    /// gadget's own output port is only connected *after* that branch is taken
+    /// (the error model, which needs the output-port gid, would otherwise
+    /// deadlock the decode against the branch). `decode` re-sends the same
+    /// outcomes idempotently, so calling this first is safe.
+    ///
+    /// Also loads the raw outcomes into the Pauli frame tracker: submitting
+    /// outcomes makes this gadget's syndrome computable, which makes windows
+    /// containing it decodable — another gadget's decode() may then COMMIT this
+    /// gadget before its own decode() call arrives (that call waits on the
+    /// error-model load). The tracker's frame propagation requires raw
+    /// measurements for every commit-region member, so they must be loaded at
+    /// outcome-arrival time, not decode() time. (`load_raw` is idempotent.)
+    ///
+    /// It deliberately does NOT set the gadget's `decode_ready` channel: that
+    /// signal is reserved for `decode()`, so that publishing outcomes alone
+    /// cannot let a neighboring gadget commit this one before its error model
+    /// has loaded. Returns a not-found error (not a panic/hang) for an unknown
+    /// gid.
+    pub async fn submit_outcomes(&self, gid: u64, outcomes: BitVector) -> Result<(), Status> {
+        let gadget_types = self.gadget_types.read().await;
+        let gadgets = self.gadgets.read().await;
+        let gadget = gadgets.get(&gid).ok_or_else(|| Status::not_found(format!("gid={gid}")))?;
+        gadget.outcomes.send_replace(Some(outcomes));
+        let gadget_type = gadget_types.get(&gadget.instance.gtype).unwrap();
+        let mut readouts = Vec::with_capacity(gadget_type.readouts.len());
+        let data: BitVector = gadget.outcomes.borrow().as_ref().unwrap().clone();
+        for readout in gadget_type.readouts.iter() {
+            let mut value = false;
+            for &mi in readout.measurement_indices.iter() {
+                value ^= get_bit(&data, mi);
+            }
+            readouts.push(value);
+        }
+        self.pauli_frame_tracker.lock().await.load_raw(gid, &readouts, &data);
+        Ok(())
     }
 
     // ────────────────────────────────────────────────────────────────────────
@@ -1159,30 +1208,30 @@ impl WindowCoordinator {
         span.add_property(|| ("commit_region", format!("{:?}", commit_region)));
         span.add_property(|| ("window", format!("{:?}", window)));
 
-        // first wait for all the outcomes to be loaded to make sure that their check
-        // models and error models are completely loaded
+        // Wait for every window ∪ commit_region gadget to have both its outcomes
+        // loaded AND its `decode()` entered (`decode_ready`). Outcomes alone is
+        // not enough: a gadget's outcomes can arrive at measurement time via
+        // `submit_outcomes` (making its syndrome computable and this window
+        // decodable) BEFORE its own error-model-gated `decode()` fires. Committing
+        // it then would decode against an error model that has not finished
+        // loading, so we also gate on `decode_ready` — set only by `decode()`.
         let token = self.cancellation.read().await.clone();
+        let required_gids: HashSet<u64> = window.iter().chain(commit_region.iter()).copied().collect();
         let mut handles: Vec<JoinHandle<bool>> = vec![];
         {
             let gadgets = self.gadgets.read().await;
-            for &window_gid in window {
-                let gadget = gadgets.get(&window_gid)?;
+            for gid in required_gids {
+                let gadget = gadgets.get(&gid)?;
                 if let Err(handle) = check_or_receiver(&gadget.outcomes, token.clone()) {
                     handles.push(handle);
                 }
-            }
-            // Also wait for outcomes of all commit_region gadgets
-            for &cgid in commit_region {
-                if !window.contains(&cgid)
-                    && let Some(gadget) = gadgets.get(&cgid)
-                    && let Err(handle) = check_or_receiver(&gadget.outcomes, token.clone())
-                {
+                if let Err(handle) = check_or_receiver(&gadget.decode_ready, token.clone()) {
                     handles.push(handle);
                 }
             }
         }
-        futures_util::future::join_all(handles).await;
-        if token.is_cancelled() {
+        let ready = futures_util::future::join_all(handles).await;
+        if token.is_cancelled() || ready.iter().any(|arrived| !matches!(arrived, Ok(true))) {
             return None;
         }
         span.add_event(Event::new("outcomes_ready"));
@@ -2282,6 +2331,7 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                     Gadget {
                         instance: gadget.clone(),
                         outcomes: watch::channel(None).0,
+                        decode_ready: watch::channel(None).0,
                         binding_cid: None,
                         // important: we should not use vec![;len] syntax because it will create clones
                         outputs: gadget_type.outputs.iter().map(|_| watch::channel(None).0).collect(),
@@ -2636,6 +2686,11 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                 coordinator::apply_loss_random_imputation(&mut outcome_data, loss_mask, &mut *rng);
             }
             gadget.outcomes.send_replace(Some(outcome_data));
+            // decode() has been entered: the caller's error model (if any) has
+            // finished loading, so this gadget is now safe to commit. This is the
+            // gate `decode_and_commit` waits on in addition to `outcomes`; a bare
+            // `submit_outcomes` (measurement time) deliberately does not set it.
+            gadget.decode_ready.send_replace(Some(()));
             let gadget_type = gadget_types.get(&gadget.instance.gtype).unwrap();
             let mut readouts = Vec::with_capacity(gadget_type.readouts.len());
             let data: BitVector = gadget.outcomes.borrow().as_ref().unwrap().clone();
@@ -2900,6 +2955,16 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
             }
         }
         Ok(().into())
+    }
+
+    async fn submit_outcomes(&self, request: Request<coordinator::Outcomes>) -> Result<Response<()>, Status> {
+        let outcomes = request.into_inner();
+        let gid = outcomes.gid;
+        let data = outcomes
+            .outcomes
+            .ok_or_else(|| Status::invalid_argument("missing outcomes"))?;
+        self.submit_outcomes(gid, data).await?;
+        Ok(Response::new(()))
     }
 }
 
@@ -3166,6 +3231,7 @@ mod tests {
                 ..Default::default()
             },
             outcomes: watch::channel(outcomes).0,
+            decode_ready: watch::channel(None).0,
             binding_cid,
             outputs: vec![],
             pauli_frame: watch::channel(None).0,
@@ -3241,5 +3307,149 @@ mod tests {
 
         let detectors = coordinator.get_gadget_detectors(gid, &gadgets, &check_models).await;
         assert_eq!(detectors.size, 0);
+    }
+
+    // ─── submit_outcomes ─────────────────────────────────────────────────
+
+    // TODO(task-7-dem): port the fork's end-to-end decode-readiness gating test
+    // `commit_region_waits_for_neighbor_decode_readiness` (fork 9f8a50e). It asserts
+    // that `submit_outcomes` alone must not let a neighbor commit and that the late
+    // error model's mechanism commits exactly once — via `dem_execute_library`,
+    // `execute_create`, and `drain_dem_predictions`/`committed_edges`, none of which
+    // exist until the DEM module lands in Task 7. The gating *behavior* is covered
+    // here by `submit_outcomes_does_not_mark_decode_ready`.
+
+    /// Register a submit-outcomes fixture gadget: a 3-measurement, 0-readout
+    /// gadget type known to both the coordinator and the Pauli frame tracker, so
+    /// that `submit_outcomes`' `load_raw` call has a tracker entry to write into.
+    async fn register_submit_fixture(coordinator: &WindowCoordinator, gid: u64) {
+        use crate::misc::bit_matrix::zeros;
+        let gadget_type = bin::GadgetType {
+            gtype: 0,
+            measurements: vec![Default::default(); 3],
+            correction_propagation: Some(zeros(0, 1)),
+            readout_propagation: Some(zeros(0, 1)),
+            logical_correction: Some(zeros(0, 0)),
+            physical_correction: Some(zeros(0, 3)),
+            ..Default::default()
+        };
+        coordinator
+            .pauli_frame_tracker
+            .lock()
+            .await
+            .add_gadget(gid, &gadget_type, None, &HashMap::new(), &[]);
+        coordinator.gadget_types.write().await.insert(0, Arc::new(gadget_type));
+    }
+
+    #[tokio::test]
+    async fn submit_outcomes_publishes_to_the_gadget_channel() {
+        // submit_outcomes feeds the gadget's `outcomes` watch channel (what the
+        // per-check-model syndrome task waits on) without running any decode. This
+        // is what lets a detector resolve at measurement time, ahead of the
+        // error-model-gated decode.
+        let coordinator = WindowCoordinator::new(
+            serde_json::json!({ "buffer_radius": 0 }),
+            BlackBoxDecoderClient::from_mock(Arc::new(crate::decoder::MockDecoder::new())),
+        );
+        let gid = 1;
+        // submit_outcomes also loads the raw outcomes into the Pauli frame
+        // tracker (see its doc), so the fixture must mirror execute()'s
+        // invariants: the gadget type is registered and the tracker knows the
+        // gadget. 3 measurements to match the submitted bit vector.
+        register_submit_fixture(&coordinator, gid).await;
+        coordinator
+            .gadgets
+            .write()
+            .await
+            .insert(gid, gadget_with_outcomes(gid, /* gtype */ 0, /* binding_cid */ None, None));
+        assert!(
+            coordinator
+                .gadgets
+                .read()
+                .await
+                .get(&gid)
+                .unwrap()
+                .outcomes
+                .borrow()
+                .is_none(),
+            "no outcomes before submit",
+        );
+
+        let bits = bit_vector::from_sparse_indices(3, &[1, 2]);
+        coordinator.submit_outcomes(gid, bits.clone()).await.expect("submit");
+        assert_eq!(
+            coordinator.gadgets.read().await.get(&gid).unwrap().outcomes.borrow().clone(),
+            Some(bits),
+            "outcomes are published to the channel",
+        );
+
+        // Unknown gid is a not-found error, not a panic/hang.
+        assert!(
+            coordinator
+                .submit_outcomes(999, bit_vector::from_sparse_indices(0, &[]))
+                .await
+                .is_err(),
+            "submit_outcomes for an unloaded gid errors",
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_outcomes_does_not_mark_decode_ready() {
+        // The crux of decode-readiness gating: publishing outcomes at measurement
+        // time must NOT set `decode_ready`, so a neighbor cannot commit this
+        // gadget before its own error-model-gated `decode()` fires. Only `decode`
+        // sets `decode_ready`.
+        let coordinator = WindowCoordinator::new(
+            serde_json::json!({ "buffer_radius": 0 }),
+            BlackBoxDecoderClient::from_mock(Arc::new(crate::decoder::MockDecoder::new())),
+        );
+        let gid = 1;
+        register_submit_fixture(&coordinator, gid).await;
+        coordinator
+            .gadgets
+            .write()
+            .await
+            .insert(gid, gadget_with_outcomes(gid, /* gtype */ 0, /* binding_cid */ None, None));
+
+        coordinator
+            .submit_outcomes(gid, bit_vector::from_sparse_indices(3, &[1, 2]))
+            .await
+            .expect("submit");
+        assert!(
+            coordinator
+                .gadgets
+                .read()
+                .await
+                .get(&gid)
+                .unwrap()
+                .decode_ready
+                .borrow()
+                .is_none(),
+            "submit_outcomes alone must not mark the gadget decode-ready",
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_outcomes_is_idempotent_with_decode_reload() {
+        // decode() re-sends the same outcomes after submit_outcomes already loaded
+        // them into the tracker; the second load_raw must be a no-op, not a panic
+        // (this is the BB-Star `unreachable` trap the idempotency guard prevents).
+        let coordinator = WindowCoordinator::new(
+            serde_json::json!({ "buffer_radius": 0 }),
+            BlackBoxDecoderClient::from_mock(Arc::new(crate::decoder::MockDecoder::new())),
+        );
+        let gid = 1;
+        register_submit_fixture(&coordinator, gid).await;
+        coordinator
+            .gadgets
+            .write()
+            .await
+            .insert(gid, gadget_with_outcomes(gid, /* gtype */ 0, /* binding_cid */ None, None));
+
+        let bits = bit_vector::from_sparse_indices(3, &[1, 2]);
+        coordinator.submit_outcomes(gid, bits.clone()).await.expect("submit");
+        // Re-loading the same raw outcomes (as decode() does) is a no-op.
+        let readouts: Vec<bool> = vec![];
+        coordinator.pauli_frame_tracker.lock().await.load_raw(gid, &readouts, &bits);
     }
 }

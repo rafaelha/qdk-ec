@@ -1420,6 +1420,13 @@ impl coordinator::coordinator_server::Coordinator for MonolithicCoordinator {
         }
         Ok(().into())
     }
+
+    /// The monolithic coordinator only decodes once every output port is
+    /// connected and all measurements are loaded, so it surfaces detectors
+    /// through `decode`; publishing outcomes early is a no-op.
+    async fn submit_outcomes(&self, _request: Request<coordinator::Outcomes>) -> Result<Response<()>, Status> {
+        Ok(Response::new(()))
+    }
 }
 
 /// define your own union-find node data structure like this

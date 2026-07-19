@@ -174,4 +174,11 @@ impl coordinator::coordinator_server::Coordinator for NaiveCoordinator {
         self.next_eid.store(self.config.id_bias, Ordering::Relaxed);
         Ok(().into())
     }
+
+    /// The naive coordinator has no notion of measurement-time detectors, so
+    /// publishing outcomes early is a no-op; detectors are surfaced (as all-0)
+    /// through `decode`.
+    async fn submit_outcomes(&self, _request: Request<coordinator::Outcomes>) -> Result<Response<()>, Status> {
+        Ok(Response::new(()))
+    }
 }

@@ -205,6 +205,13 @@ impl PauliFrameTracker {
 
     pub fn load_raw(&mut self, gid: u64, raw_readouts: &[bool], raw_measurements: &util::BitVector) {
         let gadget = self.gadgets.get_mut(&gid).unwrap();
+        // Idempotent: outcomes reach the tracker from BOTH submit_outcomes
+        // (measurement time) and decode() (which re-sends the same outcomes);
+        // whichever lands first wins, the repeat is a no-op.
+        if gadget.raw_measurements.is_some() {
+            debug_assert_eq!(gadget.num_measurements() as u64, raw_measurements.size);
+            return;
+        }
         debug_assert!(gadget.raw_readouts.is_none());
         debug_assert!(gadget.raw_measurements.is_none());
         debug_assert!(gadget.num_readouts() == raw_readouts.len());

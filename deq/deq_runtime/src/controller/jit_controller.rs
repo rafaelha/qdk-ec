@@ -446,9 +446,39 @@ impl JitController {
 
     pub async fn decode_single(
         self: &Arc<Self>,
-        outcomes: crate::coordinator::Outcomes,
+        mut outcomes: crate::coordinator::Outcomes,
     ) -> Result<crate::coordinator::Readouts, tonic::Status> {
         let gid = outcomes.gid;
+
+        // Impute lost measurement bits ONCE, before anything observes them: the
+        // early submit below and the final `decode` must publish bit-identical
+        // outcomes (decode "re-submits the same outcomes idempotently"), so the
+        // random imputation cannot be left to the coordinator's decode path.
+        // Takes `loss_mask` so the coordinator won't re-impute.
+        if outcomes.loss_mask.is_some() {
+            let coordinator_guard = self.coordinator.read().await;
+            let coordinator = coordinator_guard
+                .as_ref()
+                .ok_or_else(|| tonic::Status::failed_precondition("coordinator not connected"))?;
+            coordinator.impute_loss_outcomes(&mut outcomes).await;
+        }
+
+        // Publish the raw outcomes to the coordinator BEFORE waiting on the error
+        // model. The gadget's finished-detector syndrome is a pure function of these
+        // outcomes, so this lets a detector-conditioned branch resolve at measurement
+        // time. The error-model load below can depend on a *future* gadget's gid (its
+        // output-port connection); if that gadget is gated behind the branch, waiting
+        // for the error model before submitting outcomes deadlocks the detector against
+        // the branch. `decode` re-submits the same outcomes idempotently.
+        if outcomes.outcomes.is_some() {
+            self.coordinator
+                .read()
+                .await
+                .as_ref()
+                .ok_or_else(|| tonic::Status::failed_precondition("coordinator not connected"))?
+                .submit_outcomes(outcomes.clone())
+                .await?;
+        }
 
         let rx = self.error_model_loaded.write().await.remove(&gid).ok_or_else(|| {
             tonic::Status::invalid_argument(format!("decode called for unknown or already-decoded gid: {gid}"))
