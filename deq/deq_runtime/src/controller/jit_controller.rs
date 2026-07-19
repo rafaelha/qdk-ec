@@ -510,6 +510,20 @@ impl JitController {
         coordinator.decode(outcomes).await
     }
 
+    /// Finished-detector bits for a gadget, resolved as soon as its checks are
+    /// finished — WITHOUT waiting for the BP decode (unlike `decode_single`).
+    /// Detectors are a pure function of the submitted measurement outcomes, so this
+    /// does not consume the error-model oneshot (the error model gates the decode,
+    /// not the syndrome). The outcomes must have been submitted (via `decode_single`
+    /// for this gid) for the syndrome to become available.
+    pub async fn detectors_single(self: &Arc<Self>, gid: u64) -> Result<crate::util::BitVector, tonic::Status> {
+        let coordinator_guard = self.coordinator.read().await;
+        let coordinator = coordinator_guard
+            .as_ref()
+            .ok_or_else(|| tonic::Status::failed_precondition("coordinator not connected"))?;
+        coordinator.wait_for_detectors(gid).await
+    }
+
     /// Fire the cancellation token to abort any pending error-model loads and
     /// in-flight decodes. Used by [`crate::server::LocalServer::shutdown`] to
     /// propagate runtime shutdown into the service layer. Unlike [`Self::reset`],

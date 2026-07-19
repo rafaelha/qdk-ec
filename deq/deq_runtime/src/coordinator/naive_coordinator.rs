@@ -56,6 +56,12 @@ impl NaiveCoordinator {
             next_eid: AtomicU64::new(id_bias),
         }
     }
+
+    /// The naive coordinator does no real syndrome computation, so it has no
+    /// detectors to surface early — return an empty bus (uniform split-decode API).
+    pub async fn wait_for_detectors(&self, _gid: u64) -> Result<BitVector, Status> {
+        Ok(crate::misc::bit_vector::from_sparse_indices(0, &[]))
+    }
 }
 
 #[tonic::async_trait]
@@ -180,5 +186,18 @@ impl coordinator::coordinator_server::Coordinator for NaiveCoordinator {
     /// through `decode`.
     async fn submit_outcomes(&self, _request: Request<coordinator::Outcomes>) -> Result<Response<()>, Status> {
         Ok(Response::new(()))
+    }
+
+    async fn wait_for_detectors(
+        &self,
+        request: Request<coordinator::DetectorRequest>,
+    ) -> Result<Response<coordinator::Readouts>, Status> {
+        let gid = request.into_inner().gid;
+        let detectors = self.wait_for_detectors(gid).await?;
+        Ok(Response::new(coordinator::Readouts {
+            gid,
+            detectors: Some(detectors),
+            ..Default::default()
+        }))
     }
 }

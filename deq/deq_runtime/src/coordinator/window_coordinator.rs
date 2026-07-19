@@ -528,6 +528,43 @@ impl WindowCoordinator {
         detectors
     }
 
+    /// Return a gadget's finished-detector bits (its check-model syndrome) as soon
+    /// as they are computable — i.e. once the gadget's checks are FINISHED (all
+    /// constituent measurement outcomes submitted) — WITHOUT waiting for the BP
+    /// decode. Detectors are a pure function of the measurement outcomes, so the
+    /// syndrome-computation task (spawned in `execute`) already produces exactly
+    /// these bits and publishes them on `check_model.syndrome`, independent of the
+    /// pauli frame. A gadget with no bound check model has no detectors (empty bus).
+    pub async fn wait_for_detectors(&self, gid: u64) -> Result<BitVector, Status> {
+        let token = self.cancellation.read().await.clone();
+        let cid = {
+            let gadgets = self.gadgets.read().await;
+            gadgets
+                .get(&gid)
+                .ok_or_else(|| Status::not_found(format!("gid={gid}")))?
+                .binding_cid
+        };
+        let Some(cid) = cid else {
+            return Ok(bit_vector::from_sparse_indices(0, &[]));
+        };
+        // Subscribe under the lock (no await), then drop it before awaiting so the
+        // syndrome wait never holds the check-model map across an await point.
+        let pending = {
+            let check_models = self.check_models.read().await;
+            let cm = check_models
+                .get(&cid)
+                .ok_or_else(|| Status::not_found(format!("cid={cid}")))?;
+            get_or_receiver(&cm.syndrome, token.clone())
+        };
+        match pending {
+            Ok(syndrome) => Ok(syndrome),
+            Err(handle) => handle
+                .await
+                .unwrap_or(None)
+                .ok_or_else(|| Status::cancelled("detectors cancelled by reset")),
+        }
+    }
+
     /// Publish a gadget's raw measurement outcomes to its `outcomes` channel
     /// WITHOUT running the decode. This is what the per-check-model syndrome task
     /// (spawned in `execute`) waits on, so calling this makes a gadget's finished
@@ -2993,6 +3030,19 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
         self.submit_outcomes(gid, data).await?;
         Ok(Response::new(()))
     }
+
+    async fn wait_for_detectors(
+        &self,
+        request: Request<coordinator::DetectorRequest>,
+    ) -> Result<Response<coordinator::Readouts>, Status> {
+        let gid = request.into_inner().gid;
+        let detectors = self.wait_for_detectors(gid).await?;
+        Ok(Response::new(coordinator::Readouts {
+            gid,
+            detectors: Some(detectors),
+            ..Default::default()
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -3333,6 +3383,68 @@ mod tests {
         let check_models: HashMap<u64, CheckModel> = HashMap::new();
 
         let detectors = coordinator.get_gadget_detectors(gid, &gadgets, &check_models).await;
+        assert_eq!(detectors.size, 0);
+    }
+
+    // ─── wait_for_detectors ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn wait_for_detectors_resolves_from_syndrome_without_decode() {
+        // Detectors come from the check-model syndrome, NOT the pauli frame. Publish
+        // the syndrome but leave `pauli_frame` UNSET (decode not done) and confirm
+        // wait_for_detectors still returns the detector bits — proving it does not
+        // wait for the BP decode.
+        let coordinator = WindowCoordinator::new(
+            serde_json::json!({ "buffer_radius": 0 }),
+            BlackBoxDecoderClient::from_mock(Arc::new(crate::decoder::MockDecoder::new())),
+        );
+        let gid = 1;
+        let cid = 1;
+        coordinator.gadgets.write().await.insert(
+            gid,
+            gadget_with_outcomes(
+                gid,
+                /* gtype */ 0,
+                Some(cid),
+                Some(bit_vector::from_sparse_indices(3, &[1, 2])),
+            ),
+        );
+        let cm = local_check_model(cid, /* ctype */ 0, gid);
+        cm.syndrome.send_replace(Some(bit_vector::from_sparse_indices(2, &[0])));
+        coordinator.check_models.write().await.insert(cid, cm);
+
+        let detectors = coordinator.wait_for_detectors(gid).await.expect("detectors");
+        assert_eq!(detectors.size, 2);
+        assert_eq!(bit_vector::to_sparse_indices(&detectors), vec![0]);
+        // The pauli frame was never set, so this proves decode-independence.
+        assert!(
+            coordinator
+                .gadgets
+                .read()
+                .await
+                .get(&gid)
+                .unwrap()
+                .pauli_frame
+                .borrow()
+                .is_none(),
+            "detectors resolved without any decode / pauli-frame",
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_detectors_empty_when_no_binding() {
+        // A gadget with no bound check model has no detectors (empty bus), no hang.
+        let coordinator = WindowCoordinator::new(
+            serde_json::json!({ "buffer_radius": 0 }),
+            BlackBoxDecoderClient::from_mock(Arc::new(crate::decoder::MockDecoder::new())),
+        );
+        let gid = 1;
+        coordinator
+            .gadgets
+            .write()
+            .await
+            .insert(gid, gadget_with_outcomes(gid, /* gtype */ 0, /* binding_cid */ None, None));
+        let detectors = coordinator.wait_for_detectors(gid).await.expect("detectors");
         assert_eq!(detectors.size, 0);
     }
 

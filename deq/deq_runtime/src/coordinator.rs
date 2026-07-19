@@ -255,6 +255,23 @@ impl CoordinatorClient {
         .map(|v| v.into_inner())
     }
 
+    /// Finished-detector bits for a gadget, available WITHOUT waiting for the BP
+    /// decode (detectors are a pure function of measurement outcomes). The window
+    /// coordinator resolves these as soon as the gadget's checks are finished;
+    /// monolithic/naive/mock return an empty bus (they surface detectors via
+    /// `decode`). The outcomes must have been submitted (via `submit_outcomes` /
+    /// `decode`) for the syndrome to become available.
+    pub async fn wait_for_detectors(&self, gid: u64) -> std::result::Result<crate::util::BitVector, Status> {
+        let request = Request::new(DetectorRequest { gid });
+        let readouts = (match self {
+            #[cfg(feature = "cli")]
+            CoordinatorClient::Remote(client) => client.clone().wait_for_detectors(request).await,
+            CoordinatorClient::Local(local) => local.inner().wait_for_detectors(request).await,
+        })?
+        .into_inner();
+        Ok(readouts.detectors.unwrap_or_default())
+    }
+
     /// Apply loss-random-imputation to `outcomes.outcomes` in place using the
     /// target coordinator's RNG, and TAKE `outcomes.loss_mask` so downstream
     /// consumers (the coordinator's own `decode`) cannot re-impute with a

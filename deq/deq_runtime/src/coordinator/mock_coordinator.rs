@@ -550,4 +550,16 @@ impl coordinator_server::Coordinator for MockCoordinator {
     async fn submit_outcomes(&self, _request: Request<coordinator::Outcomes>) -> Result<Response<()>, Status> {
         Ok(Response::new(()))
     }
+
+    async fn wait_for_detectors(
+        &self,
+        request: Request<coordinator::DetectorRequest>,
+    ) -> Result<Response<coordinator::Readouts>, Status> {
+        let gid = request.into_inner().gid;
+        Ok(Response::new(coordinator::Readouts {
+            gid,
+            detectors: Some(crate::util::BitVector::default()),
+            ..Default::default()
+        }))
+    }
 }

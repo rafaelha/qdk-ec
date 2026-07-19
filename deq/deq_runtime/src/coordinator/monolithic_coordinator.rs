@@ -473,6 +473,15 @@ impl MonolithicCoordinator {
         }
     }
 
+    /// The monolithic coordinator computes detectors as part of the full-subgraph
+    /// decode, so it has no early standalone syndrome to surface ahead of the
+    /// decode; callers still receive detectors via the normal decode result.
+    /// Early standalone detectors are a window-coordinator feature — return an
+    /// empty bus here so the split-decode API is uniform across coordinators.
+    pub async fn wait_for_detectors(&self, _gid: u64) -> Result<BitVector, Status> {
+        Ok(bit_vector::from_sparse_indices(0, &[]))
+    }
+
     /// Compute one gadget's finished-detector bits from its bound check model,
     /// reusing the same defect computation as `get_syndrome` but for a single
     /// check model indexed from 0. Returns an empty `BitVector` if the gadget has
@@ -1426,6 +1435,19 @@ impl coordinator::coordinator_server::Coordinator for MonolithicCoordinator {
     /// through `decode`; publishing outcomes early is a no-op.
     async fn submit_outcomes(&self, _request: Request<coordinator::Outcomes>) -> Result<Response<()>, Status> {
         Ok(Response::new(()))
+    }
+
+    async fn wait_for_detectors(
+        &self,
+        request: Request<coordinator::DetectorRequest>,
+    ) -> Result<Response<coordinator::Readouts>, Status> {
+        let gid = request.into_inner().gid;
+        let detectors = self.wait_for_detectors(gid).await?;
+        Ok(Response::new(coordinator::Readouts {
+            gid,
+            detectors: Some(detectors),
+            ..Default::default()
+        }))
     }
 }
 
