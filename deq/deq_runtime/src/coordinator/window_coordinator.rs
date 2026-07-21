@@ -1747,8 +1747,14 @@ impl WindowCoordinator {
         span.add_property(|| ("syndrome", format!("{:?}", syndrome)));
 
         let cache_key = if self.config.persistent_decoder {
-            let error_models = self.error_models.read().await;
+            // Lock order: error_model_types (field 4) BEFORE error_models
+            // (field 7). The reverse order deadlocked in a 3-cycle with
+            // execute(ErrorModel) (holds error_model_types.read, waits
+            // error_models.write) and load_library (write on
+            // error_model_types queued in between, blocking this task's
+            // error_model_types.read under the fair RwLock).
             let error_model_types = self.error_model_types.read().await;
+            let error_models = self.error_models.read().await;
             Some(DecoderCacheKey {
                 relative_program: relative_program.clone(),
                 error_model_fingerprints: build_modifier_fingerprints(mapping, &error_models, &error_model_types),
