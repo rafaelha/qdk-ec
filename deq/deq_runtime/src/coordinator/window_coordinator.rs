@@ -507,9 +507,15 @@ impl WindowCoordinator {
         }
         .ok_or_else(|| Status::cancelled("decode cancelled by reset"))?;
         let detectors = {
+            // Lock order: check_model_types before gadgets/check_models (field
+            // order). Acquiring it inside get_gadget_detectors while holding the
+            // two read guards below deadlocked against execute(CheckModel)
+            // (holds check_model_types.read, waits gadgets.write) once a
+            // load_library writer queued on check_model_types in between.
+            let check_model_types = self.check_model_types.read().await;
             let gadgets = self.gadgets.read().await;
             let check_models = self.check_models.read().await;
-            self.get_gadget_detectors(gid, &gadgets, &check_models).await
+            Self::get_gadget_detectors(gid, &check_model_types, &gadgets, &check_models)
         };
         Ok((coordinator::Readouts {
             gid,
@@ -524,9 +530,15 @@ impl WindowCoordinator {
     /// reusing the same defect computation as the window syndrome pass but for a
     /// single check model indexed from 0. Returns an empty `BitVector` if the
     /// gadget has no bound check model or its check model defines no checks.
-    async fn get_gadget_detectors(
-        &self,
+    ///
+    /// Deliberately sync: the caller passes all three map guards, acquired in
+    /// field order (check_model_types → gadgets → check_models). This function
+    /// used to acquire `check_model_types.read()` itself while the caller held
+    /// the gadget/check-model guards — a lock-order inversion that could
+    /// deadlock the whole coordinator (see `wait_for_pauli_frame`).
+    fn get_gadget_detectors(
         gid: u64,
+        check_model_types: &HashMap<u64, Arc<bin::CheckModelType>>,
         gadgets: &HashMap<u64, Gadget>,
         check_models: &HashMap<u64, CheckModel>,
     ) -> BitVector {
@@ -542,7 +554,6 @@ impl WindowCoordinator {
             Some(cm) => cm,
             None => return bit_vector::from_sparse_indices(0, &[]),
         };
-        let check_model_types = self.check_model_types.read().await;
         let check_model_type = check_model_types.get(&check_model.instance.ctype).unwrap();
         let n = check_model_type.checks.len();
         let mut detectors = bit_vector::from_sparse_indices(n as u64, &[]);
@@ -3627,7 +3638,8 @@ mod tests {
         let mut check_models: HashMap<u64, CheckModel> = HashMap::new();
         check_models.insert(cid, local_check_model(cid, ctype, gid));
 
-        let detectors = coordinator.get_gadget_detectors(gid, &gadgets, &check_models).await;
+        let check_model_types = coordinator.check_model_types.read().await;
+        let detectors = WindowCoordinator::get_gadget_detectors(gid, &check_model_types, &gadgets, &check_models);
         assert_eq!(detectors.size, 2);
         assert_eq!(bit_vector::to_sparse_indices(&detectors), vec![0]);
     }
@@ -3652,7 +3664,8 @@ mod tests {
         );
         let check_models: HashMap<u64, CheckModel> = HashMap::new();
 
-        let detectors = coordinator.get_gadget_detectors(gid, &gadgets, &check_models).await;
+        let check_model_types = coordinator.check_model_types.read().await;
+        let detectors = WindowCoordinator::get_gadget_detectors(gid, &check_model_types, &gadgets, &check_models);
         assert_eq!(detectors.size, 0);
     }
 
