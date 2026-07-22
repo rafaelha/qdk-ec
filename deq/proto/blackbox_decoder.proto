@@ -51,7 +51,12 @@ message LoadedDecodingProblem {
   deq.util.BitVector syndrome = 2;
 }
 
-message ParityFactor { repeated uint64 subgraph = 1; }
+message ParityFactor {
+  repeated uint64 subgraph = 1;
+  // decoder-side wall-clock of the service handler's actual decoding work,
+  // for separating decoder compute from transport overhead. 0 = not reported.
+  uint64 compute_ns = 2;
+}
 
 message DecodingHypergraph {
   uint64 vertex_num = 1;

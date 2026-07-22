@@ -1674,6 +1674,13 @@ impl coordinator::coordinator_server::Coordinator for MonolithicCoordinator {
         self.set_dem_enabled(request.into_inner().enabled);
         Ok(Response::new(()))
     }
+
+    async fn drain_window_timings(
+        &self,
+        _request: Request<()>,
+    ) -> Result<Response<coordinator::WindowTimingsResponse>, Status> {
+        Ok(Response::new(coordinator::WindowTimingsResponse::default()))
+    }
 }
 
 /// define your own union-find node data structure like this

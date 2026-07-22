@@ -3330,6 +3330,13 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
         self.set_dem_enabled(request.into_inner().enabled);
         Ok(Response::new(()))
     }
+
+    async fn drain_window_timings(
+        &self,
+        _request: Request<()>,
+    ) -> Result<Response<coordinator::WindowTimingsResponse>, Status> {
+        Ok(Response::new(coordinator::WindowTimingsResponse::default()))
+    }
 }
 
 #[cfg(test)]

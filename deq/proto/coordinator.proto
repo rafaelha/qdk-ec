@@ -43,6 +43,10 @@ service Coordinator {
   // enable/disable DEM recording. The server starts with recording DISABLED;
   // the playground turns it on per replay shot.
   rpc SetDemEnabled(DemEnabledRequest) returns (google.protobuf.Empty);
+  // drain the per-window decode timing records accumulated since the previous
+  // drain (or reset). Always recorded — unlike the DEM log there is no enable
+  // flag; records are ~30 scalars per window decode.
+  rpc DrainWindowTimings(google.protobuf.Empty) returns (WindowTimingsResponse);
 }
 
 // A global DEM id pair — (cid, check_index) for a detector, or
@@ -170,4 +174,54 @@ message Readouts {
   // the gadget's finished-detector parities (its check-model syndrome),
   // populated by Decode and WaitForDetectors
   deq.util.BitVector detectors = 4;
+}
+
+// How decode_parity_factor obtained its decoding hypergraph.
+enum DecodePath {
+  // reused an already-loaded hypergraph (decode_loaded, zero construction)
+  CACHE_HIT = 0;
+  // persistent decoder, first encounter: built + load_hypergraph + decode_loaded
+  BUILT_LOADED = 1;
+  // non-persistent config: built + inline decode (no load step)
+  TEMPORARY = 2;
+}
+
+// Wall-clock timing of one window decode. All *_ns timestamps share the
+// process-monotonic origin of timestamp_ns(); durations are plain ns.
+// Construction phases (build/merge/compact/load) are 0 on CACHE_HIT.
+message WindowTiming {
+  // monotone per-shot counter, assigned by the timing log in push order
+  uint64 seq = 1;
+  repeated uint64 window_gids = 2;
+  // max over the window's check models of their syndrome-complete time
+  // (0 when unknown, e.g. monolithic approximates with decode entry)
+  uint64 syndrome_ready_ns = 3;
+  uint64 decode_start_ns = 4;
+  uint64 decode_end_ns = 5;
+  // window-exploration compute (select_commit_region + shrink_window); 0 monolithic
+  uint64 explore_ns = 6;
+  uint64 build_ns = 7;    // decoding_hypergraph()
+  uint64 merge_ns = 8;    // hyperedge merging (0 if merge_hyperedges off)
+  uint64 compact_ns = 9;  // compact_vertices (0 monolithic)
+  uint64 load_ns = 10;    // load_hypergraph into the decoder service
+  uint64 decode_ns = 11;  // the decode / decode_loaded call, client-observed
+  DecodePath path = 12;
+  uint32 syndrome_weight = 13;    // fired detectors (popcount of the syndrome)
+  uint32 correction_weight = 14;  // parity_factor.subgraph.len()
+  uint32 num_hyperedges = 15;
+  uint32 num_vertices = 16;
+  uint32 num_gadgets = 17;        // decoder-window gadget count
+  uint32 num_committing = 18;     // commit-region gadget count (== num_gadgets monolithic)
+  uint32 concurrent_decodes = 19; // decodes in flight when this one started (incl. self)
+  uint32 cache_size = 20;         // loaded_decoders entries after this decode
+  uint64 syndrome_bytes = 21;     // syndrome BitVector payload bytes
+  uint64 parity_factor_bytes = 22; // encoded_len of the returned ParityFactor
+  uint64 hypergraph_bytes = 23;   // encoded_len of the hypergraph at load; 0 on CACHE_HIT
+  // decoder-side compute reported by the decoder service (ParityFactor.compute_ns);
+  // comms overhead = decode_ns - decoder_compute_ns
+  uint64 decoder_compute_ns = 24;
+}
+
+message WindowTimingsResponse {
+  repeated WindowTiming timings = 1;
 }

@@ -120,7 +120,7 @@ impl<T: DecoderInstance + Send + 'static> black_box_decoder_server::BlackBoxDeco
         let problem = request.into_inner();
         // Skip decoding entirely when syndrome has no defects
         if problem.syndrome.as_ref().is_some_and(|s| s.data.iter().all(|&b| b == 0)) {
-            return Ok(Response::new(ParityFactor { subgraph: vec![] }));
+            return Ok(Response::new(ParityFactor { subgraph: vec![], compute_ns: 0 }));
         }
         let (tx, rx) = oneshot::channel::<ParityFactor>();
         let original_config = self.original_config.clone();
@@ -201,7 +201,7 @@ impl<T: DecoderInstance + Send + 'static> black_box_decoder_server::BlackBoxDeco
         let problem = request.into_inner();
         // Skip decoding entirely when syndrome has no defects
         if problem.syndrome.as_ref().is_some_and(|s| s.data.iter().all(|&b| b == 0)) {
-            return Ok(Response::new(ParityFactor { subgraph: vec![] }));
+            return Ok(Response::new(ParityFactor { subgraph: vec![], compute_ns: 0 }));
         }
         let (tx, rx) = oneshot::channel::<ParityFactor>();
         // Increment counter BEFORE accessing the loaded map, so that

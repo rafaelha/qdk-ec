@@ -174,7 +174,7 @@ impl DecoderInstance for PythonDecoderInstance {
             py_result.extract::<Vec<u64>>()
         })
         .unwrap();
-        ParityFactor { subgraph }
+        ParityFactor { subgraph, compute_ns: 0 }
     }
 
     fn reset(&mut self) {

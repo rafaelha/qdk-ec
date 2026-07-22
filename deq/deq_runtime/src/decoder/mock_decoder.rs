@@ -168,7 +168,7 @@ impl black_box_decoder_server::BlackBoxDecoder for MockDecoder {
         let subgraph = Self::get_response(&state, &syndrome);
         drop(state);
         self.apply_delay().await;
-        Ok(Response::new(blackbox_decoder::ParityFactor { subgraph }))
+        Ok(Response::new(blackbox_decoder::ParityFactor { subgraph, compute_ns: 0 }))
     }
 
     async fn load_hypergraph(
@@ -205,7 +205,7 @@ impl black_box_decoder_server::BlackBoxDecoder for MockDecoder {
         let subgraph = Self::get_response(&state, &syndrome);
         drop(state);
         self.apply_delay().await;
-        Ok(Response::new(blackbox_decoder::ParityFactor { subgraph }))
+        Ok(Response::new(blackbox_decoder::ParityFactor { subgraph, compute_ns: 0 }))
     }
 
     async fn reset(&self, request: Request<blackbox_decoder::ResetRequest>) -> Result<Response<()>, Status> {

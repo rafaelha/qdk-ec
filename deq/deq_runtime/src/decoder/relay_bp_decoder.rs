@@ -216,6 +216,7 @@ impl<N: RelayBPDecoderDataType + 'static> DecoderInstance for RelayBPDecoderInst
                 .enumerate()
                 .filter_map(|(i, &bit)| if bit == 1 { Some(i as u64) } else { None })
                 .collect(),
+            compute_ns: 0,
         }
     }
 

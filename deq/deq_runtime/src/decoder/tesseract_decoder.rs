@@ -82,7 +82,7 @@ impl DecoderInstance for TesseractDecoderInstance {
     fn decode(&mut self, syndrome: &BitVector) -> ParityFactor {
         let detections: Vec<u64> = to_sparse_indices(syndrome);
         let error_indices = self.decoder.decode(&detections);
-        ParityFactor { subgraph: error_indices }
+        ParityFactor { subgraph: error_indices, compute_ns: 0 }
     }
 
     fn reset(&mut self) {
