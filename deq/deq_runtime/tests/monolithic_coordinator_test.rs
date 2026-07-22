@@ -1895,3 +1895,48 @@ async fn test_persistent_decoder_reuses_cache_when_modifier_unchanged() {
     let loaded_decoders = coordinator.loaded_decoders.read().await;
     assert_eq!(loaded_decoders.len(), 1, "Expected a single cache entry");
 }
+
+// ─── monolithic decode timing (Task 4) ─────────────────────────────────────
+
+/// Mirrors `drain_window_timings_returns_and_clears_records` (window
+/// coordinator, Task 3): run a canonical shot through the persistent-decoder
+/// monolithic coordinator, then confirm `DrainWindowTimings` reports exactly
+/// one settled record with monolithic's spec-blessed semantics (no
+/// exploration, no compaction, and `num_gadgets == num_committing ==
+/// window_gids.len()` since monolithic always commits the whole subgraph),
+/// and that draining clears the log.
+#[tokio::test]
+async fn monolithic_drain_window_timings_records_decodes() {
+    let mock = make_mock_decoder();
+    let coord = make_persistent_coordinator(mock.clone());
+
+    Coordinator::load_library(&coord, Request::new(make_default_library()))
+        .await
+        .unwrap();
+    run_canonical_shot(&coord, None, None).await;
+
+    let timings = Coordinator::drain_window_timings(&coord, Request::new(()))
+        .await
+        .unwrap()
+        .into_inner()
+        .timings;
+    assert!(!timings.is_empty(), "at least one monolithic decode must be recorded");
+    for t in &timings {
+        assert!(t.decode_ns > 0, "decode duration must be measured");
+        assert_eq!(t.explore_ns, 0, "monolithic does no window exploration");
+        assert_eq!(t.compact_ns, 0, "monolithic never compacts vertices");
+        assert_eq!(t.num_gadgets, t.num_committing, "monolithic commits the whole subgraph");
+        assert_eq!(
+            t.num_gadgets as usize,
+            t.window_gids.len(),
+            "window_gids must be derived from the same gadget set as num_gadgets"
+        );
+        assert!(t.decode_end_ns >= t.decode_start_ns);
+    }
+    let again = Coordinator::drain_window_timings(&coord, Request::new(()))
+        .await
+        .unwrap()
+        .into_inner()
+        .timings;
+    assert!(again.is_empty(), "drain must clear the log");
+}

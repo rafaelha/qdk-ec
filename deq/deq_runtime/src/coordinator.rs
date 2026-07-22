@@ -414,6 +414,23 @@ impl CoordinatorClient {
             .map(|r| r.into_inner().predictions.into_iter().map(Into::into).collect())
             .unwrap_or_default()
     }
+
+    /// Drain every queued per-window/per-subgraph decode timing record. Both
+    /// `WindowCoordinator` and `MonolithicCoordinator` record these (Tasks 3-4);
+    /// the other Local arms have no timing log to drain. Follows the exact
+    /// dispatch pattern of `reset`/`decode` above: the `Remote` arm issues the
+    /// `DrainWindowTimings` RPC (request is `google.protobuf.Empty`), the
+    /// `Local` arm calls straight into the `coordinator_server::Coordinator`
+    /// trait via `DynCoordinator::inner()`.
+    pub async fn drain_window_timings(&self) -> std::result::Result<Vec<WindowTiming>, Status> {
+        let request = Request::new(());
+        (match self {
+            #[cfg(feature = "cli")]
+            CoordinatorClient::Remote(client) => client.clone().drain_window_timings(request).await,
+            CoordinatorClient::Local(local) => local.inner().drain_window_timings(request).await,
+        })
+        .map(|v| v.into_inner().timings)
+    }
 }
 
 #[cfg(test)]
