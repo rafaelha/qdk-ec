@@ -224,4 +224,8 @@ message WindowTiming {
 
 message WindowTimingsResponse {
   repeated WindowTiming timings = 1;
+  // Server clock (timestamp_ns() origin — the same clock every WindowTiming
+  // timestamp uses) at the moment this drain was answered. Lets the client
+  // convert server timestamps into its own timeline (clock synchronization).
+  uint64 drained_at_ns = 2;
 }

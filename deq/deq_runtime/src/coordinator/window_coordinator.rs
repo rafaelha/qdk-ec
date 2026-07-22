@@ -3445,6 +3445,7 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
     ) -> Result<Response<coordinator::WindowTimingsResponse>, Status> {
         Ok(Response::new(coordinator::WindowTimingsResponse {
             timings: self.timing_log.drain(),
+            drained_at_ns: crate::misc::util::timestamp_ns(),
         }))
     }
 }

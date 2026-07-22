@@ -243,6 +243,11 @@ pub struct WindowTiming {
 pub struct WindowTimingsResponse {
     #[prost(message, repeated, tag = "1")]
     pub timings: ::prost::alloc::vec::Vec<WindowTiming>,
+    /// Server clock (timestamp_ns() origin — the same clock every WindowTiming
+    /// timestamp uses) at the moment this drain was answered. Lets the client
+    /// convert server timestamps into its own timeline (clock synchronization).
+    #[prost(uint64, tag = "2")]
+    pub drained_at_ns: u64,
 }
 /// How decode_parity_factor obtained its decoding hypergraph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]

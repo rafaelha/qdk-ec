@@ -422,14 +422,16 @@ impl CoordinatorClient {
     /// `DrainWindowTimings` RPC (request is `google.protobuf.Empty`), the
     /// `Local` arm calls straight into the `coordinator_server::Coordinator`
     /// trait via `DynCoordinator::inner()`.
-    pub async fn drain_window_timings(&self) -> std::result::Result<Vec<WindowTiming>, Status> {
+    pub async fn drain_window_timings(
+        &self,
+    ) -> std::result::Result<WindowTimingsResponse, Status> {
         let request = Request::new(());
         (match self {
             #[cfg(feature = "cli")]
             CoordinatorClient::Remote(client) => client.clone().drain_window_timings(request).await,
             CoordinatorClient::Local(local) => local.inner().drain_window_timings(request).await,
         })
-        .map(|v| v.into_inner().timings)
+        .map(|v| v.into_inner())
     }
 }
 

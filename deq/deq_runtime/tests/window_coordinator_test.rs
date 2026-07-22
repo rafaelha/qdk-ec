@@ -4595,11 +4595,13 @@ async fn drain_window_timings_returns_and_clears_records() {
     exec_error_model(&coord, make_error_model(0, 5, 2)).await;
     let (_r1, _r2) = tokio::join!(decode(&coord, gid_a, 1), decode(&coord, gid_b, 1));
 
-    let timings = Coordinator::drain_window_timings(&coord, Request::new(()))
-        .await
-        .unwrap()
-        .into_inner()
-        .timings;
+    let resp = Coordinator::drain_window_timings(&coord, Request::new(()))
+        .await.unwrap().into_inner();
+    assert!(resp.drained_at_ns > 0, "server must stamp its clock on the drain");
+    let max_end = resp.timings.iter().map(|t| t.decode_end_ns).max().unwrap();
+    assert!(resp.drained_at_ns >= max_end,
+        "drain stamp is taken after every drained record was completed");
+    let timings = resp.timings;
     assert!(!timings.is_empty(), "at least one window decode must be recorded");
     for t in &timings {
         assert!(!t.window_gids.is_empty());
