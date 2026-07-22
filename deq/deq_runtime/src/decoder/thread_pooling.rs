@@ -117,10 +117,15 @@ impl<T: DecoderInstance + Send + 'static> black_box_decoder_server::BlackBoxDeco
         &self,
         request: Request<blackbox_decoder::DecodingProblem>,
     ) -> Result<Response<blackbox_decoder::ParityFactor>, Status> {
+        // includes pool queueing: everything server-side of the RPC boundary
+        let started = std::time::Instant::now();
         let problem = request.into_inner();
         // Skip decoding entirely when syndrome has no defects
         if problem.syndrome.as_ref().is_some_and(|s| s.data.iter().all(|&b| b == 0)) {
-            return Ok(Response::new(ParityFactor { subgraph: vec![], compute_ns: 0 }));
+            return Ok(Response::new(ParityFactor {
+                subgraph: vec![],
+                compute_ns: started.elapsed().as_nanos() as u64,
+            }));
         }
         let (tx, rx) = oneshot::channel::<ParityFactor>();
         let original_config = self.original_config.clone();
@@ -155,7 +160,10 @@ impl<T: DecoderInstance + Send + 'static> black_box_decoder_server::BlackBoxDeco
         self.decoding.send_modify(|v| {
             *v -= 1;
         });
-        let parity_factor = parity_factor.map_err(|_| Status::internal("decode panicked or was cancelled".to_string()))?;
+        let mut parity_factor =
+            parity_factor.map_err(|_| Status::internal("decode panicked or was cancelled".to_string()))?;
+        // includes pool queueing: everything server-side of the RPC boundary
+        parity_factor.compute_ns = started.elapsed().as_nanos() as u64;
         Ok(parity_factor.into())
     }
 
@@ -198,10 +206,15 @@ impl<T: DecoderInstance + Send + 'static> black_box_decoder_server::BlackBoxDeco
         &self,
         request: Request<blackbox_decoder::LoadedDecodingProblem>,
     ) -> Result<Response<blackbox_decoder::ParityFactor>, Status> {
+        // includes pool queueing: everything server-side of the RPC boundary
+        let started = std::time::Instant::now();
         let problem = request.into_inner();
         // Skip decoding entirely when syndrome has no defects
         if problem.syndrome.as_ref().is_some_and(|s| s.data.iter().all(|&b| b == 0)) {
-            return Ok(Response::new(ParityFactor { subgraph: vec![], compute_ns: 0 }));
+            return Ok(Response::new(ParityFactor {
+                subgraph: vec![],
+                compute_ns: started.elapsed().as_nanos() as u64,
+            }));
         }
         let (tx, rx) = oneshot::channel::<ParityFactor>();
         // Increment counter BEFORE accessing the loaded map, so that
@@ -266,9 +279,11 @@ impl<T: DecoderInstance + Send + 'static> black_box_decoder_server::BlackBoxDeco
                 }
             }
         });
-        let parity_factor = rx
+        let mut parity_factor = rx
             .await
             .map_err(|_| Status::internal("decode panicked or was cancelled".to_string()))?;
+        // includes pool queueing: everything server-side of the RPC boundary
+        parity_factor.compute_ns = started.elapsed().as_nanos() as u64;
         Ok(parity_factor.into())
     }
 
