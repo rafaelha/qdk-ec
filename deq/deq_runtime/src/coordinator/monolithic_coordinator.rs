@@ -142,6 +142,11 @@ pub struct MonolithicCoordinator {
     /// decodes the whole connected subgraph as one "window" per record. See
     /// coordinator::timing.
     pub timing_log: coordinator::timing::TimingLog,
+    /// Per-gid stamp of the FIRST time a gadget's outcomes were set (always via
+    /// the `decode` handler here — monolithic's `submit_outcomes` is a no-op).
+    /// Cleared on reset, drained + cleared with the timing log. Mirrors
+    /// `WindowCoordinator::outcome_arrivals`.
+    pub outcome_arrivals: std::sync::Mutex<Vec<coordinator::OutcomeArrival>>,
 }
 
 /// Per-coordinator [`FingerprintSource`] adapter for the monolithic
@@ -262,6 +267,7 @@ impl MonolithicCoordinator {
             loss_imputation_rng,
             dem_log,
             timing_log: Default::default(),
+            outcome_arrivals: Default::default(),
         }
     }
 
@@ -696,6 +702,10 @@ impl MonolithicCoordinator {
         let decode_start_ns = crate::misc::util::timestamp_ns();
         let mut timing = coordinator::WindowTiming {
             syndrome_ready_ns: decode_start_ns,
+            // Monolithic has no per-window readiness event; both window-formation
+            // stamps approximate with the decode entry (mirrors syndrome_ready_ns).
+            leader_arrived_ns: decode_start_ns,
+            mandatory_ready_ns: decode_start_ns,
             decode_start_ns,
             concurrent_decodes: 1,
             ..Default::default()
@@ -1617,6 +1627,13 @@ impl coordinator::coordinator_server::Coordinator for MonolithicCoordinator {
             coordinator::apply_loss_random_imputation(&mut outcome_data, loss_mask, &mut *rng);
         }
         gadget.outcomes.replace(outcome_data);
+        // First-arrival stamp: the early return above on `is_some()` guarantees
+        // this is the None→Some transition. Monolithic's submit_outcomes is a
+        // no-op, so decode() is the only place outcomes are set.
+        self.outcome_arrivals.lock().unwrap().push(coordinator::OutcomeArrival {
+            gid,
+            received_ns: crate::misc::util::timestamp_ns(),
+        });
         let mut pending_subgraphs = self.pending_subgraphs.lock().await;
         let gid_to_union_index = self.gid_to_union_index.lock().await;
         let union_index = gid_to_union_index[&gid];
@@ -1684,6 +1701,7 @@ impl coordinator::coordinator_server::Coordinator for MonolithicCoordinator {
         self.error_models.write().await.clear();
         self.dem_log.reset();
         self.timing_log.reset();
+        self.outcome_arrivals.lock().unwrap().clear();
         *self.next_gid.lock().await = 1;
         *self.next_cid.lock().await = 1;
         *self.next_eid.lock().await = 1;
@@ -1760,6 +1778,7 @@ impl coordinator::coordinator_server::Coordinator for MonolithicCoordinator {
         Ok(Response::new(coordinator::WindowTimingsResponse {
             timings: self.timing_log.drain(),
             drained_at_ns: crate::misc::util::timestamp_ns(),
+            outcome_arrivals: std::mem::take(&mut self.outcome_arrivals.lock().unwrap()),
         }))
     }
 }

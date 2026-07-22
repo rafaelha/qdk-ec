@@ -220,6 +220,19 @@ message WindowTiming {
   // decoder-side compute reported by the decoder service (ParityFactor.compute_ns);
   // comms overhead = decode_ns - decoder_compute_ns
   uint64 decoder_compute_ns = 24;
+  // decode() handler entry of this window's leader gadget (server clock).
+  // Monolithic approximates with the decode entry (== decode_start_ns).
+  uint64 leader_arrived_ns = 25;
+  // step-2 mandatory-zone syndrome wait completed (server clock).
+  // Monolithic approximates with the decode entry (== decode_start_ns).
+  uint64 mandatory_ready_ns = 26;
+}
+
+// The first time a gadget's measurement outcomes are set on a coordinator
+// (via SubmitOutcomes or Decode), stamped with the server clock.
+message OutcomeArrival {
+  uint64 gid = 1;
+  uint64 received_ns = 2;
 }
 
 message WindowTimingsResponse {
@@ -228,4 +241,7 @@ message WindowTimingsResponse {
   // timestamp uses) at the moment this drain was answered. Lets the client
   // convert server timestamps into its own timeline (clock synchronization).
   uint64 drained_at_ns = 2;
+  // Per-gid outcome-arrival stamps accumulated since the previous drain,
+  // cleared here and on reset (same lifecycle as `timings`).
+  repeated OutcomeArrival outcome_arrivals = 3;
 }

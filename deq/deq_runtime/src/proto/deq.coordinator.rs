@@ -238,6 +238,23 @@ pub struct WindowTiming {
     /// comms overhead = decode_ns - decoder_compute_ns
     #[prost(uint64, tag = "24")]
     pub decoder_compute_ns: u64,
+    /// decode() handler entry of this window's leader gadget (server clock).
+    /// Monolithic approximates with the decode entry (== decode_start_ns).
+    #[prost(uint64, tag = "25")]
+    pub leader_arrived_ns: u64,
+    /// step-2 mandatory-zone syndrome wait completed (server clock).
+    /// Monolithic approximates with the decode entry (== decode_start_ns).
+    #[prost(uint64, tag = "26")]
+    pub mandatory_ready_ns: u64,
+}
+/// The first time a gadget's measurement outcomes are set on a coordinator
+/// (via SubmitOutcomes or Decode), stamped with the server clock.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OutcomeArrival {
+    #[prost(uint64, tag = "1")]
+    pub gid: u64,
+    #[prost(uint64, tag = "2")]
+    pub received_ns: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct WindowTimingsResponse {
@@ -248,6 +265,10 @@ pub struct WindowTimingsResponse {
     /// convert server timestamps into its own timeline (clock synchronization).
     #[prost(uint64, tag = "2")]
     pub drained_at_ns: u64,
+    /// Per-gid outcome-arrival stamps accumulated since the previous drain,
+    /// cleared here and on reset (same lifecycle as `timings`).
+    #[prost(message, repeated, tag = "3")]
+    pub outcome_arrivals: ::prost::alloc::vec::Vec<OutcomeArrival>,
 }
 /// How decode_parity_factor obtained its decoding hypergraph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]

@@ -1916,11 +1916,11 @@ async fn monolithic_drain_window_timings_records_decodes() {
         .unwrap();
     run_canonical_shot(&coord, None, None).await;
 
-    let timings = Coordinator::drain_window_timings(&coord, Request::new(()))
+    let resp = Coordinator::drain_window_timings(&coord, Request::new(()))
         .await
         .unwrap()
-        .into_inner()
-        .timings;
+        .into_inner();
+    let timings = resp.timings;
     assert!(!timings.is_empty(), "at least one monolithic decode must be recorded");
     for t in &timings {
         assert!(t.decode_ns > 0, "decode duration must be measured");
@@ -1933,13 +1933,24 @@ async fn monolithic_drain_window_timings_records_decodes() {
             "window_gids must be derived from the same gadget set as num_gadgets"
         );
         assert!(t.decode_end_ns >= t.decode_start_ns);
+        // Monolithic approximates both window-formation stamps with its decode
+        // entry (it has no per-window readiness event), mirroring syndrome_ready_ns.
+        assert_eq!(t.leader_arrived_ns, t.decode_start_ns);
+        assert_eq!(t.mandatory_ready_ns, t.decode_start_ns);
+    }
+    // Every decoded gadget stamps an outcome arrival (monolithic loads outcomes
+    // in the decode() handler).
+    assert!(!resp.outcome_arrivals.is_empty(), "outcome arrivals must be recorded");
+    for a in &resp.outcome_arrivals {
+        assert!(a.received_ns > 0, "arrival stamp must carry a server-clock timestamp");
+        assert!(a.received_ns <= resp.drained_at_ns);
     }
     let again = Coordinator::drain_window_timings(&coord, Request::new(()))
         .await
         .unwrap()
-        .into_inner()
-        .timings;
-    assert!(again.is_empty(), "drain must clear the log");
+        .into_inner();
+    assert!(again.timings.is_empty(), "drain must clear the log");
+    assert!(again.outcome_arrivals.is_empty(), "drain must clear the arrivals");
 }
 
 /// Companion to `monolithic_drain_window_timings_records_decodes`: the first

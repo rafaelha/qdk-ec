@@ -54,6 +54,22 @@ pub struct JitController {
     task_counter: Arc<TaskCounter>,
 }
 
+/// Phase durations of one [`JitController::decode_single_timed`] call. All ns;
+/// each span is measured with a dedicated `Instant` pair, taken outside any
+/// other span so no measured phase contains tracking cost. See `decode_single`
+/// for the full protocol these phases decompose.
+///
+/// Interface consumed by the playground's full-timing-accounting walk.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DecodeSingleTiming {
+    /// `submit_outcomes` RPC duration (0 when outcomes are absent).
+    pub submit_ns: u64,
+    /// error-model oneshot wait (non-RPC, local await).
+    pub local_wait_ns: u64,
+    /// `decode` RPC duration.
+    pub decode_ns: u64,
+}
+
 impl JitController {
     pub fn new(config: serde_json::Value) -> Arc<Self> {
         let config: JitControllerConfig = serde_json::from_value(config).unwrap();
@@ -508,6 +524,73 @@ impl JitController {
             .as_ref()
             .ok_or_else(|| tonic::Status::failed_precondition("coordinator not connected"))?;
         coordinator.decode(outcomes).await
+    }
+
+    /// Phase-timed variant of [`decode_single`](Self::decode_single): identical
+    /// protocol and outcomes, but returns per-phase wall-clock durations
+    /// (submit / local wait / decode) alongside the readouts. `decode_single`
+    /// stays for callers that do not need the breakdown; this is duplicated
+    /// rather than delegating so those callers pay no timing overhead.
+    pub async fn decode_single_timed(
+        self: &Arc<Self>,
+        mut outcomes: crate::coordinator::Outcomes,
+    ) -> Result<(crate::coordinator::Readouts, DecodeSingleTiming), tonic::Status> {
+        let gid = outcomes.gid;
+
+        // Impute lost measurement bits ONCE (see `decode_single` for why this
+        // must happen before the early submit). Not attributed to any phase.
+        if outcomes.loss_mask.is_some() {
+            let coordinator_guard = self.coordinator.read().await;
+            let coordinator = coordinator_guard
+                .as_ref()
+                .ok_or_else(|| tonic::Status::failed_precondition("coordinator not connected"))?;
+            coordinator.impute_loss_outcomes(&mut outcomes).await;
+        }
+
+        // Phase 1: publish the raw outcomes (submit_outcomes RPC).
+        let mut submit_ns = 0u64;
+        if outcomes.outcomes.is_some() {
+            let submit_started = std::time::Instant::now();
+            self.coordinator
+                .read()
+                .await
+                .as_ref()
+                .ok_or_else(|| tonic::Status::failed_precondition("coordinator not connected"))?
+                .submit_outcomes(outcomes.clone())
+                .await?;
+            submit_ns = submit_started.elapsed().as_nanos() as u64;
+        }
+
+        let rx = self.error_model_loaded.write().await.remove(&gid).ok_or_else(|| {
+            tonic::Status::invalid_argument(format!("decode called for unknown or already-decoded gid: {gid}"))
+        })?;
+
+        // Phase 2: wait for the background error-model load (local oneshot).
+        let token = self.cancellation.read().await.clone();
+        let wait_started = std::time::Instant::now();
+        tokio::select! {
+            result = rx => {
+                result
+                    .map_err(|_| tonic::Status::cancelled(format!("error-model load task ended for gid {gid}")))??;
+            }
+            _ = token.cancelled() => {
+                return Err(tonic::Status::cancelled(format!(
+                    "decode for gid={gid} cancelled by runtime shutdown or reset"
+                )));
+            }
+        }
+        let local_wait_ns = wait_started.elapsed().as_nanos() as u64;
+
+        // Phase 3: decode (decode RPC).
+        let coordinator_guard = self.coordinator.read().await;
+        let coordinator = coordinator_guard
+            .as_ref()
+            .ok_or_else(|| tonic::Status::failed_precondition("coordinator not connected"))?;
+        let decode_started = std::time::Instant::now();
+        let readouts = coordinator.decode(outcomes).await?;
+        let decode_ns = decode_started.elapsed().as_nanos() as u64;
+
+        Ok((readouts, DecodeSingleTiming { submit_ns, local_wait_ns, decode_ns }))
     }
 
     /// Finished-detector bits for a gadget, resolved as soon as its checks are
@@ -970,5 +1053,45 @@ mod tests {
             .await
             .expect_err("dropped model loader must stop decode");
         assert_eq!(error.message(), "error-model load task ended for gid 7");
+    }
+
+    #[tokio::test]
+    async fn decode_single_timed_matches_decode_single_and_reports_phases() {
+        use crate::coordinator::{CoordinatorClient, MockCoordinator};
+
+        let controller = JitController::new_from_library(Default::default(), true);
+        controller.start(CoordinatorClient::from_mock(MockCoordinator::new())).await;
+
+        // A resolved error-model oneshot so the decode reaches the coordinator.
+        let (tx, rx) = oneshot::channel();
+        tx.send(Ok(())).unwrap();
+        controller.error_model_loaded.write().await.insert(7, rx);
+
+        let outcomes = coordinator::Outcomes { gid: 7, ..Default::default() };
+        let wall = std::time::Instant::now();
+        let (timed_readouts, timing) = controller
+            .decode_single_timed(outcomes.clone())
+            .await
+            .expect("timed decode must succeed");
+        let elapsed = wall.elapsed().as_nanos() as u64;
+
+        // Re-arm for the plain call; same gid → identical mock readouts.
+        let (tx2, rx2) = oneshot::channel();
+        tx2.send(Ok(())).unwrap();
+        controller.error_model_loaded.write().await.insert(7, rx2);
+        let plain_readouts = controller
+            .decode_single(outcomes)
+            .await
+            .expect("plain decode must succeed");
+
+        assert_eq!(
+            timed_readouts, plain_readouts,
+            "timed variant must return the same readouts as decode_single"
+        );
+        assert!(
+            timing.submit_ns + timing.local_wait_ns + timing.decode_ns <= elapsed,
+            "phase durations ({} + {} + {}) must sum within the measured wall ({elapsed})",
+            timing.submit_ns, timing.local_wait_ns, timing.decode_ns
+        );
     }
 }

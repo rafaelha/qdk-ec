@@ -4601,6 +4601,19 @@ async fn drain_window_timings_returns_and_clears_records() {
     let max_end = resp.timings.iter().map(|t| t.decode_end_ns).max().unwrap();
     assert!(resp.drained_at_ns >= max_end,
         "drain stamp is taken after every drained record was completed");
+
+    // Per-gid outcome-arrival stamps: one per gadget that received outcomes.
+    let arrivals = &resp.outcome_arrivals;
+    assert!(!arrivals.is_empty(), "outcome arrivals must be recorded");
+    let arrived_gids: std::collections::HashSet<u64> = arrivals.iter().map(|a| a.gid).collect();
+    assert!(arrived_gids.contains(&gid_a) && arrived_gids.contains(&gid_b),
+        "every decoded gadget must have an arrival stamp");
+    for a in arrivals {
+        assert!(a.received_ns > 0, "arrival stamp must carry a server-clock timestamp");
+        assert!(a.received_ns <= resp.drained_at_ns,
+            "an outcome cannot arrive after the drain answered");
+    }
+
     let timings = resp.timings;
     assert!(!timings.is_empty(), "at least one window decode must be recorded");
     for t in &timings {
@@ -4611,6 +4624,13 @@ async fn drain_window_timings_returns_and_clears_records() {
             t.decode_start_ns >= t.syndrome_ready_ns,
             "decode cannot start before the window syndrome is ready"
         );
+        // Window-formation stamps ordered: leader entry ≤ mandatory-zone
+        // syndrome ready ≤ decode start.
+        assert!(t.leader_arrived_ns > 0, "leader arrival must be stamped");
+        assert!(t.mandatory_ready_ns >= t.leader_arrived_ns,
+            "mandatory-zone syndrome cannot be ready before the leader arrived");
+        assert!(t.decode_start_ns >= t.mandatory_ready_ns,
+            "decode cannot start before the mandatory zone is ready");
         assert!(t.num_gadgets as usize >= t.num_committing as usize);
         assert!(t.num_gadgets as usize == t.window_gids.len());
         // First encounter with a persistent decoder: BUILT_LOADED with real phases.
@@ -4624,13 +4644,13 @@ async fn drain_window_timings_returns_and_clears_records() {
     for w in timings.windows(2) {
         assert!(w[1].seq > w[0].seq);
     }
-    // drain clears
+    // drain clears both timings and arrivals
     let again = Coordinator::drain_window_timings(&coord, Request::new(()))
         .await
         .unwrap()
-        .into_inner()
-        .timings;
-    assert!(again.is_empty());
+        .into_inner();
+    assert!(again.timings.is_empty());
+    assert!(again.outcome_arrivals.is_empty(), "arrivals must be cleared on drain");
 }
 
 /// Regression test: `window_gids` must reflect the actual decoder window, not
@@ -4699,10 +4719,10 @@ async fn reset_clears_window_timings() {
     exec_error_model(&coord, make_error_model(0, 5, 2)).await;
     let (_r1, _r2) = tokio::join!(decode(&coord, gid_a, 1), decode(&coord, gid_b, 1));
     reset_shot(&coord).await;
-    let timings = Coordinator::drain_window_timings(&coord, Request::new(()))
+    let resp = Coordinator::drain_window_timings(&coord, Request::new(()))
         .await
         .unwrap()
-        .into_inner()
-        .timings;
-    assert!(timings.is_empty(), "reset must clear undrained timing records");
+        .into_inner();
+    assert!(resp.timings.is_empty(), "reset must clear undrained timing records");
+    assert!(resp.outcome_arrivals.is_empty(), "reset must clear undrained outcome arrivals");
 }

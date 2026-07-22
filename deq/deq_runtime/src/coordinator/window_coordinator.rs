@@ -259,6 +259,10 @@ pub struct WindowCoordinator {
     /// Window decodes currently between decode_and_commit entry and exit —
     /// sampled into WindowTiming.concurrent_decodes.
     pub decodes_in_flight: std::sync::atomic::AtomicU32,
+    /// Per-gid stamp of the FIRST time a gadget's outcomes were set (via
+    /// `submit_outcomes` or `decode`). Cleared on reset, drained + cleared with
+    /// the timing log (same std::mem::take pattern). See coordinator::timing.
+    pub outcome_arrivals: std::sync::Mutex<Vec<coordinator::OutcomeArrival>>,
 }
 
 /// State machine for gadget lifecycle in window decoding.
@@ -459,6 +463,7 @@ impl WindowCoordinator {
             timing_log: Default::default(),
             syndrome_ready_at: Default::default(),
             decodes_in_flight: Default::default(),
+            outcome_arrivals: Default::default(),
         }
     }
 
@@ -662,7 +667,17 @@ impl WindowCoordinator {
         let gadget_types = self.gadget_types.read().await;
         let gadgets = self.gadgets.read().await;
         let gadget = gadgets.get(&gid).ok_or_else(|| Status::not_found(format!("gid={gid}")))?;
+        // Stamp the arrival on the None→Some transition only (the first time this
+        // gadget's outcomes are set). `decode`'s later re-submit is idempotent and
+        // must not re-stamp.
+        let was_none = gadget.outcomes.borrow().is_none();
         gadget.outcomes.send_replace(Some(outcomes));
+        if was_none {
+            self.outcome_arrivals.lock().unwrap().push(coordinator::OutcomeArrival {
+                gid,
+                received_ns: crate::misc::util::timestamp_ns(),
+            });
+        }
         let gadget_type = gadget_types.get(&gadget.instance.gtype).unwrap();
         let mut readouts = Vec::with_capacity(gadget_type.readouts.len());
         let data: BitVector = gadget.outcomes.borrow().as_ref().unwrap().clone();
@@ -1302,6 +1317,7 @@ impl WindowCoordinator {
     /// gadgets (marks remaining Decoding(leader) back to Uncommitted).
     ///
     /// Returns `None` only on cancellation.
+    #[allow(clippy::too_many_arguments)]
     async fn decode_and_commit(
         &self,
         center_gid: u64,
@@ -1309,6 +1325,8 @@ impl WindowCoordinator {
         committing_cids: &HashSet<u64>,
         window: &HashSet<u64>,
         explore_ns: u64,
+        leader_arrived_ns: u64,
+        mandatory_ready_ns: u64,
     ) -> Option<()> {
         let span = Span::root("decode_window", SpanContext::random());
         span.add_property(|| ("center_gid", format!("{center_gid}")));
@@ -1568,6 +1586,8 @@ impl WindowCoordinator {
             + 1;
         let mut timing = coordinator::WindowTiming {
             explore_ns,
+            leader_arrived_ns,
+            mandatory_ready_ns,
             decode_start_ns,
             concurrent_decodes: concurrent,
             num_committing: commit_region.len() as u32,
@@ -3056,6 +3076,10 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
         let outcomes = request.into_inner();
         let gid = outcomes.gid;
 
+        // Window-formation stamp: this window's leader gadget entered decode().
+        // Threaded into the WindowTiming record (like `explore_ns`).
+        let leader_arrived_ns = crate::misc::util::timestamp_ns();
+
         // Load outcomes
         let is_free_hop;
         {
@@ -3091,6 +3115,13 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                     coordinator::apply_loss_random_imputation(&mut outcome_data, loss_mask, &mut *rng);
                 }
                 gadget.outcomes.send_replace(Some(outcome_data));
+                // First-arrival stamp: this branch is the None→Some transition
+                // (guarded by `!already_submitted`); a prior `submit_outcomes`
+                // already stamped it otherwise.
+                self.outcome_arrivals.lock().unwrap().push(coordinator::OutcomeArrival {
+                    gid,
+                    received_ns: crate::misc::util::timestamp_ns(),
+                });
             }
             // decode() has been entered: the caller's error model (if any) has
             // finished loading, so this gadget is now safe to commit. This is the
@@ -3136,6 +3167,8 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
         self.await_mandatory_zone_syndrome(&explored)
             .await
             .ok_or_else(|| Status::cancelled("decode cancelled by reset"))?;
+        // Window-formation stamp: mandatory-zone syndrome wait completed.
+        let mandatory_ready_ns = crate::misc::util::timestamp_ns();
 
         // Step 3: Explore lookahead zone (non-blocking BFS, lookahead_radius more hops).
         self.explore_lookahead_zone(&mut explored)
@@ -3308,6 +3341,8 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
             &explored.committing_cids,
             &explored.decoder_window,
             explore_ns,
+            leader_arrived_ns,
+            mandatory_ready_ns,
         )
         .await
         .ok_or_else(|| Status::cancelled("decode cancelled by reset"))?;
@@ -3345,6 +3380,7 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
         self.dem_log.reset();
         self.timing_log.reset();
         self.syndrome_ready_at.lock().unwrap().clear();
+        self.outcome_arrivals.lock().unwrap().clear();
         *self.next_gid.lock().await = 1;
         *self.next_cid.lock().await = 1;
         *self.next_eid.lock().await = 1;
@@ -3446,6 +3482,7 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
         Ok(Response::new(coordinator::WindowTimingsResponse {
             timings: self.timing_log.drain(),
             drained_at_ns: crate::misc::util::timestamp_ns(),
+            outcome_arrivals: std::mem::take(&mut self.outcome_arrivals.lock().unwrap()),
         }))
     }
 }
