@@ -460,6 +460,10 @@ impl JitController {
         Ok(results)
     }
 
+    /// KEEP IN SYNC with `decode_single_timed` below — deliberately duplicated
+    /// (not delegated) so untimed callers pay zero instrumentation overhead.
+    /// The ordering is deadlock-sensitive (impute before submit; submit before
+    /// the error-model wait); any change here must be mirrored there.
     pub async fn decode_single(
         self: &Arc<Self>,
         mut outcomes: crate::coordinator::Outcomes,
