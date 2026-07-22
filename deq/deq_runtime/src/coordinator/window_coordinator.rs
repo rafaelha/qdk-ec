@@ -1572,6 +1572,11 @@ impl WindowCoordinator {
             concurrent_decodes: concurrent,
             num_committing: commit_region.len() as u32,
             num_gadgets: window.len() as u32,
+            window_gids: {
+                let mut gids: Vec<u64> = window.iter().cloned().collect();
+                gids.sort();
+                gids
+            },
             ..Default::default()
         };
 
@@ -1789,11 +1794,6 @@ impl WindowCoordinator {
 
         timing.syndrome_weight = syndrome.data.iter().map(|b| b.count_ones()).sum::<u32>();
         timing.syndrome_bytes = syndrome.data.len() as u64;
-        timing.window_gids = {
-            let mut gids = mapping.global_gid_of.clone();
-            gids.sort();
-            gids
-        };
         timing.syndrome_ready_ns = {
             let map = self.syndrome_ready_at.lock().unwrap();
             mapping

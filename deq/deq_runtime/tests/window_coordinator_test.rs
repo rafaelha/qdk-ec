@@ -4631,6 +4631,57 @@ async fn drain_window_timings_returns_and_clears_records() {
     assert!(again.is_empty());
 }
 
+/// Regression test: `window_gids` must reflect the actual decoder window, not
+/// the (possibly larger) set of `expanded_gadgets` fed into `RelativeProgram::new`.
+///
+/// `build_checked_chain` (see `make_test_library_with_remote_errors`) wires each
+/// non-terminal gadget's error model to reference the NEXT gadget's check model
+/// via `remote_check_models`. With a small buffer_radius, some window decodes
+/// will have a "next" gadget that lies outside the decoder window — this makes
+/// `decode_and_commit` append it to `expanded_gadgets` as an "outside
+/// error-contributing gadget" (error-only, `check_model: None`), which used to
+/// leak into `timing.window_gids` via `mapping.global_gid_of` and make
+/// `window_gids.len() > num_gadgets`. Assert the invariant holds for every
+/// recorded window across this topology.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drain_window_timings_window_gids_matches_num_gadgets_with_outside_error_gadget() {
+    let (gids, coord, mock, _trace_file) = build_checked_chain(5, 1).await;
+    mock.set_decode_delay(std::time::Duration::from_millis(10));
+
+    let handles: Vec<_> = gids
+        .iter()
+        .map(|&gid| {
+            let c = coord.clone();
+            tokio::spawn(async move { decode_arc(c, gid, 1).await })
+        })
+        .collect();
+
+    let results = tokio::time::timeout(std::time::Duration::from_secs(10), futures_util::future::join_all(handles))
+        .await
+        .expect("DEADLOCK: concurrent decode did not complete within 10s");
+    for (i, result) in results.into_iter().enumerate() {
+        let readouts = result.unwrap();
+        assert_eq!(readouts.gid, gids[i], "gid mismatch for gadget {i}");
+    }
+
+    // Drain BEFORE reset_shot: reset_shot clears undrained timing records
+    // (see `reset_clears_window_timings`), so it must come after the drain here.
+    let timings = Coordinator::drain_window_timings(coord.as_ref(), Request::new(()))
+        .await
+        .unwrap()
+        .into_inner()
+        .timings;
+    assert!(!timings.is_empty(), "at least one window decode must be recorded");
+    for t in &timings {
+        assert_eq!(
+            t.window_gids.len(),
+            t.num_gadgets as usize,
+            "window_gids must exactly match the decoder window, even when outside \
+             error-contributing gadgets are folded into expanded_gadgets: {t:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn reset_clears_window_timings() {
     let trace_file = NamedTempFile::new().unwrap();
