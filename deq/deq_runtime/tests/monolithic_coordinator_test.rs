@@ -1,6 +1,7 @@
 //! Tests for MonolithicCoordinator using MockDecoder
 
 use deq_runtime::bin::{self, instruction};
+use deq_runtime::coordinator;
 use deq_runtime::coordinator::coordinator_server::Coordinator;
 use deq_runtime::coordinator::monolithic_coordinator::MonolithicCoordinator;
 use deq_runtime::decoder::{BlackBoxDecoderClient, MockDecoder};
@@ -1939,4 +1940,54 @@ async fn monolithic_drain_window_timings_records_decodes() {
         .into_inner()
         .timings;
     assert!(again.is_empty(), "drain must clear the log");
+}
+
+/// Companion to `monolithic_drain_window_timings_records_decodes`: the first
+/// shot only exercises the `BUILT_LOADED` branch of `decode_parity_factor`
+/// (fresh hypergraph construction). This test drives a second shot with the
+/// same modifier — mirroring
+/// `test_persistent_decoder_reuses_cache_when_modifier_unchanged`'s
+/// `reset_keeping_library_and_decoder` pattern, which keeps `loaded_decoders`
+/// alive across the reset — so `decode_parity_factor` takes the `CACHE_HIT`
+/// early-return branch instead, and asserts on that record specifically.
+#[tokio::test]
+async fn monolithic_drain_window_timings_records_cache_hit() {
+    let mock = make_mock_decoder();
+    let coord = make_persistent_coordinator(mock.clone());
+
+    Coordinator::load_library(&coord, Request::new(make_default_library()))
+        .await
+        .unwrap();
+
+    // Shot 1: populates `loaded_decoders` via the BUILT_LOADED path.
+    run_canonical_shot(&coord, None, None).await;
+    Coordinator::drain_window_timings(&coord, Request::new(())).await.unwrap();
+
+    reset_keeping_library_and_decoder(&coord).await;
+
+    // Shot 2: same (absent) modifier, same topology — same `DecoderCacheKey`,
+    // so `decode_parity_factor` must hit the cache this time.
+    run_canonical_shot(&coord, None, None).await;
+
+    let timings = Coordinator::drain_window_timings(&coord, Request::new(()))
+        .await
+        .unwrap()
+        .into_inner()
+        .timings;
+    assert!(!timings.is_empty(), "the second shot's cache-hit decode must be recorded");
+    for t in &timings {
+        assert_eq!(
+            t.path,
+            coordinator::DecodePath::CacheHit as i32,
+            "second shot with an unchanged modifier must hit the persistent decoder cache"
+        );
+        assert!(t.decode_end_ns >= t.decode_start_ns);
+        assert_eq!(t.num_gadgets, t.num_committing, "monolithic commits the whole subgraph");
+        assert_eq!(
+            t.num_gadgets as usize,
+            t.window_gids.len(),
+            "window_gids must be derived from the same gadget set as num_gadgets"
+        );
+        assert_eq!(t.hypergraph_bytes, 0, "no hypergraph is rebuilt on a cache hit");
+    }
 }
