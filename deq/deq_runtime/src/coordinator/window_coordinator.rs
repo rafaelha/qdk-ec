@@ -247,6 +247,18 @@ pub struct WindowCoordinator {
     pub trace_shot: Arc<Mutex<trace::Shot>>,
     /// accumulated trace across all shots
     pub trace: Mutex<trace::WindowCoordinatorTrace>,
+    /// Always-on per-window decode timing log (drained by DrainWindowTimings,
+    /// cleared on reset). See coordinator::timing.
+    pub timing_log: coordinator::timing::TimingLog,
+    /// cid -> timestamp_ns() when that check model's syndrome became complete.
+    /// decode_parity_factor takes the max over the window's cids as the
+    /// window's syndrome-ready time. Cleared on reset. Arc so the spawned
+    /// syndrome-completion task (which mirrors `trace_shot`'s capture
+    /// pattern) can hold its own handle.
+    pub syndrome_ready_at: Arc<std::sync::Mutex<std::collections::HashMap<u64, u64>>>,
+    /// Window decodes currently between decode_and_commit entry and exit —
+    /// sampled into WindowTiming.concurrent_decodes.
+    pub decodes_in_flight: std::sync::atomic::AtomicU32,
 }
 
 /// State machine for gadget lifecycle in window decoding.
@@ -444,6 +456,9 @@ impl WindowCoordinator {
             dem_log,
             trace_shot: Arc::new(Mutex::new(trace::Shot::default())),
             trace: Mutex::new(trace::WindowCoordinatorTrace::default()),
+            timing_log: Default::default(),
+            syndrome_ready_at: Default::default(),
+            decodes_in_flight: Default::default(),
         }
     }
 
@@ -1293,6 +1308,7 @@ impl WindowCoordinator {
         commit_region: &HashSet<u64>,
         committing_cids: &HashSet<u64>,
         window: &HashSet<u64>,
+        explore_ns: u64,
     ) -> Option<()> {
         let span = Span::root("decode_window", SpanContext::random());
         span.add_property(|| ("center_gid", format!("{center_gid}")));
@@ -1540,8 +1556,27 @@ impl WindowCoordinator {
         span.add_event(Event::new("relative_program"));
         span.add_event(Event::new("committing"));
 
+        // From here on there is no further early return before the decode
+        // completes, so this is the one safe place to open the timing record
+        // and bump `decodes_in_flight` — every earlier `?` above would leak an
+        // increment placed at function entry (decode_and_commit has several
+        // cancellation early-returns between entry and here).
+        let decode_start_ns = crate::misc::util::timestamp_ns();
+        let concurrent = self
+            .decodes_in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let mut timing = coordinator::WindowTiming {
+            explore_ns,
+            decode_start_ns,
+            concurrent_decodes: concurrent,
+            num_committing: commit_region.len() as u32,
+            num_gadgets: window.len() as u32,
+            ..Default::default()
+        };
+
         let (parity_factor, errors) = self
-            .decode_parity_factor(center_gid, committing_cids, &relative_program, &mapping, &span)
+            .decode_parity_factor(center_gid, committing_cids, &relative_program, &mapping, &span, &mut timing)
             .await;
         span.add_event(Event::new("decoded"));
 
@@ -1549,6 +1584,10 @@ impl WindowCoordinator {
             leader_gid: center_gid,
         }))
         .await;
+        timing.decode_end_ns = crate::misc::util::timestamp_ns();
+        self.decodes_in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        timing.cache_size = self.loaded_decoders.read().await.len() as u32;
+        self.timing_log.push(timing);
         span.add_property(|| {
             let global_subgraph = Self::global_subgraph_of(&mapping, &errors, &parity_factor.subgraph);
             ("parity_factor", format!("{:?}", global_subgraph))
@@ -1716,6 +1755,7 @@ impl WindowCoordinator {
             .collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn decode_parity_factor(
         &self,
         gid: u64,
@@ -1723,6 +1763,7 @@ impl WindowCoordinator {
         relative_program: &RelativeProgram,
         mapping: &RelativeMapping,
         span: &Span,
+        timing: &mut coordinator::WindowTiming,
     ) -> (blackbox_decoder::ParityFactor, Arc<Vec<ErrorIndex>>) {
         // calculate syndrome
         span.add_event(Event::new("calculate_syndrome"));
@@ -1745,6 +1786,23 @@ impl WindowCoordinator {
         };
         span.add_event(Event::new("syndrome_calculated"));
         span.add_property(|| ("syndrome", format!("{:?}", syndrome)));
+
+        timing.syndrome_weight = syndrome.data.iter().map(|b| b.count_ones()).sum::<u32>();
+        timing.syndrome_bytes = syndrome.data.len() as u64;
+        timing.window_gids = {
+            let mut gids = mapping.global_gid_of.clone();
+            gids.sort();
+            gids
+        };
+        timing.syndrome_ready_ns = {
+            let map = self.syndrome_ready_at.lock().unwrap();
+            mapping
+                .global_cid_of
+                .iter()
+                .filter_map(|cid| map.get(cid).copied())
+                .max()
+                .unwrap_or(0)
+        };
 
         let cache_key = if self.config.persistent_decoder {
             // Lock order: error_model_types (field 4) BEFORE error_models
@@ -1776,6 +1834,10 @@ impl WindowCoordinator {
                 } else {
                     syndrome.clone()
                 };
+                timing.path = coordinator::DecodePath::CacheHit as i32;
+                timing.num_hyperedges = loaded.hyperedge_vertices.len() as u32;
+                timing.num_vertices = loaded.vertex_num as u32;
+                let decode_started = std::time::Instant::now();
                 let parity_factor = self
                     .black_box_decoder
                     .clone()
@@ -1785,6 +1847,10 @@ impl WindowCoordinator {
                     })
                     .await
                     .unwrap();
+                timing.decode_ns = decode_started.elapsed().as_nanos() as u64;
+                timing.decoder_compute_ns = parity_factor.compute_ns;
+                timing.correction_weight = parity_factor.subgraph.len() as u32;
+                timing.parity_factor_bytes = parity_factor.encoded_len() as u64;
                 if self.config.assert_parity_factor {
                     assert_parity_factor(loaded.decoding_hypergraph.as_ref().unwrap(), &parity_factor, &decode_syndrome);
                 }
@@ -1804,12 +1870,15 @@ impl WindowCoordinator {
 
         // when the decoder is not available, construct the decoding hypergraph for the window
         // and instantiate such a decoder
+        let build_started = std::time::Instant::now();
         let (mut decoding_hypergraph, mut errors, mut committed) =
             self.decoding_hypergraph(committing_cids, relative_program, mapping).await;
+        timing.build_ns = build_started.elapsed().as_nanos() as u64;
         let mut constituents = None;
 
         // merge the decoding hypergraph edges if their syndromes are the same
         if self.config.merge_hyperedges {
+            let merge_started = std::time::Instant::now();
             let original_errors = errors.clone();
             let original_committed = committed.clone();
             let mut original_to_merged = Vec::with_capacity(errors.len());
@@ -1864,6 +1933,7 @@ impl WindowCoordinator {
             constituents = Some(Arc::new(constituent_vec));
             errors = Arc::new(merged_errors);
             committed = merged_committed;
+            timing.merge_ns = merge_started.elapsed().as_nanos() as u64;
         }
         let committed = Arc::new(committed);
 
@@ -1877,12 +1947,19 @@ impl WindowCoordinator {
         // remap both the hypergraph and syndrome to a contiguous vertex space.
         // This is necessary because some decoders (e.g. MWPF) reject graphs
         // with isolated vertices.
+        let compact_started = std::time::Instant::now();
         let (decoding_hypergraph, syndrome, vertex_remap) = Self::compact_vertices(decoding_hypergraph, &syndrome);
+        timing.compact_ns = compact_started.elapsed().as_nanos() as u64;
 
         let decoding_hypergraph = Arc::new(decoding_hypergraph);
+        timing.num_hyperedges = decoding_hypergraph.hyperedges.len() as u32;
+        timing.num_vertices = decoding_hypergraph.vertex_num as u32;
+        timing.hypergraph_bytes = decoding_hypergraph.as_ref().encoded_len() as u64;
 
         let parity_factor = if let Some(cache_key) = cache_key {
+            timing.path = coordinator::DecodePath::BuiltLoaded as i32;
             span.add_event(Event::new("decoding").with_property(|| ("type", "loading")));
+            let load_started = std::time::Instant::now();
             let hid = self
                 .black_box_decoder
                 .clone()
@@ -1890,6 +1967,7 @@ impl WindowCoordinator {
                 .await
                 .unwrap()
                 .hid;
+            timing.load_ns = load_started.elapsed().as_nanos() as u64;
             let mut loaded_decoders = self.loaded_decoders.write().await;
             loaded_decoders.insert(
                 cache_key,
@@ -1901,28 +1979,41 @@ impl WindowCoordinator {
                     vertex_remap: vertex_remap.clone(),
                     hyperedge_vertices: hyperedge_vertices.clone(),
                     committed: Some(committed.clone()),
+                    vertex_num: decoding_hypergraph.vertex_num,
                 },
             );
             drop(loaded_decoders);
-            self.black_box_decoder
+            let decode_started = std::time::Instant::now();
+            let parity_factor = self
+                .black_box_decoder
                 .clone()
                 .decode_loaded(blackbox_decoder::LoadedDecodingProblem {
                     hid,
                     syndrome: Some(syndrome.clone()),
                 })
                 .await
-                .unwrap()
+                .unwrap();
+            timing.decode_ns = decode_started.elapsed().as_nanos() as u64;
+            parity_factor
         } else {
+            timing.path = coordinator::DecodePath::Temporary as i32;
             span.add_event(Event::new("decoding").with_property(|| ("type", "temporary")));
-            self.black_box_decoder
+            let decode_started = std::time::Instant::now();
+            let parity_factor = self
+                .black_box_decoder
                 .clone()
                 .decode(blackbox_decoder::DecodingProblem {
                     hypergraph: Some(decoding_hypergraph.as_ref().clone()),
                     syndrome: Some(syndrome.clone()),
                 })
                 .await
-                .unwrap()
+                .unwrap();
+            timing.decode_ns = decode_started.elapsed().as_nanos() as u64;
+            parity_factor
         };
+        timing.decoder_compute_ns = parity_factor.compute_ns;
+        timing.correction_weight = parity_factor.subgraph.len() as u32;
+        timing.parity_factor_bytes = parity_factor.encoded_len() as u64;
 
         if self.config.assert_parity_factor {
             assert_parity_factor(&decoding_hypergraph, &parity_factor, &syndrome);
@@ -2738,6 +2829,7 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                 let check_model_gid = check_model.gid;
                 let trace_shot = self.trace_shot.clone();
                 let has_trace = self.config.trace_filepath.is_some();
+                let syndrome_ready_at = self.syndrome_ready_at.clone();
                 tokio::spawn(async move {
                     let _guard = _guard;
                     let expanded_remote_gadgets =
@@ -2800,6 +2892,11 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                     check_model.expanded_remote_gadgets = Some(expanded_remote_gadgets);
                     check_model.syndrome.send_replace(Some(syndrome));
                     drop(check_models);
+                    // Always-on: record when this cid's syndrome became complete,
+                    // for WindowTiming.syndrome_ready_ns (decode_parity_factor takes
+                    // the max over the window's cids). Unconditional (not gated on
+                    // has_trace) — the timing log has no enable flag.
+                    syndrome_ready_at.lock().unwrap().insert(cid, crate::misc::util::timestamp_ns());
                     // Record syndrome-ready trace event
                     if has_trace {
                         trace_shot.lock().await.events.push(trace::Event {
@@ -3047,6 +3144,12 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
 
         // Commit loop: check window for Decoding gadgets, run steps 3+4,
         // mark entire window as Decoding, then proceed.
+        // Window-exploration compute (select_commit_region + shrink_window), for
+        // WindowTiming.explore_ns. Set inside the retry loop below (only the
+        // iteration that reaches the break actually runs steps 4-5); hoisted here
+        // so it's in scope at the decode_and_commit call site after the loop.
+        #[allow(unused_assignments)]
+        let mut explore_ns: u64 = 0;
         loop {
             let token = self.cancellation.read().await.clone();
             if token.is_cancelled() {
@@ -3123,11 +3226,13 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                 }
 
                 if blocked.is_empty() {
+                    let explore_started = std::time::Instant::now();
                     // Step 4: Select commit region.
                     self.select_commit_region(&mut explored, &gadgets);
 
                     // Step 5: Shrink window to minimal decoder window.
                     self.shrink_window(&mut explored, &gadgets);
+                    explore_ns = explore_started.elapsed().as_nanos() as u64;
 
                     // Emit WindowExploreEvent trace.
                     let mandatory_zone_gids: Vec<u64> = explored
@@ -3202,6 +3307,7 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
             &explored.commit_region,
             &explored.committing_cids,
             &explored.decoder_window,
+            explore_ns,
         )
         .await
         .ok_or_else(|| Status::cancelled("decode cancelled by reset"))?;
@@ -3237,6 +3343,8 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
         self.pending_referring_by_gid.lock().await.clear();
         self.pending_referring_by_port.lock().await.clear();
         self.dem_log.reset();
+        self.timing_log.reset();
+        self.syndrome_ready_at.lock().unwrap().clear();
         *self.next_gid.lock().await = 1;
         *self.next_cid.lock().await = 1;
         *self.next_eid.lock().await = 1;
@@ -3335,7 +3443,9 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
         &self,
         _request: Request<()>,
     ) -> Result<Response<coordinator::WindowTimingsResponse>, Status> {
-        Ok(Response::new(coordinator::WindowTimingsResponse::default()))
+        Ok(Response::new(coordinator::WindowTimingsResponse {
+            timings: self.timing_log.drain(),
+        }))
     }
 }
 
@@ -3971,8 +4081,9 @@ mod tests {
         let committing_cids: HashSet<u64> = [201].into_iter().collect();
         let span = Span::root("test", SpanContext::random());
 
+        let mut timing = coordinator::WindowTiming::default();
         let (_parity_factor, _errors) = coordinator
-            .decode_parity_factor(101, &committing_cids, &relative_program, &mapping, &span)
+            .decode_parity_factor(101, &committing_cids, &relative_program, &mapping, &span, &mut timing)
             .await;
 
         assert_eq!(
@@ -4001,8 +4112,9 @@ mod tests {
         let committing_cids: HashSet<u64> = [201].into_iter().collect();
         let span = Span::root("test", SpanContext::random());
 
+        let mut timing = coordinator::WindowTiming::default();
         let (_parity_factor, _errors) = coordinator
-            .decode_parity_factor(101, &committing_cids, &relative_program, &mapping, &span)
+            .decode_parity_factor(101, &committing_cids, &relative_program, &mapping, &span, &mut timing)
             .await;
 
         assert_eq!(
@@ -4029,8 +4141,9 @@ mod tests {
         let cached_committing_cids: HashSet<u64> = [202].into_iter().collect();
         let span = Span::root("test", SpanContext::random());
 
+        let mut timing = coordinator::WindowTiming::default();
         let (_parity_factor, _errors) = coordinator
-            .decode_parity_factor(101, &committing_cids, &relative_program, &mapping, &span)
+            .decode_parity_factor(101, &committing_cids, &relative_program, &mapping, &span, &mut timing)
             .await;
         let _ = coordinator.dem_log.drain_predictions();
         let mut cached_cm = local_check_model(202, 401, 102);
@@ -4039,8 +4152,16 @@ mod tests {
             .syndrome
             .send_replace(Some(bit_vector::from_sparse_indices(1, &[0])));
         coordinator.check_models.write().await.insert(202, cached_cm);
+        let mut cached_timing = coordinator::WindowTiming::default();
         let (_parity_factor, _errors) = coordinator
-            .decode_parity_factor(102, &cached_committing_cids, &cached_relative_program, &cached_mapping, &span)
+            .decode_parity_factor(
+                102,
+                &cached_committing_cids,
+                &cached_relative_program,
+                &cached_mapping,
+                &span,
+                &mut cached_timing,
+            )
             .await;
 
         assert_eq!(

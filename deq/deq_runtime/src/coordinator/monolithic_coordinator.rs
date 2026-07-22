@@ -177,6 +177,9 @@ pub struct LoadedDecoder {
     /// hyperedge commits (monolithic). Cache-stable: `committing_local_cids` is
     /// part of the decoder cache key, so windows sharing an entry agree here.
     pub committed: Option<Arc<Vec<bool>>>,
+    /// post-compaction vertex count of the loaded hypergraph, for O(1)
+    /// WindowTiming.num_vertices on cache hits
+    pub vertex_num: u64,
 }
 
 pub struct Gadget {
@@ -800,6 +803,7 @@ impl MonolithicCoordinator {
                     hyperedge_vertices: hyperedge_vertices.clone(),
                     // monolithic decodes the whole subgraph at once: all committed
                     committed: None,
+                    vertex_num: decoding_hypergraph.vertex_num,
                 },
             );
             drop(loaded_decoders);

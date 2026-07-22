@@ -99,6 +99,9 @@ pub mod dem;
 // (the message is `DemDrainResponse`), so it stays re-exported.
 pub use dem::{DemDrain, DemLog};
 
+pub mod timing;
+pub use timing::TimingLog;
+
 impl CoordinatorType {
     pub fn create(&self, config: serde_json::Value, black_box_decoder: Option<BlackBoxDecoderClient>) -> DynCoordinator {
         match self {
