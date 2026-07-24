@@ -1610,6 +1610,21 @@ impl WindowCoordinator {
         }))
         .await;
         timing.decode_end_ns = crate::misc::util::timestamp_ns();
+        // Post-decode bookkeeping is the exact remainder of the handler span once
+        // every measured phase is subtracted (all share timestamp_ns()'s clock),
+        // so prep+build+merge+compact+load+decode+finalize == decode_end -
+        // decode_start with no unaccounted gap.
+        timing.finalize_ns = timing
+            .decode_end_ns
+            .saturating_sub(timing.decode_start_ns)
+            .saturating_sub(
+                timing.prep_ns
+                    + timing.build_ns
+                    + timing.merge_ns
+                    + timing.compact_ns
+                    + timing.load_ns
+                    + timing.decode_ns,
+            );
         self.decodes_in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         timing.cache_size = self.loaded_decoders.read().await.len() as u32;
         self.timing_log.push(timing);
@@ -1857,6 +1872,9 @@ impl WindowCoordinator {
                 timing.path = coordinator::DecodePath::CacheHit as i32;
                 timing.num_hyperedges = loaded.hyperedge_vertices.len() as u32;
                 timing.num_vertices = loaded.vertex_num as u32;
+                // Front of the handler: syndrome assembly + cache-key lookup up to
+                // here, anchored to the absolute decode_start stamp (same clock).
+                timing.prep_ns = crate::misc::util::timestamp_ns().saturating_sub(timing.decode_start_ns);
                 let decode_started = std::time::Instant::now();
                 let parity_factor = self
                     .black_box_decoder
@@ -1890,6 +1908,9 @@ impl WindowCoordinator {
 
         // when the decoder is not available, construct the decoding hypergraph for the window
         // and instantiate such a decoder
+        // Front of the handler: syndrome assembly + cache-key fingerprint up to
+        // here (build begins next), anchored to the absolute decode_start stamp.
+        timing.prep_ns = crate::misc::util::timestamp_ns().saturating_sub(timing.decode_start_ns);
         let build_started = std::time::Instant::now();
         let (mut decoding_hypergraph, mut errors, mut committed) =
             self.decoding_hypergraph(committing_cids, relative_program, mapping).await;

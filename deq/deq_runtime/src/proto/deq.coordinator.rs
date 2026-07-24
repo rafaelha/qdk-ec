@@ -246,6 +246,19 @@ pub struct WindowTiming {
     /// Monolithic approximates with the decode entry (== decode_start_ns).
     #[prost(uint64, tag = "26")]
     pub mandatory_ready_ns: u64,
+    /// decode_start -> first construction phase: syndrome-vector assembly from the
+    /// window's check models + decoder cache-key fingerprinting (incl. the
+    /// error_model_types/error_models read-lock acquisition). The front of the
+    /// decode handler that has no other phase counter.
+    #[prost(uint64, tag = "27")]
+    pub prep_ns: u64,
+    /// decode-call end -> decode_end: post-decode bookkeeping (DEM prediction
+    /// recording, parity-factor serialization, decode-finished event). Computed as
+    /// the exact remainder of (decode_end - decode_start) once every other phase is
+    /// subtracted, so prep+build+merge+compact+load+decode+finalize tiles the whole
+    /// \[decode_start, decode_end\] span with no unaccounted gap.
+    #[prost(uint64, tag = "28")]
+    pub finalize_ns: u64,
 }
 /// The first time a gadget's measurement outcomes are set on a coordinator
 /// (via SubmitOutcomes or Decode), stamped with the server clock.
