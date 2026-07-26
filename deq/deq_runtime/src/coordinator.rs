@@ -5,6 +5,7 @@ use crate::misc::util::help_message;
 use clap::ValueEnum;
 use serde::Serialize;
 use std::sync::Arc;
+use tokio::sync::watch;
 #[cfg(feature = "cli")]
 use tonic::transport::Endpoint;
 #[cfg(feature = "cli")]
@@ -18,6 +19,38 @@ pub(crate) use crate::bin;
 include!("proto/deq.coordinator.rs");
 #[cfg(feature = "cli")]
 use coordinator_server::CoordinatorServer;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DecodeProgressState {
+    NeedsGraph(Vec<(u64, u64)>),
+    Pending,
+    Ready,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecodeProgress {
+    pub revision: u64,
+    pub state: DecodeProgressState,
+}
+
+impl Default for DecodeProgress {
+    fn default() -> Self {
+        Self {
+            revision: 0,
+            state: DecodeProgressState::Pending,
+        }
+    }
+}
+
+pub(crate) fn publish_decode_progress(sender: &watch::Sender<DecodeProgress>, state: DecodeProgressState) {
+    let current = sender.borrow().clone();
+    if current.state != state {
+        sender.send_replace(DecodeProgress {
+            revision: current.revision + 1,
+            state,
+        });
+    }
+}
 
 /// Replace each bit of `outcomes` whose position is set in `loss_mask`
 /// with a uniformly random bit drawn from `rng`.  This is the default
@@ -247,6 +280,32 @@ impl CoordinatorClient {
             CoordinatorClient::Local(local) => local.inner().decode(request).await,
         })
         .map(|v| v.into_inner())
+    }
+
+    pub async fn wait_decode_progress(
+        &self,
+        gid: u64,
+        after_revision: Option<u64>,
+    ) -> std::result::Result<DecodeProgress, Status> {
+        match self {
+            #[cfg(feature = "cli")]
+            CoordinatorClient::Remote(_) => Ok(DecodeProgress {
+                revision: 1,
+                state: DecodeProgressState::Ready,
+            }),
+            CoordinatorClient::Local(DynCoordinator::Window(c)) => c.wait_decode_progress(gid, after_revision).await,
+            CoordinatorClient::Local(_) => Ok(DecodeProgress {
+                revision: 1,
+                state: DecodeProgressState::Ready,
+            }),
+        }
+    }
+
+    pub async fn decode_dependencies(&self, gid: u64) -> Vec<u64> {
+        match self {
+            CoordinatorClient::Local(DynCoordinator::Window(c)) => c.decode_dependencies(gid).await,
+            _ => vec![gid],
+        }
     }
 
     /// Publish a gadget's raw outcomes so its finished-detector syndrome can be

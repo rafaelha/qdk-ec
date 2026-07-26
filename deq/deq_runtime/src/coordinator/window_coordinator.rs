@@ -172,12 +172,6 @@ impl WindowCoordinatorConfig {
         }
         self.lookahead_radius.unwrap_or(self.buffer_radius)
     }
-
-    /// Effective window radius: `buffer_radius + lookahead_radius`.
-    /// This is how far the BFS expands from the center gadget.
-    pub fn effective_window_radius(&self) -> usize {
-        self.buffer_radius + self.lookahead_radius()
-    }
 }
 
 fn default_true() -> bool {
@@ -201,6 +195,8 @@ pub struct WindowCoordinator {
     pub gadgets: Arc<RwLock<HashMap<u64, Gadget>>>,
     pub check_models: Arc<RwLock<HashMap<u64, CheckModel>>>,
     pub error_models: Arc<RwLock<HashMap<u64, ErrorModel>>>,
+    decode_progress: RwLock<HashMap<u64, watch::Sender<coordinator::DecodeProgress>>>,
+    decode_dependencies: RwLock<HashMap<u64, HashSet<u64>>>,
     /// Error models waiting for a target gadget to get a binding check model.
     /// Key: target gadget GID. Value: list of `(eid, ri)` pairs — the eid to
     /// register in referring_eids once the check model is created, and which
@@ -405,6 +401,10 @@ pub struct ExploredWindow {
     pub decoder_window: HashSet<u64>,
 }
 
+fn required_window_readiness(window: &HashSet<u64>, commit_region: &HashSet<u64>) -> (HashSet<u64>, HashSet<u64>) {
+    (window.iter().chain(commit_region).copied().collect(), commit_region.clone())
+}
+
 impl WindowCoordinator {
     pub fn new(config: serde_json::Value, black_box_decoder: BlackBoxDecoderClient) -> Self {
         let config: WindowCoordinatorConfig = serde_json::from_value(config).unwrap();
@@ -430,6 +430,8 @@ impl WindowCoordinator {
             gadgets: Default::default(),
             check_models: Default::default(),
             error_models: Default::default(),
+            decode_progress: Default::default(),
+            decode_dependencies: Default::default(),
             pending_referring_by_gid: Default::default(),
             pending_referring_by_port: Default::default(),
             next_gid: Mutex::new(1),
@@ -494,6 +496,61 @@ impl WindowCoordinator {
         }
     }
 
+    async fn progress_sender(&self, gid: u64) -> watch::Sender<coordinator::DecodeProgress> {
+        self.decode_progress
+            .write()
+            .await
+            .entry(gid)
+            .or_insert_with(|| watch::channel(coordinator::DecodeProgress::default()).0)
+            .clone()
+    }
+
+    async fn publish_progress(&self, gid: u64, state: coordinator::DecodeProgressState) {
+        let sender = self.progress_sender(gid).await;
+        coordinator::publish_decode_progress(&sender, state);
+    }
+
+    async fn record_decode_dependencies(&self, gid: u64, gadgets: &HashSet<u64>) {
+        self.decode_dependencies.write().await.insert(gid, gadgets.clone());
+    }
+
+    pub async fn decode_dependencies(&self, gid: u64) -> Vec<u64> {
+        self.decode_dependencies
+            .read()
+            .await
+            .get(&gid)
+            .map(|gadgets| gadgets.iter().copied().collect())
+            .unwrap_or_else(|| vec![gid])
+    }
+
+    pub async fn wait_decode_progress(
+        &self,
+        gid: u64,
+        after_revision: Option<u64>,
+    ) -> Result<coordinator::DecodeProgress, Status> {
+        let sender = self.progress_sender(gid).await;
+        let mut receiver = sender.subscribe();
+        let current = receiver.borrow().clone();
+        if after_revision.is_none_or(|revision| current.revision > revision) {
+            return Ok(current);
+        }
+        let token = self.cancellation.read().await.clone();
+        loop {
+            tokio::select! {
+                changed = receiver.changed() => {
+                    changed.map_err(|_| Status::cancelled("decode progress reset"))?;
+                    let current = receiver.borrow().clone();
+                    if current.revision > after_revision.unwrap() {
+                        return Ok(current);
+                    }
+                }
+                _ = token.cancelled() => {
+                    return Err(Status::cancelled("decode progress cancelled by reset"));
+                }
+            }
+        }
+    }
+
     /// Wait for a gadget's pauli_frame to be set and return it as `Readouts`.
     async fn wait_for_pauli_frame(&self, gid: u64) -> Result<Response<coordinator::Readouts>, Status> {
         let token = self.cancellation.read().await.clone();
@@ -506,6 +563,7 @@ impl WindowCoordinator {
             Err(handle) => handle.await.unwrap_or(None),
         }
         .ok_or_else(|| Status::cancelled("decode cancelled by reset"))?;
+        self.publish_progress(gid, coordinator::DecodeProgressState::Ready).await;
         let detectors = {
             // Lock order: check_model_types before gadgets/check_models (field
             // order). Acquiring it inside get_gadget_detectors while holding the
@@ -714,7 +772,11 @@ impl WindowCoordinator {
     /// distances, and the BFS frontier ready for step 3.
     /// Returns `None` if cancelled.
     async fn explore_mandatory_zone(&self, center_gid: u64) -> Option<ExploredWindow> {
-        let buffer_radius = self.config.buffer_radius;
+        let mandatory_radius = if self.config.buffer_radius == 0 {
+            0
+        } else {
+            self.config.buffer_radius.saturating_add(1)
+        };
         let token = self.cancellation.read().await.clone();
 
         let mut explored = ExploredWindow {
@@ -734,7 +796,7 @@ impl WindowCoordinator {
             }
             let my_dist = explored.center_distance[&fgid];
             let mut sync_neighbors: Vec<(u64, bool)> = vec![];
-            let mut async_handles: Vec<JoinHandle<Option<bin::gadget::Connector>>> = vec![];
+            let mut async_handles: Vec<((u64, u64), JoinHandle<Option<bin::gadget::Connector>>)> = vec![];
 
             {
                 let gadgets = self.gadgets.read().await;
@@ -747,7 +809,7 @@ impl WindowCoordinator {
                     }
                     let peer = &gadgets[&connector.gid];
                     let peer_dist = if peer.is_free_hop { my_dist } else { my_dist + 1 };
-                    if peer_dist <= buffer_radius {
+                    if peer_dist <= mandatory_radius {
                         explored.gadgets.insert(connector.gid);
                         explored.center_distance.insert(connector.gid, peer_dist);
                         explored.phase.insert(connector.gid, ExplorePhase::MandatoryZone);
@@ -756,13 +818,10 @@ impl WindowCoordinator {
                 }
 
                 // Follow output ports — blocking wait for unconnected ports,
-                // because every direction must have `buffer_radius` buffer.
-                // At the boundary (my_dist == buffer_radius), only free-hop
-                // neighbors (same distance) could be in range — they don't
-                // strengthen the buffer, so we skip blocking for unconnected
-                // ports.  This is critical for buffer_radius = 0 (single-shot
-                // QEC): each gadget decodes independently with no waits.
-                for sender in &gadget.outputs {
+                // because a complete buffer needs an outer measured boundary.
+                // The gadget at exactly `buffer_radius + 1` is included as that
+                // boundary, but its own outputs are not awaited.
+                for (port, sender) in gadget.outputs.iter().enumerate() {
                     match get_or_receiver(sender, token.clone()) {
                         Ok(connector) => {
                             if explored.gadgets.contains(&connector.gid) {
@@ -770,7 +829,7 @@ impl WindowCoordinator {
                             }
                             let peer = gadgets.get(&connector.gid)?;
                             let peer_dist = if peer.is_free_hop { my_dist } else { my_dist + 1 };
-                            if peer_dist <= buffer_radius {
+                            if peer_dist <= mandatory_radius {
                                 explored.gadgets.insert(connector.gid);
                                 explored.center_distance.insert(connector.gid, peer_dist);
                                 explored.phase.insert(connector.gid, ExplorePhase::MandatoryZone);
@@ -778,8 +837,8 @@ impl WindowCoordinator {
                             }
                         }
                         Err(handle) => {
-                            if my_dist < buffer_radius {
-                                async_handles.push(handle);
+                            if my_dist < mandatory_radius {
+                                async_handles.push(((fgid, port as u64), handle));
                             }
                         }
                     }
@@ -789,7 +848,7 @@ impl WindowCoordinator {
             // Enqueue sync neighbors: free-hops to front (distance 0), others to back.
             for (gid, is_free_hop) in sync_neighbors {
                 let peer_dist = explored.center_distance[&gid];
-                if peer_dist < buffer_radius {
+                if peer_dist < mandatory_radius {
                     if is_free_hop {
                         explored.frontier.push_front(gid);
                     } else {
@@ -798,28 +857,42 @@ impl WindowCoordinator {
                 }
             }
 
-            // Await async output handles.
-            for handle in async_handles {
-                if let Some(connector) = handle.await.unwrap_or(None) {
-                    if explored.gadgets.contains(&connector.gid) {
-                        continue;
-                    }
-                    let gadgets = self.gadgets.read().await;
-                    let peer = &gadgets[&connector.gid];
-                    let peer_dist = if peer.is_free_hop { my_dist } else { my_dist + 1 };
-                    if peer_dist <= buffer_radius {
-                        explored.gadgets.insert(connector.gid);
-                        explored.center_distance.insert(connector.gid, peer_dist);
-                        explored.phase.insert(connector.gid, ExplorePhase::MandatoryZone);
-                        if peer_dist < buffer_radius {
-                            if peer.is_free_hop {
-                                explored.frontier.push_front(connector.gid);
-                            } else {
-                                explored.frontier.push_back(connector.gid);
-                            }
+            self.record_decode_dependencies(center_gid, &explored.gadgets).await;
+            if !async_handles.is_empty() {
+                self.publish_progress(
+                    center_gid,
+                    coordinator::DecodeProgressState::NeedsGraph(
+                        async_handles.iter().map(|(blocker, _)| *blocker).collect(),
+                    ),
+                )
+                .await;
+            }
+            let resolved = futures_util::future::join_all(async_handles.into_iter().map(|(_, handle)| handle)).await;
+            let had_resolved_handles = !resolved.is_empty();
+            for connector in resolved.into_iter().flatten().flatten() {
+                if explored.gadgets.contains(&connector.gid) {
+                    continue;
+                }
+                let gadgets = self.gadgets.read().await;
+                let peer = &gadgets[&connector.gid];
+                let peer_dist = if peer.is_free_hop { my_dist } else { my_dist + 1 };
+                if peer_dist <= mandatory_radius {
+                    explored.gadgets.insert(connector.gid);
+                    explored.center_distance.insert(connector.gid, peer_dist);
+                    explored.phase.insert(connector.gid, ExplorePhase::MandatoryZone);
+                    if peer_dist < mandatory_radius {
+                        if peer.is_free_hop {
+                            explored.frontier.push_front(connector.gid);
+                        } else {
+                            explored.frontier.push_back(connector.gid);
                         }
                     }
                 }
+            }
+            self.record_decode_dependencies(center_gid, &explored.gadgets).await;
+            if had_resolved_handles {
+                self.publish_progress(center_gid, coordinator::DecodeProgressState::Pending)
+                    .await;
             }
         }
 
@@ -828,7 +901,7 @@ impl WindowCoordinator {
         // they were at exactly buffer_radius.
         explored.frontier.clear();
         for &gid in &explored.gadgets {
-            if explored.center_distance[&gid] == buffer_radius {
+            if explored.center_distance[&gid] == mandatory_radius {
                 explored.frontier.push_back(gid);
             } else {
                 // Free-hop gadgets at distances < buffer_radius might also
@@ -1299,24 +1372,26 @@ impl WindowCoordinator {
         span.add_property(|| ("commit_region", format!("{:?}", commit_region)));
         span.add_property(|| ("window", format!("{:?}", window)));
 
-        // Wait for every window ∪ commit_region gadget to have both its outcomes
-        // loaded AND its `decode()` entered (`decode_ready`). Outcomes alone is
-        // not enough: a gadget's outcomes can arrive at measurement time via
-        // `submit_outcomes` (making its syndrome computable and this window
-        // decodable) BEFORE its own error-model-gated `decode()` fires. Committing
-        // it then would decode against an error model that has not finished
-        // loading, so we also gate on `decode_ready` — set only by `decode()`.
+        // Every gadget in the decoder window must have measured outcomes, but
+        // only gadgets selected for commit must have entered `decode()`. The
+        // outer buffer boundary can intentionally have an unconnected output:
+        // its syndrome is the required context, while its future-dependent
+        // error model belongs to a later window. Requiring `decode_ready` for
+        // that buffer-only gadget would deadlock this window against the CFG
+        // branch that creates its successor.
         let token = self.cancellation.read().await.clone();
-        let required_gids: HashSet<u64> = window.iter().chain(commit_region.iter()).copied().collect();
+        let (required_outcomes, required_decode_ready) = required_window_readiness(window, commit_region);
         let mut handles: Vec<JoinHandle<bool>> = vec![];
         {
             let gadgets = self.gadgets.read().await;
-            for gid in required_gids {
+            for gid in required_outcomes {
                 let gadget = gadgets.get(&gid)?;
                 if let Err(handle) = check_or_receiver(&gadget.outcomes, token.clone()) {
                     handles.push(handle);
                 }
-                if let Err(handle) = check_or_receiver(&gadget.decode_ready, token.clone()) {
+                if required_decode_ready.contains(&gid)
+                    && let Err(handle) = check_or_receiver(&gadget.decode_ready, token.clone())
+                {
                     handles.push(handle);
                 }
             }
@@ -3234,6 +3309,8 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
         self.gadgets.write().await.clear();
         self.check_models.write().await.clear();
         self.error_models.write().await.clear();
+        self.decode_progress.write().await.clear();
+        self.decode_dependencies.write().await.clear();
         self.pending_referring_by_gid.lock().await.clear();
         self.pending_referring_by_port.lock().await.clear();
         self.dem_log.reset();
@@ -3602,6 +3679,50 @@ mod tests {
             is_free_hop: false,
             state: watch::channel(GadgetState::Uncommitted).0,
         }
+    }
+
+    #[tokio::test]
+    async fn pending_progress_waits_until_resolved_dependencies_are_visible() {
+        let coordinator = Arc::new(WindowCoordinator::new(
+            serde_json::json!({ "buffer_radius": 1 }),
+            BlackBoxDecoderClient::from_mock(Arc::new(crate::decoder::MockDecoder::new())),
+        ));
+        let (output, _) = watch::channel(None);
+        let mut center = gadget_with_outcomes(1, 0, None, None);
+        center.outputs.push(output.clone());
+        coordinator
+            .gadgets
+            .write()
+            .await
+            .extend([(1, center), (2, gadget_with_outcomes(2, 0, None, None))]);
+
+        let mut progress = coordinator.progress_sender(1).await.subscribe();
+        let worker = {
+            let coordinator = Arc::clone(&coordinator);
+            tokio::spawn(async move { coordinator.explore_mandatory_zone(1).await })
+        };
+        progress.changed().await.expect("NeedsGraph progress");
+        assert!(matches!(
+            progress.borrow().state,
+            coordinator::DecodeProgressState::NeedsGraph(_)
+        ));
+
+        let dependency_guard = coordinator.decode_dependencies.write().await;
+        output.send_replace(Some(bin::gadget::Connector { gid: 2, port: 0 }));
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(
+            !progress.has_changed().expect("progress channel"),
+            "Pending became visible before the newly resolved dependency"
+        );
+
+        drop(dependency_guard);
+        progress.changed().await.expect("Pending progress");
+        assert_eq!(progress.borrow().state, coordinator::DecodeProgressState::Pending);
+        let mut dependencies = coordinator.decode_dependencies(1).await;
+        dependencies.sort_unstable();
+        assert_eq!(dependencies, vec![1, 2]);
+        worker.await.expect("exploration task").expect("explored window");
     }
 
     /// Construct a window `CheckModel` bound to `gid`/`ctype` with no remotes.
@@ -4236,6 +4357,16 @@ mod tests {
                 .count();
             assert_eq!(commits, 1, "late mechanism {mechanism:?} commits exactly once");
         }
+    }
+
+    #[test]
+    fn buffer_only_gadgets_do_not_gate_decode_readiness() {
+        let window = HashSet::from([1, 2, 3]);
+        let commit_region = HashSet::from([1, 2]);
+        let (outcomes, decode_ready) = required_window_readiness(&window, &commit_region);
+
+        assert_eq!(outcomes, HashSet::from([1, 2, 3]));
+        assert_eq!(decode_ready, HashSet::from([1, 2]));
     }
 
     /// End-to-end DEM gRPC surface (Task 8): a window coordinator hosted over a

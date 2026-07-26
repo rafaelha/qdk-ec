@@ -1,5 +1,5 @@
 use crate::bin::{self, check_model, check_model_type, error_model, error_model_type};
-use crate::coordinator::CoordinatorClient;
+use crate::coordinator::{self, CoordinatorClient};
 use crate::jit::{self, jit_compiler::JitCompiler};
 use crate::misc::sync::TaskCounter;
 use hashbrown::{HashMap, HashSet};
@@ -9,8 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "cli")]
 use structdoc::StructDoc;
-use tokio::sync::RwLock;
-use tokio::sync::oneshot;
+use tokio::sync::{RwLock, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 include!("../proto/deq.controller.jit_controller.rs");
@@ -48,10 +47,25 @@ pub struct JitController {
     /// Decode must wait for the error model before forwarding to coordinator.
     /// Stores the receiver; the sender is passed to the spawned error model task.
     error_model_loaded: RwLock<HashMap<u64, oneshot::Receiver<Result<(), tonic::Status>>>>,
+    decode_progress: RwLock<HashMap<u64, watch::Sender<coordinator::DecodeProgress>>>,
+    decode_progress_relays: RwLock<HashSet<u64>>,
     /// Cancelled on reset()/drop to abort pending error-model and batch tasks.
     cancellation: RwLock<CancellationToken>,
     /// Tracks active spawned tasks; reset() waits for all to finish.
     task_counter: Arc<TaskCounter>,
+}
+
+fn newly_reportable_progress(
+    state: coordinator::DecodeProgressState,
+    reported_blockers: &mut HashSet<(u64, u64)>,
+) -> Option<coordinator::DecodeProgressState> {
+    let coordinator::DecodeProgressState::NeedsGraph(mut blockers) = state else {
+        return Some(state);
+    };
+    blockers.sort_unstable();
+    blockers.dedup();
+    blockers.retain(|blocker| reported_blockers.insert(*blocker));
+    (!blockers.is_empty()).then_some(coordinator::DecodeProgressState::NeedsGraph(blockers))
 }
 
 impl JitController {
@@ -73,6 +87,8 @@ impl JitController {
             next_etype: AtomicU64::new(1),
             library,
             error_model_loaded: RwLock::new(HashMap::new()),
+            decode_progress: RwLock::new(HashMap::new()),
+            decode_progress_relays: RwLock::new(HashSet::new()),
             cancellation: RwLock::new(CancellationToken::new()),
             task_counter: TaskCounter::new(),
         })
@@ -93,6 +109,8 @@ impl JitController {
             next_etype: AtomicU64::new(1),
             library,
             error_model_loaded: RwLock::new(HashMap::new()),
+            decode_progress: RwLock::new(HashMap::new()),
+            decode_progress_relays: RwLock::new(HashSet::new()),
             cancellation: RwLock::new(CancellationToken::new()),
             task_counter: TaskCounter::new(),
         })
@@ -282,6 +300,9 @@ impl JitController {
                 .await
                 .map(|_| ());
 
+            if result.is_ok() {
+                this.compiler.mark_error_model_ready(gid).await;
+            }
             // Notify that the error model has been loaded
             let _ = error_model_tx.send(result);
         });
@@ -524,6 +545,134 @@ impl JitController {
         coordinator.wait_for_detectors(gid).await
     }
 
+    async fn progress_sender(&self, gid: u64) -> watch::Sender<coordinator::DecodeProgress> {
+        self.decode_progress
+            .write()
+            .await
+            .entry(gid)
+            .or_insert_with(|| watch::channel(coordinator::DecodeProgress::default()).0)
+            .clone()
+    }
+
+    async fn ensure_progress_relay(self: &Arc<Self>, gid: u64) {
+        if !self.decode_progress_relays.write().await.insert(gid) {
+            return;
+        }
+        let sender = self.progress_sender(gid).await;
+        let this = Arc::clone(self);
+        let token = self.cancellation.read().await.clone();
+        let _guard = self.task_counter.guard();
+        tokio::spawn(async move {
+            let _guard = _guard;
+            let mut compiler_progress = this.compiler.subscribe_progress();
+            let mut reported_blockers = HashSet::new();
+            loop {
+                let state = this.compiler.decode_progress_state(gid).await;
+                if state == coordinator::DecodeProgressState::Ready {
+                    break;
+                }
+                if let Some(state) = newly_reportable_progress(state, &mut reported_blockers) {
+                    coordinator::publish_decode_progress(&sender, state);
+                }
+                tokio::select! {
+                    changed = compiler_progress.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                    _ = token.cancelled() => return,
+                }
+            }
+
+            let coordinator_client = {
+                let coordinator = this.coordinator.read().await;
+                let Some(coordinator) = coordinator.as_ref() else {
+                    return;
+                };
+                coordinator.clone()
+            };
+            let Ok(mut window_progress) = coordinator_client.wait_decode_progress(gid, None).await else {
+                return;
+            };
+            loop {
+                let roots = coordinator_client.decode_dependencies(gid).await;
+                let compiler_state = this.compiler.decode_progress_state_for_roots(&roots).await;
+                let state = match (compiler_state, window_progress.state.clone()) {
+                    (
+                        coordinator::DecodeProgressState::NeedsGraph(mut left),
+                        coordinator::DecodeProgressState::NeedsGraph(right),
+                    ) => {
+                        left.extend(right);
+                        left.sort_unstable();
+                        left.dedup();
+                        coordinator::DecodeProgressState::NeedsGraph(left)
+                    }
+                    (coordinator::DecodeProgressState::NeedsGraph(blockers), _)
+                    | (_, coordinator::DecodeProgressState::NeedsGraph(blockers)) => {
+                        coordinator::DecodeProgressState::NeedsGraph(blockers)
+                    }
+                    (coordinator::DecodeProgressState::Ready, coordinator::DecodeProgressState::Ready) => {
+                        coordinator::DecodeProgressState::Ready
+                    }
+                    _ => coordinator::DecodeProgressState::Pending,
+                };
+                let ready = state == coordinator::DecodeProgressState::Ready;
+                if let Some(state) = newly_reportable_progress(state, &mut reported_blockers) {
+                    coordinator::publish_decode_progress(&sender, state);
+                }
+                if ready {
+                    return;
+                }
+                tokio::select! {
+                    progress = coordinator_client.wait_decode_progress(
+                        gid,
+                        Some(window_progress.revision),
+                    ) => {
+                        let Ok(progress) = progress else {
+                            return;
+                        };
+                        window_progress = progress;
+                    }
+                    changed = compiler_progress.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                    _ = token.cancelled() => return,
+                }
+            }
+        });
+    }
+
+    pub async fn wait_decode_progress(
+        self: &Arc<Self>,
+        gid: u64,
+        after_revision: Option<u64>,
+    ) -> Result<crate::coordinator::DecodeProgress, tonic::Status> {
+        self.ensure_progress_relay(gid).await;
+        let sender = self.progress_sender(gid).await;
+        let mut receiver = sender.subscribe();
+        let current = receiver.borrow().clone();
+        if after_revision.is_none_or(|revision| current.revision > revision) {
+            return Ok(current);
+        }
+        let token = self.cancellation.read().await.clone();
+        loop {
+            tokio::select! {
+                changed = receiver.changed() => {
+                    changed.map_err(|_| tonic::Status::cancelled("decode progress reset"))?;
+                    let current = receiver.borrow().clone();
+                    if current.revision > after_revision.unwrap() {
+                        return Ok(current);
+                    }
+                }
+                _ = token.cancelled() => {
+                    return Err(tonic::Status::cancelled("decode progress cancelled by reset"));
+                }
+            }
+        }
+    }
+
     pub async fn drain_dem(&self) -> crate::coordinator::dem::DemDrain {
         let coordinator_guard = self.coordinator.read().await;
         match coordinator_guard.as_ref() {
@@ -591,6 +740,8 @@ impl JitController {
             self.clear_cache().await;
         }
         self.error_model_loaded.write().await.clear();
+        self.decode_progress.write().await.clear();
+        self.decode_progress_relays.write().await.clear();
         let coordinator_guard = self.coordinator.read().await;
         if let Some(coordinator) = coordinator_guard.as_ref() {
             coordinator.reset(flags).await?;
@@ -954,6 +1105,31 @@ impl TypeCache {
 mod tests {
     use super::*;
     use crate::coordinator;
+
+    #[test]
+    fn progress_relay_reports_each_graph_blocker_once() {
+        let mut reported = HashSet::new();
+        let observed = [
+            coordinator::DecodeProgressState::NeedsGraph(vec![(6, 0)]),
+            coordinator::DecodeProgressState::NeedsGraph(vec![(6, 0), (9, 0)]),
+            coordinator::DecodeProgressState::NeedsGraph(vec![(9, 0)]),
+            coordinator::DecodeProgressState::Pending,
+            coordinator::DecodeProgressState::NeedsGraph(vec![(10, 0)]),
+        ]
+        .into_iter()
+        .filter_map(|state| newly_reportable_progress(state, &mut reported))
+        .collect::<Vec<_>>();
+
+        assert_eq!(
+            observed,
+            vec![
+                coordinator::DecodeProgressState::NeedsGraph(vec![(6, 0)]),
+                coordinator::DecodeProgressState::NeedsGraph(vec![(9, 0)]),
+                coordinator::DecodeProgressState::Pending,
+                coordinator::DecodeProgressState::NeedsGraph(vec![(10, 0)]),
+            ]
+        );
+    }
 
     #[tokio::test]
     async fn decode_single_rejects_a_dropped_error_model_loader() {
