@@ -263,6 +263,37 @@ pub struct WindowCoordinator {
     /// `submit_outcomes` or `decode`). Cleared on reset, drained + cleared with
     /// the timing log (same std::mem::take pattern). See coordinator::timing.
     pub outcome_arrivals: std::sync::Mutex<Vec<coordinator::OutcomeArrival>>,
+    /// Centers of leaders currently BLOCKED in the commit loop (registered via
+    /// an RAII guard, so cancellation unregisters too). A claiming leader
+    /// defers to any EARLIER (smaller-gid) waiting leader whose center sits in
+    /// its explored window — the ordered hand-off that keeps tail commits in
+    /// sliding-window order (see the commit loop in `decode()`). std Mutex:
+    /// held only for sync membership ops, never across an await.
+    waiting_leaders: std::sync::Mutex<std::collections::BTreeSet<u64>>,
+}
+
+/// RAII registration in `WindowCoordinator::waiting_leaders`: created when a
+/// leader enters the commit loop, removed on drop — including cancellation
+/// unwinds — so the ordered hand-off never keys on a dead task. A registered
+/// leader whose center has already left `Uncommitted` (it claimed, or another
+/// window committed it) is ignored by the defer check, so the guard living
+/// past the claim is harmless.
+struct WaitingLeaderGuard<'a> {
+    set: &'a std::sync::Mutex<std::collections::BTreeSet<u64>>,
+    gid: u64,
+}
+
+impl<'a> WaitingLeaderGuard<'a> {
+    fn register(set: &'a std::sync::Mutex<std::collections::BTreeSet<u64>>, gid: u64) -> Self {
+        set.lock().unwrap().insert(gid);
+        WaitingLeaderGuard { set, gid }
+    }
+}
+
+impl Drop for WaitingLeaderGuard<'_> {
+    fn drop(&mut self) {
+        self.set.lock().unwrap().remove(&self.gid);
+    }
 }
 
 /// State machine for gadget lifecycle in window decoding.
@@ -464,6 +495,7 @@ impl WindowCoordinator {
             syndrome_ready_at: Default::default(),
             decodes_in_flight: Default::default(),
             outcome_arrivals: Default::default(),
+            waiting_leaders: Default::default(),
         }
     }
 
@@ -954,6 +986,23 @@ impl WindowCoordinator {
     /// `buffer_radius` boundary-distance requirement.
     ///
     /// Returns `None` if cancelled.
+    /// Re-seed the BFS frontier for a repeat [`Self::explore_lookahead_zone`]
+    /// pass (the commit loop's retry iterations): every explored gadget goes
+    /// back on the frontier, in ascending center-distance order.
+    ///
+    /// The ordering keeps the 0-1 BFS's minimal-distance property for NEWLY
+    /// discovered gadgets: seeds pop in non-decreasing distance, so a new
+    /// neighbor's first discovery is via its closest explored source (already-
+    /// explored gadgets keep their original distances and are skipped by the
+    /// `contains` guard). Re-seeding everything (not just the old boundary) is
+    /// deliberate — a gadget previously skipped because its syndrome was not
+    /// yet ready can sit next to ANY explored gadget, not just the frontier.
+    fn reseed_lookahead_frontier(explored: &mut ExploredWindow) {
+        let mut seeds: Vec<u64> = explored.gadgets.iter().copied().collect();
+        seeds.sort_unstable_by_key(|g| explored.center_distance[g]);
+        explored.frontier = seeds.into();
+    }
+
     async fn explore_lookahead_zone(&self, explored: &mut ExploredWindow) -> Option<()> {
         let lookahead_radius = self.config.lookahead_radius();
         if lookahead_radius == 0 {
@@ -3177,6 +3226,18 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
 
         // Hop-counted gadget: five-step window exploration then commit loop.
 
+        // Register this leader for the ordered hand-off (see the defer check
+        // in the commit loop's claim branch). Registered HERE — at decode()
+        // entry, before the mandatory-zone waits — not at commit-loop entry:
+        // decode() entries arrive in stream order, while step 1/2 wake-ups
+        // under load do not, and a later leader that reached the loop first
+        // used to claim (and commit) the tail ahead of an earlier leader
+        // still waiting on its mandatory syndrome. Deferring to a leader that
+        // is still in steps 1-2 cannot hang: those steps complete iff the
+        // program's gadgets keep arriving, which this decode()'s own return
+        // already depends on.
+        let _waiting = WaitingLeaderGuard::register(&self.waiting_leaders, gid);
+
         // Step 1: Explore mandatory zone (blocking BFS up to buffer_radius).
         let mut explored = self
             .explore_mandatory_zone(gid)
@@ -3191,24 +3252,43 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
         // Window-formation stamp: mandatory-zone syndrome wait completed.
         let mandatory_ready_ns = crate::misc::util::timestamp_ns();
 
-        // Step 3: Explore lookahead zone (non-blocking BFS, lookahead_radius more hops).
-        self.explore_lookahead_zone(&mut explored)
-            .await
-            .ok_or_else(|| Status::cancelled("decode cancelled by reset"))?;
-
-        // Commit loop: check window for Decoding gadgets, run steps 3+4,
-        // mark entire window as Decoding, then proceed.
+        // Commit loop: run step 3, check window for Decoding gadgets, run
+        // steps 4+5, mark entire window as Decoding, then proceed.
+        //
+        // Step 3 (lookahead) runs at the TOP of every iteration, not once
+        // before the loop: a leader can sit blocked here for a long time —
+        // released from another window's buffer, or waiting out a neighbor's
+        // decode — and gadgets that registered and became syndrome-ready in
+        // the meantime were invisible to a frozen first-pass window.
+        // Committing from that stale window strands the skipped gadgets for
+        // an extra straggler window and lets a late tail leader commit ahead
+        // of an earlier one (out-of-order commits at the stream tail). The
+        // first iteration consumes step 1's frontier exactly as before;
+        // retries re-seed the frontier from the already-explored set so the
+        // non-blocking BFS can pick up newly available neighbors.
+        //
         // Window-exploration compute (select_commit_region + shrink_window), for
         // WindowTiming.explore_ns. Set inside the retry loop below (only the
         // iteration that reaches the break actually runs steps 4-5); hoisted here
         // so it's in scope at the decode_and_commit call site after the loop.
         #[allow(unused_assignments)]
         let mut explore_ns: u64 = 0;
+        let mut explore_pass: u32 = 0;
         loop {
             let token = self.cancellation.read().await.clone();
             if token.is_cancelled() {
                 return Err(Status::cancelled("decode cancelled by reset"));
             }
+
+            // Step 3: Explore lookahead zone (non-blocking BFS, lookahead_radius
+            // more hops). Re-seeded on retries (see the loop comment above).
+            if explore_pass > 0 {
+                Self::reseed_lookahead_frontier(&mut explored);
+            }
+            explore_pass += 1;
+            self.explore_lookahead_zone(&mut explored)
+                .await
+                .ok_or_else(|| Status::cancelled("decode cancelled by reset"))?;
 
             let blocking_gids: Vec<u64>;
             {
@@ -3280,6 +3360,46 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                 }
 
                 if blocked.is_empty() {
+                    // Ordered hand-off: an EARLIER leader (smaller center gid;
+                    // gid order is topological — a Create::Gadget's connectors
+                    // may only reference already-registered gadgets) is still
+                    // blocked in this same loop and its center sits in OUR
+                    // window. Claiming now would grab that center as buffer
+                    // and commit this window's region ahead of it — the
+                    // out-of-order tail commit (a late leader wins the wake
+                    // race after a buffer release and commits {tail} while an
+                    // earlier round is left for a straggler window). Defer:
+                    // wait for that leader's center to leave Uncommitted (it
+                    // claims, or another window commits it), then retry. The
+                    // smallest-gid waiting leader never defers, so the
+                    // hand-off chain cannot cycle.
+                    let earlier_waiting = {
+                        let waiting = self.waiting_leaders.lock().unwrap();
+                        waiting.iter().copied().find(|w| {
+                            *w < gid
+                                && explored.gadgets.contains(w)
+                                && gadgets
+                                    .get(w)
+                                    .is_some_and(|g| matches!(*g.state.borrow(), GadgetState::Uncommitted))
+                        })
+                    };
+                    if let Some(w) = earlier_waiting {
+                        let mut rx = gadgets
+                            .get(&w)
+                            .expect("waiting leader's gadget exists in the map")
+                            .state
+                            .subscribe();
+                        let token_c = token.clone();
+                        drop(gadgets);
+                        tokio::select! {
+                            result = rx.wait_for(|s| !matches!(s, GadgetState::Uncommitted)) => {
+                                let _ = result;
+                            }
+                            _ = token_c.cancelled() => {}
+                        }
+                        continue;
+                    }
+
                     let explore_started = std::time::Instant::now();
                     // Step 4: Select commit region.
                     self.select_commit_region(&mut explored, &gadgets);
@@ -3402,6 +3522,10 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
         self.timing_log.reset();
         self.syndrome_ready_at.lock().unwrap().clear();
         self.outcome_arrivals.lock().unwrap().clear();
+        // Defensive: in-flight decode() tasks were cancelled above and their
+        // RAII guards unregister on drop; clear anyway so a stale entry can
+        // never make a next-shot leader defer to a dead one.
+        self.waiting_leaders.lock().unwrap().clear();
         *self.next_gid.lock().await = 1;
         *self.next_cid.lock().await = 1;
         *self.next_eid.lock().await = 1;
