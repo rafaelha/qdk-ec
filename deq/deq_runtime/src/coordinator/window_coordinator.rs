@@ -1580,10 +1580,7 @@ impl WindowCoordinator {
         // increment placed at function entry (decode_and_commit has several
         // cancellation early-returns between entry and here).
         let decode_start_ns = crate::misc::util::timestamp_ns();
-        let concurrent = self
-            .decodes_in_flight
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1;
+        let concurrent = self.decodes_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         let mut timing = coordinator::WindowTiming {
             explore_ns,
             leader_arrived_ns,
@@ -1614,17 +1611,9 @@ impl WindowCoordinator {
         // every measured phase is subtracted (all share timestamp_ns()'s clock),
         // so prep+build+merge+compact+load+decode+finalize == decode_end -
         // decode_start with no unaccounted gap.
-        timing.finalize_ns = timing
-            .decode_end_ns
-            .saturating_sub(timing.decode_start_ns)
-            .saturating_sub(
-                timing.prep_ns
-                    + timing.build_ns
-                    + timing.merge_ns
-                    + timing.compact_ns
-                    + timing.load_ns
-                    + timing.decode_ns,
-            );
+        timing.finalize_ns = timing.decode_end_ns.saturating_sub(timing.decode_start_ns).saturating_sub(
+            timing.prep_ns + timing.build_ns + timing.merge_ns + timing.compact_ns + timing.load_ns + timing.decode_ns,
+        );
         self.decodes_in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         timing.cache_size = self.loaded_decoders.read().await.len() as u32;
         self.timing_log.push(timing);
@@ -2937,7 +2926,10 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                     // for WindowTiming.syndrome_ready_ns (decode_parity_factor takes
                     // the max over the window's cids). Unconditional (not gated on
                     // has_trace) — the timing log has no enable flag.
-                    syndrome_ready_at.lock().unwrap().insert(cid, crate::misc::util::timestamp_ns());
+                    syndrome_ready_at
+                        .lock()
+                        .unwrap()
+                        .insert(cid, crate::misc::util::timestamp_ns());
                     // Record syndrome-ready trace event
                     if has_trace {
                         trace_shot.lock().await.events.push(trace::Event {
@@ -2968,6 +2960,20 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                     }
                 }
                 let modified_remote = Arc::new(modified_remote);
+
+                // DEM: fold the probability modifiers into the etype's error
+                // list and precompute the required-slot metadata BEFORE taking
+                // the instance locks below — both the clone and the scan are
+                // O(errors) on the etype's whole list (~100 µs for
+                // surface-code etypes) and only need `error_model_types`,
+                // which is already held. Under the locks they serialized
+                // every concurrent registration/submit behind this arm.
+                let prepared_dem = self.dem_log.is_enabled().then(|| {
+                    coordinator::dem::PreparedErrorModel::new(
+                        coordinator::dem::effective_errors(error_model_type, &error_model),
+                        &modified_remote,
+                    )
+                });
 
                 // Acquire locks in ordering: gadgets(read) → check_models(write) →
                 // error_models(write).  All three are held throughout to ensure
@@ -3005,19 +3011,13 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                 check_model.attaching_eid_vec.push(eid);
 
                 // record the new error mechanisms in the DEM increment log
-                // (record-only, probability modifiers folded in). Registered
-                // BEFORE the resolution loop below so its on_remote_resolved
-                // emissions land on a known eid. is_enabled guard: skips the
-                // effective_errors clone of the etype's whole error list when
-                // the log is off (later hooks are no-ops on their own).
-                if self.dem_log.is_enabled() {
-                    self.dem_log.on_error_model(
-                        check_model.instance.gid,
-                        eid,
-                        error_model.cid,
-                        coordinator::dem::effective_errors(error_model_type, &error_model),
-                        &modified_remote,
-                    );
+                // (record-only, probability modifiers folded in — hoisted
+                // above the locks). Registered BEFORE the resolution loop
+                // below so its on_remote_resolved emissions land on a known
+                // eid.
+                if let Some(prepared) = prepared_dem {
+                    self.dem_log
+                        .on_error_model_prepared(check_model.instance.gid, eid, error_model.cid, prepared);
                 }
 
                 // Register referring_eids for resolved targets; defer unresolved ones.
