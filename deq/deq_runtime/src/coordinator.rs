@@ -422,9 +422,7 @@ impl CoordinatorClient {
     /// `DrainWindowTimings` RPC (request is `google.protobuf.Empty`), the
     /// `Local` arm calls straight into the `coordinator_server::Coordinator`
     /// trait via `DynCoordinator::inner()`.
-    pub async fn drain_window_timings(
-        &self,
-    ) -> std::result::Result<WindowTimingsResponse, Status> {
+    pub async fn drain_window_timings(&self) -> std::result::Result<WindowTimingsResponse, Status> {
         let request = Request::new(());
         (match self {
             #[cfg(feature = "cli")]

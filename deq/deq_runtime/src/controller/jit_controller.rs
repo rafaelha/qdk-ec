@@ -594,7 +594,14 @@ impl JitController {
         let readouts = coordinator.decode(outcomes).await?;
         let decode_ns = decode_started.elapsed().as_nanos() as u64;
 
-        Ok((readouts, DecodeSingleTiming { submit_ns, local_wait_ns, decode_ns }))
+        Ok((
+            readouts,
+            DecodeSingleTiming {
+                submit_ns,
+                local_wait_ns,
+                decode_ns,
+            },
+        ))
     }
 
     /// Finished-detector bits for a gadget, resolved as soon as its checks are
@@ -1071,7 +1078,10 @@ mod tests {
         tx.send(Ok(())).unwrap();
         controller.error_model_loaded.write().await.insert(7, rx);
 
-        let outcomes = coordinator::Outcomes { gid: 7, ..Default::default() };
+        let outcomes = coordinator::Outcomes {
+            gid: 7,
+            ..Default::default()
+        };
         let wall = std::time::Instant::now();
         let (timed_readouts, timing) = controller
             .decode_single_timed(outcomes.clone())
@@ -1083,10 +1093,7 @@ mod tests {
         let (tx2, rx2) = oneshot::channel();
         tx2.send(Ok(())).unwrap();
         controller.error_model_loaded.write().await.insert(7, rx2);
-        let plain_readouts = controller
-            .decode_single(outcomes)
-            .await
-            .expect("plain decode must succeed");
+        let plain_readouts = controller.decode_single(outcomes).await.expect("plain decode must succeed");
 
         assert_eq!(
             timed_readouts, plain_readouts,
@@ -1095,7 +1102,9 @@ mod tests {
         assert!(
             timing.submit_ns + timing.local_wait_ns + timing.decode_ns <= elapsed,
             "phase durations ({} + {} + {}) must sum within the measured wall ({elapsed})",
-            timing.submit_ns, timing.local_wait_ns, timing.decode_ns
+            timing.submit_ns,
+            timing.local_wait_ns,
+            timing.decode_ns
         );
     }
 }

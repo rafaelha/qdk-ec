@@ -4586,7 +4586,9 @@ async fn drain_window_timings_returns_and_clears_records() {
     let mock = make_mock_decoder();
     let coord = make_coordinator(mock.clone(), &trace_path);
 
-    Coordinator::load_library(&coord, Request::new(make_test_library())).await.unwrap();
+    Coordinator::load_library(&coord, Request::new(make_test_library()))
+        .await
+        .unwrap();
     let gid_a = exec_gadget(&coord, make_gadget(0, 1, vec![])).await;
     exec_check_model(&coord, make_check_model(0, 1, gid_a)).await;
     exec_error_model(&coord, make_error_model(0, 1, 1)).await;
@@ -4596,22 +4598,30 @@ async fn drain_window_timings_returns_and_clears_records() {
     let (_r1, _r2) = tokio::join!(decode(&coord, gid_a, 1), decode(&coord, gid_b, 1));
 
     let resp = Coordinator::drain_window_timings(&coord, Request::new(()))
-        .await.unwrap().into_inner();
+        .await
+        .unwrap()
+        .into_inner();
     assert!(resp.drained_at_ns > 0, "server must stamp its clock on the drain");
     let max_end = resp.timings.iter().map(|t| t.decode_end_ns).max().unwrap();
-    assert!(resp.drained_at_ns >= max_end,
-        "drain stamp is taken after every drained record was completed");
+    assert!(
+        resp.drained_at_ns >= max_end,
+        "drain stamp is taken after every drained record was completed"
+    );
 
     // Per-gid outcome-arrival stamps: one per gadget that received outcomes.
     let arrivals = &resp.outcome_arrivals;
     assert!(!arrivals.is_empty(), "outcome arrivals must be recorded");
     let arrived_gids: std::collections::HashSet<u64> = arrivals.iter().map(|a| a.gid).collect();
-    assert!(arrived_gids.contains(&gid_a) && arrived_gids.contains(&gid_b),
-        "every decoded gadget must have an arrival stamp");
+    assert!(
+        arrived_gids.contains(&gid_a) && arrived_gids.contains(&gid_b),
+        "every decoded gadget must have an arrival stamp"
+    );
     for a in arrivals {
         assert!(a.received_ns > 0, "arrival stamp must carry a server-clock timestamp");
-        assert!(a.received_ns <= resp.drained_at_ns,
-            "an outcome cannot arrive after the drain answered");
+        assert!(
+            a.received_ns <= resp.drained_at_ns,
+            "an outcome cannot arrive after the drain answered"
+        );
     }
 
     let timings = resp.timings;
@@ -4627,10 +4637,14 @@ async fn drain_window_timings_returns_and_clears_records() {
         // Window-formation stamps ordered: leader entry ≤ mandatory-zone
         // syndrome ready ≤ decode start.
         assert!(t.leader_arrived_ns > 0, "leader arrival must be stamped");
-        assert!(t.mandatory_ready_ns >= t.leader_arrived_ns,
-            "mandatory-zone syndrome cannot be ready before the leader arrived");
-        assert!(t.decode_start_ns >= t.mandatory_ready_ns,
-            "decode cannot start before the mandatory zone is ready");
+        assert!(
+            t.mandatory_ready_ns >= t.leader_arrived_ns,
+            "mandatory-zone syndrome cannot be ready before the leader arrived"
+        );
+        assert!(
+            t.decode_start_ns >= t.mandatory_ready_ns,
+            "decode cannot start before the mandatory zone is ready"
+        );
         assert!(t.num_gadgets as usize >= t.num_committing as usize);
         assert!(t.num_gadgets as usize == t.window_gids.len());
         // First encounter with a persistent decoder: BUILT_LOADED with real phases.
@@ -4710,7 +4724,9 @@ async fn reset_clears_window_timings() {
     let trace_path = trace_file.path().to_str().unwrap().to_string();
     let mock = make_mock_decoder();
     let coord = make_coordinator(mock.clone(), &trace_path);
-    Coordinator::load_library(&coord, Request::new(make_test_library())).await.unwrap();
+    Coordinator::load_library(&coord, Request::new(make_test_library()))
+        .await
+        .unwrap();
     let gid_a = exec_gadget(&coord, make_gadget(0, 1, vec![])).await;
     exec_check_model(&coord, make_check_model(0, 1, gid_a)).await;
     exec_error_model(&coord, make_error_model(0, 1, 1)).await;
@@ -4724,5 +4740,8 @@ async fn reset_clears_window_timings() {
         .unwrap()
         .into_inner();
     assert!(resp.timings.is_empty(), "reset must clear undrained timing records");
-    assert!(resp.outcome_arrivals.is_empty(), "reset must clear undrained outcome arrivals");
+    assert!(
+        resp.outcome_arrivals.is_empty(),
+        "reset must clear undrained outcome arrivals"
+    );
 }
