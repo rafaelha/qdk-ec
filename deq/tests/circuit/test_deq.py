@@ -31,6 +31,8 @@ from deq.circuit.model import (
     PropagateStatement,
     ReadoutTarget,
     LogicalPauliTarget,
+    PhysicalMeasurementTarget,
+    PreselectStatement,
     VirtualCorrection,
 )
 
@@ -390,6 +392,35 @@ CODE MyCode [[3,1]] {
         assert code.k == 1
         assert code.d is None
 
+    def test_code_parameter_n_must_be_positive(self):
+        with pytest.raises(SyntaxError, match=r"parameter n must be >= 1"):
+            parse("CODE C [[0,0]] {\n}\n")
+
+    def test_code_parameter_k_must_not_exceed_n(self):
+        with pytest.raises(SyntaxError, match=r"parameter k \(3\) must be <= n \(2\)"):
+            parse("CODE C [[2,3]] {\n}\n")
+
+    def test_code_parameter_d_must_be_positive(self):
+        with pytest.raises(SyntaxError, match=r"parameter d must be >= 1"):
+            parse("CODE C [[3,1,0]] {\n    STABILIZER Z0*Z1 Z1*Z2\n}\n")
+
+    def test_code_logical_count_must_match_k(self):
+        # k and the number of LOGICAL declarations are two spellings of the
+        # same quantity. Nothing downstream re-checks this: the transpiler's
+        # code validation only iterates over the logicals it is handed, so a
+        # mismatched k reaches the emitted port type unnoticed.
+        one_logical = "    LOGICAL X0*X1*X2 Z0*Z1*Z2\n"
+        with pytest.raises(SyntaxError, match=r"but has 1 LOGICAL .*expected 2"):
+            parse(f"CODE C [[3,2,1]] {{\n{one_logical}}}\n")
+        with pytest.raises(SyntaxError, match=r"but has 2 LOGICAL .*expected 1"):
+            parse(f"CODE C [[3,1,1]] {{\n{one_logical}{one_logical}}}\n")
+        with pytest.raises(SyntaxError, match=r"but has 0 LOGICAL .*expected 1"):
+            parse("CODE C [[3,1,1]] {\n    STABILIZER Z0*Z1\n}\n")
+
+    def test_code_logical_count_matching_k_is_accepted(self):
+        parse("CODE C [[3,1,1]] {\n    LOGICAL X0*X1*X2 Z0*Z1*Z2\n}\n")
+        parse("CODE C [[3,0,1]] {\n    STABILIZER Z0*Z1\n}\n")
+
     def test_multiple_logicals(self):
         text = """
 CODE C [[4,2]] {
@@ -550,6 +581,12 @@ class TestRepeatBlockRestrictions:
     def test_input_in_gadget_repeat_is_invalid(self):
         text = "GADGET G {\n    REPEAT 3 {\n        INPUT a 0\n    }\n}\n"
         with pytest.raises(SyntaxError):
+            parse(text)
+
+    def test_semantic_error_reports_source_line(self):
+        # The offending INPUT is on line 3; the diagnostic must point at it.
+        text = "GADGET G {\n    REPEAT 3 {\n        INPUT a 0\n    }\n}\n"
+        with pytest.raises(SyntaxError, match=r"line 3"):
             parse(text)
 
     def test_output_in_gadget_repeat_is_invalid(self):
@@ -1072,3 +1109,83 @@ class TestStimAliases:
         gadget = deq.definitions[0]
         checks = [s for s in gadget.body if isinstance(s, CheckStatement)]
         assert len(checks) == 2
+
+
+class TestPreselectStatement:
+    """PRESELECT accepts one or more concrete physical-measurement targets
+    (``rec[-k]`` and ``M<i>``) plus an optional trailing parity bit."""
+
+    def test_single_target_default_parity(self):
+        text = "GADGET G {\n    M 0\n    PRESELECT rec[-1]\n}\n"
+        gadget = parse(text).definitions[0]
+        stmts = [s for s in gadget.body if isinstance(s, PreselectStatement)]
+        assert len(stmts) == 1
+        assert stmts[0].conditions == [MeasurementRecordTarget(1)]
+        assert stmts[0].expected_value == 0
+
+    def test_single_target_explicit_parity(self):
+        text = "GADGET G {\n    M 0\n    PRESELECT rec[-1] 1\n}\n"
+        stmts = [
+            s for s in parse(text).definitions[0].body
+            if isinstance(s, PreselectStatement)
+        ]
+        assert stmts[0].expected_value == 1
+
+    def test_multi_target_default_parity(self):
+        text = (
+            "GADGET G {\n    M 0 1\n"
+            "    PRESELECT rec[-1] rec[-2]\n}\n"
+        )
+        stmts = [
+            s for s in parse(text).definitions[0].body
+            if isinstance(s, PreselectStatement)
+        ]
+        assert stmts[0].conditions == [
+            MeasurementRecordTarget(1),
+            MeasurementRecordTarget(2),
+        ]
+        assert stmts[0].expected_value == 0
+
+    def test_multi_target_odd_parity(self):
+        text = (
+            "GADGET G {\n    M 0 1\n"
+            "    PRESELECT rec[-1] rec[-2] 1\n}\n"
+        )
+        stmts = [
+            s for s in parse(text).definitions[0].body
+            if isinstance(s, PreselectStatement)
+        ]
+        assert stmts[0].expected_value == 1
+
+    def test_absolute_physical_target_accepted(self):
+        text = "GADGET G {\n    M 0\n    PRESELECT M0\n}\n"
+        stmts = [
+            s for s in parse(text).definitions[0].body
+            if isinstance(s, PreselectStatement)
+        ]
+        assert stmts[0].conditions == [PhysicalMeasurementTarget(0)]
+
+    def test_virtual_input_stabilizer_rejected(self):
+        text = (
+            "CODE C [[1,1,1]] { STABILIZER Z0 LOGICAL X0 Z0 }\n"
+            "GADGET G {\n    INPUT C 0\n"
+            "    PRESELECT IN0.S0\n"
+            "    OUTPUT C 0\n}\n"
+        )
+        with pytest.raises(Exception):
+            parse(text)
+
+    def test_virtual_output_stabilizer_rejected(self):
+        text = (
+            "CODE C [[1,1,1]] { STABILIZER Z0 LOGICAL X0 Z0 }\n"
+            "GADGET G {\n    INPUT C 0\n"
+            "    PRESELECT OUT0.S0\n"
+            "    OUTPUT C 0\n}\n"
+        )
+        with pytest.raises(Exception):
+            parse(text)
+
+    def test_invalid_parity_value_rejected(self):
+        text = "GADGET G {\n    M 0\n    PRESELECT rec[-1] 2\n}\n"
+        with pytest.raises(SyntaxError, match="expected parity must be 0 or 1"):
+            parse(text)

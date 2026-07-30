@@ -559,10 +559,6 @@
           "name": "entity.name.tag.logical.deq"
         },
         {
-          "match": "[XYZ]\\d+",
-          "name": "storage.type.pauli.deq"
-        },
-        {
           "match": "C\\d+",
           "name": "support.class.check.deq"
         },
@@ -708,6 +704,10 @@
           "include": "#mako-expression"
         },
         {
+          "match": "(?:IN|OUT)\\d+\\.S\\d+",
+          "name": "invalid.illegal.virtual-stabilizer-in-preselect.deq"
+        },
+        {
           "match": "M\\d+",
           "name": "variable.other.deq"
         },
@@ -716,8 +716,12 @@
           "name": "variable.other.deq"
         },
         {
+          "match": "\\b[01]\\b",
+          "name": "constant.numeric.parity.deq"
+        },
+        {
           "match": "\\d+",
-          "name": "constant.numeric.deq"
+          "name": "invalid.illegal.preselect-parity-out-of-range.deq"
         }
       ]
     },

@@ -38,7 +38,6 @@ from deq.circuit.model import (
     MeasurementRefTarget,
     OutputPort,
     OutputVirtualTarget,
-    PauliTarget,
     PhysicalMeasurementTarget,
     DeqFile,
     PropagateStatement,
@@ -75,6 +74,7 @@ from deq.transpiler.jit_noise_builder import (
 )
 import stim
 
+from deq.spec.common import bitmatrix_from_sparse
 from deq.transpiler.code_validation import validate_code
 from deq.transpiler.stim_constants import qubit_indices as _qubit_indices
 from deq.transpiler.stim_constants import (
@@ -976,14 +976,8 @@ def _build_logical_correction(
                 for row in target_rows:
                     _xor_entry(row, term.index)
 
-    sorted_entries = sorted(entries)
-    rows_list = [r for r, _ in sorted_entries]
-    cols_list = [c for _, c in sorted_entries]
-    return util_pb.BitMatrix(
-        rows=num_output_observables,
-        cols=num_readouts,
-        i=rows_list,
-        j=cols_list,
+    return bitmatrix_from_sparse(
+        entries, rows=num_output_observables, cols=num_readouts
     )
 
 
@@ -1161,7 +1155,7 @@ def build_readouts(
             )
 
     if not readouts_info:
-        propagation = _empty_bit_matrix(0, num_input_observables + 1)
+        propagation = util_pb.BitMatrix(rows=0, cols=num_input_observables + 1)
         return [], propagation, []
 
     readouts_pb: list[pb.GadgetType.Readout] = []
@@ -1376,10 +1370,6 @@ def _build_readout_propagation(
     return util_pb.BitMatrix(rows=rows, cols=cols, i=row_idx, j=col_idx)
 
 
-def _empty_bit_matrix(rows: int, cols: int) -> util_pb.BitMatrix:
-    return util_pb.BitMatrix(rows=rows, cols=cols)
-
-
 # ---------------------------------------------------------------------------
 # Error mechanisms
 # ---------------------------------------------------------------------------
@@ -1533,17 +1523,10 @@ def _parse_error(
                     f"target {target}"
                 )
             continue
-        if isinstance(target, PauliTarget):
-            raise ValueError(
-                f"in GADGET {gadget_name!r}: {_render_error(stmt)}: "
-                f"physical observable {target} is not supported; "
-                f"use L{target.pauli}{target.index} for the logical "
-                f"observable instead"
-            )
         raise ValueError(
             f"in GADGET {gadget_name!r}: {_render_error(stmt)}: "
             f"unsupported target {target!r}; expected C<i>, R<i>, "
-            f"LX/LY/LZ<i>, or X/Y/Z<i>"
+            f"or LX/LY/LZ<i>"
         )
 
     # Set stabilizer generator residual columns from unfinished check
