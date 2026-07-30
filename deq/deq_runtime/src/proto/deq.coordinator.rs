@@ -165,6 +165,157 @@ pub struct Readouts {
     #[prost(message, optional, tag = "4")]
     pub detectors: ::core::option::Option<super::util::BitVector>,
 }
+/// Wall-clock timing of one window decode. All \*\_ns timestamps share the
+/// process-monotonic origin of timestamp_ns(); durations are plain ns.
+/// Construction phases (build/merge/compact/load) are 0 on CACHE_HIT.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WindowTiming {
+    /// monotone per-shot counter, assigned by the timing log in push order
+    #[prost(uint64, tag = "1")]
+    pub seq: u64,
+    #[prost(uint64, repeated, tag = "2")]
+    pub window_gids: ::prost::alloc::vec::Vec<u64>,
+    /// max over the window's check models of their syndrome-complete time
+    /// (0 when unknown, e.g. monolithic approximates with decode entry)
+    #[prost(uint64, tag = "3")]
+    pub syndrome_ready_ns: u64,
+    #[prost(uint64, tag = "4")]
+    pub decode_start_ns: u64,
+    #[prost(uint64, tag = "5")]
+    pub decode_end_ns: u64,
+    /// window-exploration compute (select_commit_region + shrink_window); 0 monolithic
+    #[prost(uint64, tag = "6")]
+    pub explore_ns: u64,
+    /// decoding_hypergraph()
+    #[prost(uint64, tag = "7")]
+    pub build_ns: u64,
+    /// hyperedge merging (0 if merge_hyperedges off)
+    #[prost(uint64, tag = "8")]
+    pub merge_ns: u64,
+    /// compact_vertices (0 monolithic)
+    #[prost(uint64, tag = "9")]
+    pub compact_ns: u64,
+    /// load_hypergraph into the decoder service
+    #[prost(uint64, tag = "10")]
+    pub load_ns: u64,
+    /// the decode / decode_loaded call, client-observed
+    #[prost(uint64, tag = "11")]
+    pub decode_ns: u64,
+    #[prost(enumeration = "DecodePath", tag = "12")]
+    pub path: i32,
+    /// fired detectors (popcount of the syndrome)
+    #[prost(uint32, tag = "13")]
+    pub syndrome_weight: u32,
+    /// parity_factor.subgraph.len()
+    #[prost(uint32, tag = "14")]
+    pub correction_weight: u32,
+    #[prost(uint32, tag = "15")]
+    pub num_hyperedges: u32,
+    #[prost(uint32, tag = "16")]
+    pub num_vertices: u32,
+    /// decoder-window gadget count
+    #[prost(uint32, tag = "17")]
+    pub num_gadgets: u32,
+    /// commit-region gadget count (== num_gadgets monolithic)
+    #[prost(uint32, tag = "18")]
+    pub num_committing: u32,
+    /// decodes in flight when this one started (incl. self)
+    #[prost(uint32, tag = "19")]
+    pub concurrent_decodes: u32,
+    /// loaded_decoders entries after this decode
+    #[prost(uint32, tag = "20")]
+    pub cache_size: u32,
+    /// syndrome BitVector payload bytes
+    #[prost(uint64, tag = "21")]
+    pub syndrome_bytes: u64,
+    /// encoded_len of the returned ParityFactor
+    #[prost(uint64, tag = "22")]
+    pub parity_factor_bytes: u64,
+    /// encoded_len of the hypergraph at load; 0 on CACHE_HIT
+    #[prost(uint64, tag = "23")]
+    pub hypergraph_bytes: u64,
+    /// decoder-side compute reported by the decoder service (ParityFactor.compute_ns);
+    /// comms overhead = decode_ns - decoder_compute_ns
+    #[prost(uint64, tag = "24")]
+    pub decoder_compute_ns: u64,
+    /// decode() handler entry of this window's leader gadget (server clock).
+    /// Monolithic approximates with the decode entry (== decode_start_ns).
+    #[prost(uint64, tag = "25")]
+    pub leader_arrived_ns: u64,
+    /// step-2 mandatory-zone syndrome wait completed (server clock).
+    /// Monolithic approximates with the decode entry (== decode_start_ns).
+    #[prost(uint64, tag = "26")]
+    pub mandatory_ready_ns: u64,
+    /// decode_start -> first construction phase: syndrome-vector assembly from the
+    /// window's check models + decoder cache-key fingerprinting (incl. the
+    /// error_model_types/error_models read-lock acquisition). The front of the
+    /// decode handler that has no other phase counter.
+    #[prost(uint64, tag = "27")]
+    pub prep_ns: u64,
+    /// decode-call end -> decode_end: post-decode bookkeeping (DEM prediction
+    /// recording, parity-factor serialization, decode-finished event). Computed as
+    /// the exact remainder of (decode_end - decode_start) once every other phase is
+    /// subtracted, so prep+build+merge+compact+load+decode+finalize tiles the whole
+    /// \[decode_start, decode_end\] span with no unaccounted gap.
+    #[prost(uint64, tag = "28")]
+    pub finalize_ns: u64,
+}
+/// The first time a gadget's measurement outcomes are set on a coordinator
+/// (via SubmitOutcomes or Decode), stamped with the server clock.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OutcomeArrival {
+    #[prost(uint64, tag = "1")]
+    pub gid: u64,
+    #[prost(uint64, tag = "2")]
+    pub received_ns: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WindowTimingsResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub timings: ::prost::alloc::vec::Vec<WindowTiming>,
+    /// Server clock (timestamp_ns() origin — the same clock every WindowTiming
+    /// timestamp uses) at the moment this drain was answered. Lets the client
+    /// convert server timestamps into its own timeline (clock synchronization).
+    #[prost(uint64, tag = "2")]
+    pub drained_at_ns: u64,
+    /// Per-gid outcome-arrival stamps accumulated since the previous drain,
+    /// cleared here and on reset (same lifecycle as `timings`).
+    #[prost(message, repeated, tag = "3")]
+    pub outcome_arrivals: ::prost::alloc::vec::Vec<OutcomeArrival>,
+}
+/// How decode_parity_factor obtained its decoding hypergraph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum DecodePath {
+    /// reused an already-loaded hypergraph (decode_loaded, zero construction)
+    CacheHit = 0,
+    /// persistent decoder, first encounter: built + load_hypergraph + decode_loaded
+    BuiltLoaded = 1,
+    /// non-persistent config: built + inline decode (no load step)
+    Temporary = 2,
+}
+impl DecodePath {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::CacheHit => "CACHE_HIT",
+            Self::BuiltLoaded => "BUILT_LOADED",
+            Self::Temporary => "TEMPORARY",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "CACHE_HIT" => Some(Self::CacheHit),
+            "BUILT_LOADED" => Some(Self::BuiltLoaded),
+            "TEMPORARY" => Some(Self::Temporary),
+            _ => None,
+        }
+    }
+}
 /// Generated client implementations.
 #[cfg(feature = "cli")]
 pub mod coordinator_client {
@@ -505,6 +656,35 @@ pub mod coordinator_client {
                 .insert(GrpcMethod::new("deq.coordinator.Coordinator", "SetDemEnabled"));
             self.inner.unary(req, path, codec).await
         }
+        /// drain the per-window decode timing records accumulated since the previous
+        /// drain (or reset). Always recorded — unlike the DEM log there is no enable
+        /// flag; records are ~30 scalars per window decode.
+        pub async fn drain_window_timings(
+            &mut self,
+            request: impl tonic::IntoRequest<()>,
+        ) -> std::result::Result<
+            tonic::Response<super::WindowTimingsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/deq.coordinator.Coordinator/DrainWindowTimings",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("deq.coordinator.Coordinator", "DrainWindowTimings"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -589,6 +769,16 @@ pub mod coordinator_server {
             &self,
             request: tonic::Request<super::DemEnabledRequest>,
         ) -> std::result::Result<tonic::Response<()>, tonic::Status>;
+        /// drain the per-window decode timing records accumulated since the previous
+        /// drain (or reset). Always recorded — unlike the DEM log there is no enable
+        /// flag; records are ~30 scalars per window decode.
+        async fn drain_window_timings(
+            &self,
+            request: tonic::Request<()>,
+        ) -> std::result::Result<
+            tonic::Response<super::WindowTimingsResponse>,
+            tonic::Status,
+        >;
     }
     #[derive(Debug)]
     pub struct CoordinatorServer<T> {
@@ -1092,6 +1282,47 @@ pub mod coordinator_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = SetDemEnabledSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/deq.coordinator.Coordinator/DrainWindowTimings" => {
+                    #[allow(non_camel_case_types)]
+                    struct DrainWindowTimingsSvc<T: Coordinator>(pub Arc<T>);
+                    impl<T: Coordinator> tonic::server::UnaryService<()>
+                    for DrainWindowTimingsSvc<T> {
+                        type Response = super::WindowTimingsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(&mut self, request: tonic::Request<()>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Coordinator>::drain_window_timings(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DrainWindowTimingsSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

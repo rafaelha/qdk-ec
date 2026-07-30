@@ -37,6 +37,7 @@ use crate::misc::util::exclusive_probability_of;
 use crate::util::BitVector;
 use binar::{BitVec, BitwiseMut};
 use hashbrown::{HashMap, HashSet};
+use prost::Message;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 #[cfg(feature = "cli")]
@@ -136,6 +137,16 @@ pub struct MonolithicCoordinator {
     /// Disabled by default on the server (see `new`) — the playground enables it
     /// per replay shot via the `set_dem_enabled` RPC.
     pub dem_log: Arc<coordinator::dem::DemLog>,
+    /// Always-on per-window decode timing log (drained by DrainWindowTimings,
+    /// cleared on reset). Mirrors `WindowCoordinator::timing_log`; monolithic
+    /// decodes the whole connected subgraph as one "window" per record. See
+    /// coordinator::timing.
+    pub timing_log: coordinator::timing::TimingLog,
+    /// Per-gid stamp of the FIRST time a gadget's outcomes were set (always via
+    /// the `decode` handler here — monolithic's `submit_outcomes` is a no-op).
+    /// Cleared on reset, drained + cleared with the timing log. Mirrors
+    /// `WindowCoordinator::outcome_arrivals`.
+    pub outcome_arrivals: std::sync::Mutex<Vec<coordinator::OutcomeArrival>>,
 }
 
 /// Per-coordinator [`FingerprintSource`] adapter for the monolithic
@@ -177,6 +188,9 @@ pub struct LoadedDecoder {
     /// hyperedge commits (monolithic). Cache-stable: `committing_local_cids` is
     /// part of the decoder cache key, so windows sharing an entry agree here.
     pub committed: Option<Arc<Vec<bool>>>,
+    /// post-compaction vertex count of the loaded hypergraph, for O(1)
+    /// WindowTiming.num_vertices on cache hits
+    pub vertex_num: u64,
 }
 
 pub struct Gadget {
@@ -252,6 +266,8 @@ impl MonolithicCoordinator {
             task_counter: TaskCounter::new(),
             loss_imputation_rng,
             dem_log,
+            timing_log: Default::default(),
+            outcome_arrivals: Default::default(),
         }
     }
 
@@ -678,8 +694,42 @@ impl MonolithicCoordinator {
         check_models: &HashMap<u64, CheckModel>,
         error_models: &HashMap<u64, ErrorModel>,
     ) -> (blackbox_decoder::ParityFactor, Arc<Vec<ErrorIndex>>) {
+        // Always-on per-decode timing (mirrors WindowCoordinator::decode_parity_factor,
+        // Task 3). Monolithic has no per-window readiness event, so decode entry is
+        // the spec-blessed approximation for `syndrome_ready_ns`; there is exactly
+        // one "window" here (the whole connected subgraph), so `concurrent_decodes`
+        // is always 1 (monolithic never decodes two overlapping windows at once).
+        let decode_start_ns = crate::misc::util::timestamp_ns();
+        let mut timing = coordinator::WindowTiming {
+            syndrome_ready_ns: decode_start_ns,
+            // Monolithic has no per-window readiness event; both window-formation
+            // stamps approximate with the decode entry (mirrors syndrome_ready_ns).
+            leader_arrived_ns: decode_start_ns,
+            mandatory_ready_ns: decode_start_ns,
+            decode_start_ns,
+            concurrent_decodes: 1,
+            ..Default::default()
+        };
+
         // calculate syndrome
         let syndrome = self.get_syndrome(relative_program, mapping, gadgets, check_models).await;
+        timing.syndrome_weight = syndrome.data.iter().map(|b| b.count_ones()).sum::<u32>();
+        timing.syndrome_bytes = syndrome.data.len() as u64;
+
+        // `window_gids`/`num_gadgets`/`num_committing` must all derive from the
+        // SAME gadget set: the `gadgets` map is the actual connected subgraph
+        // monolithic is deciding over (NOT `mapping.global_gid_of`, which can
+        // additionally include outside-window error-only gadgets on other
+        // coordinators — see the WindowCoordinator regression fix this mirrors).
+        // Monolithic always commits every gadget in that subgraph at once, so
+        // `num_committing == num_gadgets == window_gids.len()` holds trivially.
+        timing.window_gids = {
+            let mut gids: Vec<u64> = gadgets.keys().cloned().collect();
+            gids.sort();
+            gids
+        };
+        timing.num_gadgets = gadgets.len() as u32;
+        timing.num_committing = timing.num_gadgets;
 
         let cache_key = if self.config.persistent_decoder {
             let error_model_types = self.error_model_types.read().await;
@@ -697,6 +747,10 @@ impl MonolithicCoordinator {
             let loaded = loaded_decoders.get(cache_key);
             if let Some(loaded) = loaded {
                 // we can use the loaded decoding hypergraph to call the decoding service
+                timing.path = coordinator::DecodePath::CacheHit as i32;
+                timing.num_hyperedges = loaded.hyperedge_vertices.len() as u32;
+                timing.num_vertices = loaded.vertex_num as u32;
+                let decode_started = std::time::Instant::now();
                 let parity_factor = self
                     .black_box_decoder
                     .clone()
@@ -706,6 +760,10 @@ impl MonolithicCoordinator {
                     })
                     .await
                     .unwrap();
+                timing.decode_ns = decode_started.elapsed().as_nanos() as u64;
+                timing.decoder_compute_ns = parity_factor.compute_ns;
+                timing.correction_weight = parity_factor.subgraph.len() as u32;
+                timing.parity_factor_bytes = parity_factor.encoded_len() as u64;
                 if self.config.assert_parity_factor {
                     assert_parity_factor(loaded.decoding_hypergraph.as_ref().unwrap(), &parity_factor, &syndrome);
                 }
@@ -717,19 +775,25 @@ impl MonolithicCoordinator {
                     &loaded.hyperedge_vertices,
                     mapping,
                 );
+                timing.decode_end_ns = crate::misc::util::timestamp_ns();
+                timing.cache_size = self.loaded_decoders.read().await.len() as u32;
+                self.timing_log.push(timing);
                 return (parity_factor, loaded.errors.clone());
             }
         }
 
         // when the decoder is not available, construct a monolithic decoding hypergraph
         // and instantiate such a decoder
+        let build_started = std::time::Instant::now();
         let (mut decoding_hypergraph, mut errors) = self
             .decoding_hypergraph(relative_program, mapping, check_models, error_models)
             .await;
+        timing.build_ns = build_started.elapsed().as_nanos() as u64;
         let mut constituents = None;
 
         // merge the decoding hypergraph edges if their syndromes are the same
         if self.config.merge_hyperedges {
+            let merge_started = std::time::Instant::now();
             let original_errors = errors.clone();
             let mut original_to_merged = Vec::with_capacity(errors.len());
             let mut merged: HashMap<Vec<u64>, (usize, f64)> = HashMap::new();
@@ -772,6 +836,7 @@ impl MonolithicCoordinator {
             }
             constituents = Some(Arc::new(constituent_vec));
             errors = Arc::new(merged_errors);
+            timing.merge_ns = merge_started.elapsed().as_nanos() as u64;
         }
         // Vertex lists per (merged) hyperedge — the monolithic path never
         // compacts, so these are the final local indices the DEM flips map
@@ -779,8 +844,13 @@ impl MonolithicCoordinator {
         let hyperedge_vertices: Arc<Vec<Vec<u64>>> =
             Arc::new(decoding_hypergraph.hyperedges.iter().map(|h| h.vertices.clone()).collect());
         let decoding_hypergraph = Arc::new(decoding_hypergraph);
+        timing.num_hyperedges = decoding_hypergraph.hyperedges.len() as u32;
+        timing.num_vertices = decoding_hypergraph.vertex_num as u32;
+        timing.hypergraph_bytes = decoding_hypergraph.as_ref().encoded_len() as u64;
 
         let parity_factor = if let Some(cache_key) = cache_key {
+            timing.path = coordinator::DecodePath::BuiltLoaded as i32;
+            let load_started = std::time::Instant::now();
             let hid = self
                 .black_box_decoder
                 .clone()
@@ -788,6 +858,7 @@ impl MonolithicCoordinator {
                 .await
                 .unwrap()
                 .hid;
+            timing.load_ns = load_started.elapsed().as_nanos() as u64;
             let mut loaded_decoders = self.loaded_decoders.write().await;
             loaded_decoders.insert(
                 cache_key,
@@ -800,27 +871,40 @@ impl MonolithicCoordinator {
                     hyperedge_vertices: hyperedge_vertices.clone(),
                     // monolithic decodes the whole subgraph at once: all committed
                     committed: None,
+                    vertex_num: decoding_hypergraph.vertex_num,
                 },
             );
             drop(loaded_decoders);
-            self.black_box_decoder
+            let decode_started = std::time::Instant::now();
+            let parity_factor = self
+                .black_box_decoder
                 .clone()
                 .decode_loaded(blackbox_decoder::LoadedDecodingProblem {
                     hid,
                     syndrome: Some(syndrome.clone()),
                 })
                 .await
-                .unwrap()
+                .unwrap();
+            timing.decode_ns = decode_started.elapsed().as_nanos() as u64;
+            parity_factor
         } else {
-            self.black_box_decoder
+            timing.path = coordinator::DecodePath::Temporary as i32;
+            let decode_started = std::time::Instant::now();
+            let parity_factor = self
+                .black_box_decoder
                 .clone()
                 .decode(blackbox_decoder::DecodingProblem {
                     hypergraph: Some(decoding_hypergraph.as_ref().clone()),
                     syndrome: Some(syndrome.clone()),
                 })
                 .await
-                .unwrap()
+                .unwrap();
+            timing.decode_ns = decode_started.elapsed().as_nanos() as u64;
+            parity_factor
         };
+        timing.decoder_compute_ns = parity_factor.compute_ns;
+        timing.correction_weight = parity_factor.subgraph.len() as u32;
+        timing.parity_factor_bytes = parity_factor.encoded_len() as u64;
 
         if self.config.assert_parity_factor {
             assert_parity_factor(&decoding_hypergraph, &parity_factor, &syndrome);
@@ -834,6 +918,9 @@ impl MonolithicCoordinator {
             &hyperedge_vertices,
             mapping,
         );
+        timing.decode_end_ns = crate::misc::util::timestamp_ns();
+        timing.cache_size = self.loaded_decoders.read().await.len() as u32;
+        self.timing_log.push(timing);
         (parity_factor, errors)
     }
 
@@ -1540,6 +1627,13 @@ impl coordinator::coordinator_server::Coordinator for MonolithicCoordinator {
             coordinator::apply_loss_random_imputation(&mut outcome_data, loss_mask, &mut *rng);
         }
         gadget.outcomes.replace(outcome_data);
+        // First-arrival stamp: the early return above on `is_some()` guarantees
+        // this is the None→Some transition. Monolithic's submit_outcomes is a
+        // no-op, so decode() is the only place outcomes are set.
+        self.outcome_arrivals.lock().unwrap().push(coordinator::OutcomeArrival {
+            gid,
+            received_ns: crate::misc::util::timestamp_ns(),
+        });
         let mut pending_subgraphs = self.pending_subgraphs.lock().await;
         let gid_to_union_index = self.gid_to_union_index.lock().await;
         let union_index = gid_to_union_index[&gid];
@@ -1606,6 +1700,8 @@ impl coordinator::coordinator_server::Coordinator for MonolithicCoordinator {
         self.check_models.write().await.clear();
         self.error_models.write().await.clear();
         self.dem_log.reset();
+        self.timing_log.reset();
+        self.outcome_arrivals.lock().unwrap().clear();
         *self.next_gid.lock().await = 1;
         *self.next_cid.lock().await = 1;
         *self.next_eid.lock().await = 1;
@@ -1673,6 +1769,17 @@ impl coordinator::coordinator_server::Coordinator for MonolithicCoordinator {
     async fn set_dem_enabled(&self, request: Request<coordinator::DemEnabledRequest>) -> Result<Response<()>, Status> {
         self.set_dem_enabled(request.into_inner().enabled);
         Ok(Response::new(()))
+    }
+
+    async fn drain_window_timings(
+        &self,
+        _request: Request<()>,
+    ) -> Result<Response<coordinator::WindowTimingsResponse>, Status> {
+        Ok(Response::new(coordinator::WindowTimingsResponse {
+            timings: self.timing_log.drain(),
+            drained_at_ns: crate::misc::util::timestamp_ns(),
+            outcome_arrivals: std::mem::take(&mut self.outcome_arrivals.lock().unwrap()),
+        }))
     }
 }
 

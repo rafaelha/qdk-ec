@@ -272,6 +272,56 @@ pub fn prediction_flips(
     flips
 }
 
+/// Shared dead-slot test for `PendingErrorModel` / `PreparedErrorModel`:
+/// true if any of `error`'s remote refs points at a dead (rerouted-away,
+/// `check_bias` None) slot.
+fn references_dead_slot(check_bias: &[Option<u64>], error: &bin::error_model_type::Error) -> bool {
+    error.checks.iter().any(|check| {
+        check
+            .remote_check_model
+            .is_some_and(|ri| !matches!(check_bias.get(ri as usize), Some(Some(_))))
+    })
+}
+
+/// The lock-free part of `on_error_model`: the effective error list plus the
+/// per-slot metadata derived from it (one O(errors × checks) scan). Build
+/// this BEFORE taking coordinator instance locks — both the
+/// `effective_errors` clone and the scan are the expensive pieces, and they
+/// only need the (read-mostly) type maps.
+pub struct PreparedErrorModel {
+    errors: Vec<bin::error_model_type::Error>,
+    check_bias: Vec<Option<u64>>,
+    /// Live slots referenced by at least one surviving (p>0, no dead ref)
+    /// error — exactly the slots whose resolution gates emission.
+    required_slots: Vec<usize>,
+}
+
+impl PreparedErrorModel {
+    pub fn new(
+        errors: Vec<bin::error_model_type::Error>,
+        slots: &[Option<bin::error_model_type::RemoteCheckModel>],
+    ) -> Self {
+        let check_bias: Vec<Option<u64>> = slots.iter().map(|s| s.as_ref().map(|s| s.check_bias)).collect();
+        let mut required = vec![false; slots.len()];
+        for error in &errors {
+            if error.probability <= 0.0 || references_dead_slot(&check_bias, error) {
+                continue;
+            }
+            for check in &error.checks {
+                if let Some(ri) = check.remote_check_model {
+                    required[ri as usize] = true;
+                }
+            }
+        }
+        let required_slots = required.iter().enumerate().filter_map(|(ri, &r)| r.then_some(ri)).collect();
+        PreparedErrorModel {
+            errors,
+            check_bias,
+            required_slots,
+        }
+    }
+}
+
 /// An error model whose remote references are not all emit-ready yet.
 struct PendingErrorModel {
     gid: u64,
@@ -283,6 +333,8 @@ struct PendingErrorModel {
     check_bias: Vec<Option<u64>>,
     /// per remote slot: resolved global cid
     resolved: Vec<Option<u64>>,
+    /// live slots referenced by >=1 surviving error (see `PreparedErrorModel`)
+    required_slots: Vec<usize>,
 }
 
 impl PendingErrorModel {
@@ -294,11 +346,7 @@ impl PendingErrorModel {
     /// drift once, panicking on an exempt error's unresolved live ref), hence
     /// the shared helper.
     fn references_dead_slot(&self, error: &bin::error_model_type::Error) -> bool {
-        error.checks.iter().any(|check| {
-            check
-                .remote_check_model
-                .is_some_and(|ri| !matches!(self.check_bias.get(ri as usize), Some(Some(_))))
-        })
+        references_dead_slot(&self.check_bias, error)
     }
 
     /// Emit-ready iff every live remote slot referenced by a p>0 error is
@@ -307,7 +355,30 @@ impl PendingErrorModel {
     /// their other references would hold the model forever. The owning cid is
     /// always known (coordinators validate it at Create::ErrorModel), so only
     /// remote references gate emission.
+    ///
+    /// O(|required_slots|) via the slot set precomputed at construction —
+    /// this runs once per remote-slot resolution UNDER the coordinators'
+    /// instance locks, and the full per-error scan it replaces (O(errors ×
+    /// checks), hundreds of errors for surface-code etypes) dominated
+    /// execute(ErrorModel)'s lock hold. The debug assert keeps it honest
+    /// against the exact per-error definition.
     fn is_resolvable(&self, known_cids: &HashSet<u64>) -> bool {
+        let fast = self
+            .required_slots
+            .iter()
+            .all(|&ri| matches!(self.resolved[ri], Some(cid) if known_cids.contains(&cid)));
+        debug_assert_eq!(
+            fast,
+            self.is_resolvable_exact(known_cids),
+            "required_slots drifted from the per-error resolvability scan (eid {})",
+            self.eid
+        );
+        fast
+    }
+
+    /// The exact per-error definition of resolvability (see `is_resolvable`).
+    /// Kept as the debug cross-check for the slot-set fast path.
+    fn is_resolvable_exact(&self, known_cids: &HashSet<u64>) -> bool {
         for error in &self.errors {
             if error.probability <= 0.0 || self.references_dead_slot(error) {
                 continue;
@@ -369,6 +440,13 @@ impl PendingErrorModel {
 struct Inner {
     ready: DemDrain,
     pending: Vec<PendingErrorModel>,
+    /// Resolvable models whose edges have NOT been materialized yet: `emit()`
+    /// is O(errors) per model and the hooks that resolve models run under the
+    /// coordinators' instance locks, so materialization is deferred to
+    /// `drain()` (which runs off those locks). Kept in resolution order —
+    /// draining them in order produces the exact edge stream the eager emit
+    /// produced.
+    emitted: Vec<PendingErrorModel>,
     predictions: Vec<DemPrediction>,
     /// Next `DemPrediction.seq` — monotone per shot, zeroed by `reset()`.
     next_seq: u64,
@@ -382,18 +460,25 @@ struct Inner {
 }
 
 impl Inner {
-    /// Move every now-resolvable pending model into `ready`, preserving
-    /// arrival order (the playground replays drains as an ordered event
-    /// stream, so emission order should be deterministic).
+    /// Move every now-resolvable pending model into the emission queue,
+    /// preserving arrival order (the playground replays drains as an ordered
+    /// event stream, so emission order should be deterministic).
     fn sweep(&mut self) {
         let mut i = 0;
         while i < self.pending.len() {
             if self.pending[i].is_resolvable(&self.known_cids) {
                 let model = self.pending.remove(i);
-                self.ready.edges.extend(model.emit());
+                self.emitted.push(model);
             } else {
                 i += 1;
             }
+        }
+    }
+
+    /// Materialize the queued models' edges into `ready` (drain-time only).
+    fn materialize_emitted(&mut self) {
+        for model in std::mem::take(&mut self.emitted) {
+            self.ready.edges.extend(model.emit());
         }
     }
 }
@@ -447,21 +532,29 @@ impl DemLog {
         errors: Vec<bin::error_model_type::Error>,
         slots: &[Option<bin::error_model_type::RemoteCheckModel>],
     ) {
+        self.on_error_model_prepared(gid, eid, owning_cid, PreparedErrorModel::new(errors, slots));
+    }
+
+    /// `on_error_model` with the O(errors) work pre-done off-lock — see
+    /// [`PreparedErrorModel`]. This is the variant coordinators should call
+    /// from lock-holding registration paths.
+    pub fn on_error_model_prepared(&self, gid: u64, eid: u64, owning_cid: u64, prepared: PreparedErrorModel) {
+        let resolved = vec![None; prepared.check_bias.len()];
         let model = PendingErrorModel {
             gid,
             eid,
             owning_cid,
-            errors,
-            check_bias: slots.iter().map(|s| s.as_ref().map(|s| s.check_bias)).collect(),
-            resolved: vec![None; slots.len()],
+            errors: prepared.errors,
+            check_bias: prepared.check_bias,
+            resolved,
+            required_slots: prepared.required_slots,
         };
         let mut inner = self.inner.lock().unwrap();
         if inner.disabled {
             return;
         }
         if model.is_resolvable(&inner.known_cids) {
-            let edges = model.emit();
-            inner.ready.edges.extend(edges);
+            inner.emitted.push(model);
         } else {
             inner.pending.push(model);
         }
@@ -474,42 +567,66 @@ impl DemLog {
     /// is ignored too rather than indexed — a panic here would fire while
     /// holding the Mutex and poison it, wedging the log for the whole run —
     /// but it still trips a debug_assert so caller drift surfaces in tests.
+    ///
+    /// Targeted, not a full `sweep()`: only `eid`'s models changed state, and
+    /// every pending model is unresolvable between hooks (resolvable ones are
+    /// emitted by the hook that made them so), so re-checking the others is
+    /// pure cost. This runs under the coordinators' instance locks via
+    /// execute(ErrorModel)'s resolution loop — once per remote slot — and the
+    /// full sweep made that loop O(pending × errors) per slot.
     pub fn on_remote_resolved(&self, eid: u64, ri: usize, cid: u64) {
         let mut inner = self.inner.lock().unwrap();
         if inner.disabled {
             return;
         }
-        for model in &mut inner.pending {
-            if model.eid == eid {
-                debug_assert!(ri < model.resolved.len(), "slot {ri} out of range for eid {eid}");
-                if let Some(slot) = model.resolved.get_mut(ri) {
+        let mut i = 0;
+        while i < inner.pending.len() {
+            if inner.pending[i].eid == eid {
+                debug_assert!(ri < inner.pending[i].resolved.len(), "slot {ri} out of range for eid {eid}");
+                if let Some(slot) = inner.pending[i].resolved.get_mut(ri) {
                     *slot = Some(cid);
                 }
+                if inner.pending[i].is_resolvable(&inner.known_cids) {
+                    let model = inner.pending.remove(i);
+                    inner.emitted.push(model);
+                    continue;
+                }
             }
+            i += 1;
         }
-        inner.sweep();
     }
 
     /// All remote slots of error model `eid` resolved in one shot (mirrors
     /// the batched `expand_remote_check_models` result vector). The model
     /// must have been registered via `on_error_model` first; resolutions for
-    /// unknown (or already-emitted) eids are ignored.
+    /// unknown (or already-emitted) eids are ignored. Targeted like
+    /// `on_remote_resolved` — only `eid`'s models can become resolvable here.
     pub fn on_remotes_resolved(&self, eid: u64, resolved: &[Option<u64>]) {
         let mut inner = self.inner.lock().unwrap();
         if inner.disabled {
             return;
         }
-        for model in &mut inner.pending {
-            if model.eid == eid {
-                debug_assert_eq!(model.resolved.len(), resolved.len(), "slot count mismatch for eid {eid}");
-                for (slot, &cid) in model.resolved.iter_mut().zip(resolved.iter()) {
+        let mut i = 0;
+        while i < inner.pending.len() {
+            if inner.pending[i].eid == eid {
+                debug_assert_eq!(
+                    inner.pending[i].resolved.len(),
+                    resolved.len(),
+                    "slot count mismatch for eid {eid}"
+                );
+                for (slot, &cid) in inner.pending[i].resolved.iter_mut().zip(resolved.iter()) {
                     if cid.is_some() {
                         *slot = cid;
                     }
                 }
+                if inner.pending[i].is_resolvable(&inner.known_cids) {
+                    let model = inner.pending.remove(i);
+                    inner.emitted.push(model);
+                    continue;
+                }
             }
+            i += 1;
         }
-        inner.sweep();
     }
 
     /// `on_remotes_resolved` with the truncation guard shared by every
@@ -532,7 +649,9 @@ impl DemLog {
 
     /// Take everything that became visible since the previous drain.
     pub fn drain(&self) -> DemDrain {
-        std::mem::take(&mut self.inner.lock().unwrap().ready)
+        let mut inner = self.inner.lock().unwrap();
+        inner.materialize_emitted();
+        std::mem::take(&mut inner.ready)
     }
 
     pub fn push_prediction(&self, mut prediction: DemPrediction) {

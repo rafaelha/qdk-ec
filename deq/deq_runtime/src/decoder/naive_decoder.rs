@@ -42,7 +42,11 @@ impl black_box_decoder_server::BlackBoxDecoder for NaiveDecoder {
         &self,
         _request: Request<blackbox_decoder::DecodingProblem>,
     ) -> Result<Response<blackbox_decoder::ParityFactor>, Status> {
-        Ok(Response::new(blackbox_decoder::ParityFactor { subgraph: vec![] }))
+        let started = std::time::Instant::now();
+        Ok(Response::new(blackbox_decoder::ParityFactor {
+            subgraph: vec![],
+            compute_ns: started.elapsed().as_nanos() as u64,
+        }))
     }
 
     async fn load_hypergraph(
@@ -56,7 +60,11 @@ impl black_box_decoder_server::BlackBoxDecoder for NaiveDecoder {
         &self,
         _request: Request<blackbox_decoder::LoadedDecodingProblem>,
     ) -> Result<Response<blackbox_decoder::ParityFactor>, Status> {
-        Ok(Response::new(blackbox_decoder::ParityFactor { subgraph: vec![] }))
+        let started = std::time::Instant::now();
+        Ok(Response::new(blackbox_decoder::ParityFactor {
+            subgraph: vec![],
+            compute_ns: started.elapsed().as_nanos() as u64,
+        }))
     }
 
     async fn reset(&self, _request: Request<blackbox_decoder::ResetRequest>) -> Result<Response<()>, Status> {

@@ -581,4 +581,11 @@ impl coordinator_server::Coordinator for MockCoordinator {
     async fn set_dem_enabled(&self, _request: Request<coordinator::DemEnabledRequest>) -> Result<Response<()>, Status> {
         Ok(Response::new(()))
     }
+
+    async fn drain_window_timings(
+        &self,
+        _request: Request<()>,
+    ) -> Result<Response<coordinator::WindowTimingsResponse>, Status> {
+        Ok(Response::new(coordinator::WindowTimingsResponse::default()))
+    }
 }

@@ -153,6 +153,7 @@ impl black_box_decoder_server::BlackBoxDecoder for MockDecoder {
         &self,
         request: Request<blackbox_decoder::DecodingProblem>,
     ) -> Result<Response<blackbox_decoder::ParityFactor>, Status> {
+        let started = std::time::Instant::now();
         let problem = request.into_inner();
         let hypergraph = problem
             .hypergraph
@@ -168,7 +169,10 @@ impl black_box_decoder_server::BlackBoxDecoder for MockDecoder {
         let subgraph = Self::get_response(&state, &syndrome);
         drop(state);
         self.apply_delay().await;
-        Ok(Response::new(blackbox_decoder::ParityFactor { subgraph }))
+        Ok(Response::new(blackbox_decoder::ParityFactor {
+            subgraph,
+            compute_ns: started.elapsed().as_nanos() as u64,
+        }))
     }
 
     async fn load_hypergraph(
@@ -189,6 +193,7 @@ impl black_box_decoder_server::BlackBoxDecoder for MockDecoder {
         &self,
         request: Request<blackbox_decoder::LoadedDecodingProblem>,
     ) -> Result<Response<blackbox_decoder::ParityFactor>, Status> {
+        let started = std::time::Instant::now();
         let problem = request.into_inner();
         let syndrome = problem.syndrome.ok_or_else(|| Status::invalid_argument("missing syndrome"))?;
 
@@ -205,7 +210,10 @@ impl black_box_decoder_server::BlackBoxDecoder for MockDecoder {
         let subgraph = Self::get_response(&state, &syndrome);
         drop(state);
         self.apply_delay().await;
-        Ok(Response::new(blackbox_decoder::ParityFactor { subgraph }))
+        Ok(Response::new(blackbox_decoder::ParityFactor {
+            subgraph,
+            compute_ns: started.elapsed().as_nanos() as u64,
+        }))
     }
 
     async fn reset(&self, request: Request<blackbox_decoder::ResetRequest>) -> Result<Response<()>, Status> {

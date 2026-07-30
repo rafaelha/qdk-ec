@@ -71,6 +71,9 @@ pub struct ServerConfigs {
 
 impl ServerConfigs {
     pub async fn run(self) {
+        // Pin the process-monotonic origin before any client shot starts, so
+        // client clock-sync anchors (drained_at_ns) are meaningful from shot 0.
+        crate::misc::util::timestamp_ns();
         let addr: core::net::SocketAddr = self.addr.parse().unwrap();
         let mut server = tonic::transport::Server::builder();
         let tcp_nodelay = true; // enabled by default
@@ -143,6 +146,9 @@ impl ServerConfigs {
     /// have no reason to pay gRPC overhead). Use [`LocalServer::bind_grpc`] to
     /// optionally expose a network endpoint on top.
     pub async fn build_local(self) -> Arc<LocalServer> {
+        // Pin the process-monotonic origin before any client shot starts, so
+        // client clock-sync anchors (drained_at_ns) are meaningful from shot 0.
+        crate::misc::util::timestamp_ns();
         let decoder = self.decoder.create(self.decoder_config);
         let black_box_decoder = decoder.as_black_box_decoder_client(None).await;
         let coordinator = self.coordinator.create(self.coordinator_config, black_box_decoder);

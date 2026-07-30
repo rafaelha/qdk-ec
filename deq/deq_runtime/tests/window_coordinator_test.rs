@@ -7,6 +7,7 @@
 mod common;
 
 use deq_runtime::bin::{self, instruction};
+use deq_runtime::coordinator;
 use deq_runtime::coordinator::coordinator_server::Coordinator;
 use deq_runtime::coordinator::window_coordinator::{self, WindowCoordinator};
 use deq_runtime::decoder::{BlackBoxDecoderClient, MockDecoder};
@@ -4574,4 +4575,173 @@ async fn test_window_persistent_decoder_reuses_cache_when_modifier_unchanged() {
     );
     let loaded_decoders = coord.loaded_decoders.read().await;
     assert_eq!(loaded_decoders.len(), 1, "Expected a single cache entry");
+}
+
+// ─── window decode timing (Task 3) ─────────────────────────────────────────
+
+#[tokio::test]
+async fn drain_window_timings_returns_and_clears_records() {
+    let trace_file = NamedTempFile::new().unwrap();
+    let trace_path = trace_file.path().to_str().unwrap().to_string();
+    let mock = make_mock_decoder();
+    let coord = make_coordinator(mock.clone(), &trace_path);
+
+    Coordinator::load_library(&coord, Request::new(make_test_library()))
+        .await
+        .unwrap();
+    let gid_a = exec_gadget(&coord, make_gadget(0, 1, vec![])).await;
+    exec_check_model(&coord, make_check_model(0, 1, gid_a)).await;
+    exec_error_model(&coord, make_error_model(0, 1, 1)).await;
+    let gid_b = exec_gadget(&coord, make_gadget(0, 5, vec![(gid_a, 0)])).await;
+    exec_check_model(&coord, make_check_model(0, 5, gid_b)).await;
+    exec_error_model(&coord, make_error_model(0, 5, 2)).await;
+    let (_r1, _r2) = tokio::join!(decode(&coord, gid_a, 1), decode(&coord, gid_b, 1));
+
+    let resp = Coordinator::drain_window_timings(&coord, Request::new(()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(resp.drained_at_ns > 0, "server must stamp its clock on the drain");
+    let max_end = resp.timings.iter().map(|t| t.decode_end_ns).max().unwrap();
+    assert!(
+        resp.drained_at_ns >= max_end,
+        "drain stamp is taken after every drained record was completed"
+    );
+
+    // Per-gid outcome-arrival stamps: one per gadget that received outcomes.
+    let arrivals = &resp.outcome_arrivals;
+    assert!(!arrivals.is_empty(), "outcome arrivals must be recorded");
+    let arrived_gids: std::collections::HashSet<u64> = arrivals.iter().map(|a| a.gid).collect();
+    assert!(
+        arrived_gids.contains(&gid_a) && arrived_gids.contains(&gid_b),
+        "every decoded gadget must have an arrival stamp"
+    );
+    for a in arrivals {
+        assert!(a.received_ns > 0, "arrival stamp must carry a server-clock timestamp");
+        assert!(
+            a.received_ns <= resp.drained_at_ns,
+            "an outcome cannot arrive after the drain answered"
+        );
+    }
+
+    let timings = resp.timings;
+    assert!(!timings.is_empty(), "at least one window decode must be recorded");
+    for t in &timings {
+        assert!(!t.window_gids.is_empty());
+        assert!(t.decode_end_ns >= t.decode_start_ns);
+        assert!(t.decode_ns > 0, "decode duration must be measured");
+        assert!(
+            t.decode_start_ns >= t.syndrome_ready_ns,
+            "decode cannot start before the window syndrome is ready"
+        );
+        // Window-formation stamps ordered: leader entry ≤ mandatory-zone
+        // syndrome ready ≤ decode start.
+        assert!(t.leader_arrived_ns > 0, "leader arrival must be stamped");
+        assert!(
+            t.mandatory_ready_ns >= t.leader_arrived_ns,
+            "mandatory-zone syndrome cannot be ready before the leader arrived"
+        );
+        assert!(
+            t.decode_start_ns >= t.mandatory_ready_ns,
+            "decode cannot start before the mandatory zone is ready"
+        );
+        assert!(t.num_gadgets as usize >= t.num_committing as usize);
+        assert!(t.num_gadgets as usize == t.window_gids.len());
+        // First encounter with a persistent decoder: BUILT_LOADED with real phases.
+        if t.path == coordinator::DecodePath::BuiltLoaded as i32 {
+            assert!(t.num_hyperedges > 0);
+            assert!(t.hypergraph_bytes > 0);
+        }
+        assert!(t.concurrent_decodes >= 1);
+    }
+    // seq is a monotone per-shot counter
+    for w in timings.windows(2) {
+        assert!(w[1].seq > w[0].seq);
+    }
+    // drain clears both timings and arrivals
+    let again = Coordinator::drain_window_timings(&coord, Request::new(()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(again.timings.is_empty());
+    assert!(again.outcome_arrivals.is_empty(), "arrivals must be cleared on drain");
+}
+
+/// Regression test: `window_gids` must reflect the actual decoder window, not
+/// the (possibly larger) set of `expanded_gadgets` fed into `RelativeProgram::new`.
+///
+/// `build_checked_chain` (see `make_test_library_with_remote_errors`) wires each
+/// non-terminal gadget's error model to reference the NEXT gadget's check model
+/// via `remote_check_models`. With a small buffer_radius, some window decodes
+/// will have a "next" gadget that lies outside the decoder window — this makes
+/// `decode_and_commit` append it to `expanded_gadgets` as an "outside
+/// error-contributing gadget" (error-only, `check_model: None`), which used to
+/// leak into `timing.window_gids` via `mapping.global_gid_of` and make
+/// `window_gids.len() > num_gadgets`. Assert the invariant holds for every
+/// recorded window across this topology.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drain_window_timings_window_gids_matches_num_gadgets_with_outside_error_gadget() {
+    let (gids, coord, mock, _trace_file) = build_checked_chain(5, 1).await;
+    mock.set_decode_delay(std::time::Duration::from_millis(10));
+
+    let handles: Vec<_> = gids
+        .iter()
+        .map(|&gid| {
+            let c = coord.clone();
+            tokio::spawn(async move { decode_arc(c, gid, 1).await })
+        })
+        .collect();
+
+    let results = tokio::time::timeout(std::time::Duration::from_secs(10), futures_util::future::join_all(handles))
+        .await
+        .expect("DEADLOCK: concurrent decode did not complete within 10s");
+    for (i, result) in results.into_iter().enumerate() {
+        let readouts = result.unwrap();
+        assert_eq!(readouts.gid, gids[i], "gid mismatch for gadget {i}");
+    }
+
+    // Drain BEFORE reset_shot: reset_shot clears undrained timing records
+    // (see `reset_clears_window_timings`), so it must come after the drain here.
+    let timings = Coordinator::drain_window_timings(coord.as_ref(), Request::new(()))
+        .await
+        .unwrap()
+        .into_inner()
+        .timings;
+    assert!(!timings.is_empty(), "at least one window decode must be recorded");
+    for t in &timings {
+        assert_eq!(
+            t.window_gids.len(),
+            t.num_gadgets as usize,
+            "window_gids must exactly match the decoder window, even when outside \
+             error-contributing gadgets are folded into expanded_gadgets: {t:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn reset_clears_window_timings() {
+    let trace_file = NamedTempFile::new().unwrap();
+    let trace_path = trace_file.path().to_str().unwrap().to_string();
+    let mock = make_mock_decoder();
+    let coord = make_coordinator(mock.clone(), &trace_path);
+    Coordinator::load_library(&coord, Request::new(make_test_library()))
+        .await
+        .unwrap();
+    let gid_a = exec_gadget(&coord, make_gadget(0, 1, vec![])).await;
+    exec_check_model(&coord, make_check_model(0, 1, gid_a)).await;
+    exec_error_model(&coord, make_error_model(0, 1, 1)).await;
+    let gid_b = exec_gadget(&coord, make_gadget(0, 5, vec![(gid_a, 0)])).await;
+    exec_check_model(&coord, make_check_model(0, 5, gid_b)).await;
+    exec_error_model(&coord, make_error_model(0, 5, 2)).await;
+    let (_r1, _r2) = tokio::join!(decode(&coord, gid_a, 1), decode(&coord, gid_b, 1));
+    reset_shot(&coord).await;
+    let resp = Coordinator::drain_window_timings(&coord, Request::new(()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(resp.timings.is_empty(), "reset must clear undrained timing records");
+    assert!(
+        resp.outcome_arrivals.is_empty(),
+        "reset must clear undrained outcome arrivals"
+    );
 }

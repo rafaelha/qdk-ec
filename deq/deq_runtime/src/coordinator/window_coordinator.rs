@@ -243,6 +243,53 @@ pub struct WindowCoordinator {
     pub trace_shot: Arc<Mutex<trace::Shot>>,
     /// accumulated trace across all shots
     pub trace: Mutex<trace::WindowCoordinatorTrace>,
+    /// Always-on per-window decode timing log (drained by DrainWindowTimings,
+    /// cleared on reset). See coordinator::timing.
+    pub timing_log: coordinator::timing::TimingLog,
+    /// cid -> timestamp_ns() when that check model's syndrome became complete.
+    /// decode_parity_factor takes the max over the window's cids as the
+    /// window's syndrome-ready time. Cleared on reset. Arc so the spawned
+    /// syndrome-completion task (which mirrors `trace_shot`'s capture
+    /// pattern) can hold its own handle.
+    pub syndrome_ready_at: Arc<std::sync::Mutex<std::collections::HashMap<u64, u64>>>,
+    /// Window decodes currently between decode_and_commit entry and exit —
+    /// sampled into WindowTiming.concurrent_decodes.
+    pub decodes_in_flight: std::sync::atomic::AtomicU32,
+    /// Per-gid stamp of the FIRST time a gadget's outcomes were set (via
+    /// `submit_outcomes` or `decode`). Cleared on reset, drained + cleared with
+    /// the timing log (same std::mem::take pattern). See coordinator::timing.
+    pub outcome_arrivals: std::sync::Mutex<Vec<coordinator::OutcomeArrival>>,
+    /// Centers of leaders currently BLOCKED in the commit loop (registered via
+    /// an RAII guard, so cancellation unregisters too). A claiming leader
+    /// defers to any EARLIER (smaller-gid) waiting leader whose center sits in
+    /// its explored window — the ordered hand-off that keeps tail commits in
+    /// sliding-window order (see the commit loop in `decode()`). std Mutex:
+    /// held only for sync membership ops, never across an await.
+    waiting_leaders: std::sync::Mutex<std::collections::BTreeSet<u64>>,
+}
+
+/// RAII registration in `WindowCoordinator::waiting_leaders`: created when a
+/// leader enters the commit loop, removed on drop — including cancellation
+/// unwinds — so the ordered hand-off never keys on a dead task. A registered
+/// leader whose center has already left `Uncommitted` (it claimed, or another
+/// window committed it) is ignored by the defer check, so the guard living
+/// past the claim is harmless.
+struct WaitingLeaderGuard<'a> {
+    set: &'a std::sync::Mutex<std::collections::BTreeSet<u64>>,
+    gid: u64,
+}
+
+impl<'a> WaitingLeaderGuard<'a> {
+    fn register(set: &'a std::sync::Mutex<std::collections::BTreeSet<u64>>, gid: u64) -> Self {
+        set.lock().unwrap().insert(gid);
+        WaitingLeaderGuard { set, gid }
+    }
+}
+
+impl Drop for WaitingLeaderGuard<'_> {
+    fn drop(&mut self) {
+        self.set.lock().unwrap().remove(&self.gid);
+    }
 }
 
 /// State machine for gadget lifecycle in window decoding.
@@ -446,6 +493,11 @@ impl WindowCoordinator {
             dem_log,
             trace_shot: Arc::new(Mutex::new(trace::Shot::default())),
             trace: Mutex::new(trace::WindowCoordinatorTrace::default()),
+            timing_log: Default::default(),
+            syndrome_ready_at: Default::default(),
+            decodes_in_flight: Default::default(),
+            outcome_arrivals: Default::default(),
+            waiting_leaders: Default::default(),
         }
     }
 
@@ -705,7 +757,17 @@ impl WindowCoordinator {
         let gadget_types = self.gadget_types.read().await;
         let gadgets = self.gadgets.read().await;
         let gadget = gadgets.get(&gid).ok_or_else(|| Status::not_found(format!("gid={gid}")))?;
+        // Stamp the arrival on the None→Some transition only (the first time this
+        // gadget's outcomes are set). `decode`'s later re-submit is idempotent and
+        // must not re-stamp.
+        let was_none = gadget.outcomes.borrow().is_none();
         gadget.outcomes.send_replace(Some(outcomes));
+        if was_none {
+            self.outcome_arrivals.lock().unwrap().push(coordinator::OutcomeArrival {
+                gid,
+                received_ns: crate::misc::util::timestamp_ns(),
+            });
+        }
         let gadget_type = gadget_types.get(&gadget.instance.gtype).unwrap();
         let mut readouts = Vec::with_capacity(gadget_type.readouts.len());
         let data: BitVector = gadget.outcomes.borrow().as_ref().unwrap().clone();
@@ -997,6 +1059,23 @@ impl WindowCoordinator {
     /// `buffer_radius` boundary-distance requirement.
     ///
     /// Returns `None` if cancelled.
+    /// Re-seed the BFS frontier for a repeat [`Self::explore_lookahead_zone`]
+    /// pass (the commit loop's retry iterations): every explored gadget goes
+    /// back on the frontier, in ascending center-distance order.
+    ///
+    /// The ordering keeps the 0-1 BFS's minimal-distance property for NEWLY
+    /// discovered gadgets: seeds pop in non-decreasing distance, so a new
+    /// neighbor's first discovery is via its closest explored source (already-
+    /// explored gadgets keep their original distances and are skipped by the
+    /// `contains` guard). Re-seeding everything (not just the old boundary) is
+    /// deliberate — a gadget previously skipped because its syndrome was not
+    /// yet ready can sit next to ANY explored gadget, not just the frontier.
+    fn reseed_lookahead_frontier(explored: &mut ExploredWindow) {
+        let mut seeds: Vec<u64> = explored.gadgets.iter().copied().collect();
+        seeds.sort_unstable_by_key(|g| explored.center_distance[g]);
+        explored.frontier = seeds.into();
+    }
+
     async fn explore_lookahead_zone(&self, explored: &mut ExploredWindow) -> Option<()> {
         let lookahead_radius = self.config.lookahead_radius();
         if lookahead_radius == 0 {
@@ -1360,12 +1439,16 @@ impl WindowCoordinator {
     /// gadgets (marks remaining Decoding(leader) back to Uncommitted).
     ///
     /// Returns `None` only on cancellation.
+    #[allow(clippy::too_many_arguments)]
     async fn decode_and_commit(
         &self,
         center_gid: u64,
         commit_region: &HashSet<u64>,
         committing_cids: &HashSet<u64>,
         window: &HashSet<u64>,
+        explore_ns: u64,
+        leader_arrived_ns: u64,
+        mandatory_ready_ns: u64,
     ) -> Option<()> {
         let span = Span::root("decode_window", SpanContext::random());
         span.add_property(|| ("center_gid", format!("{center_gid}")));
@@ -1615,8 +1698,31 @@ impl WindowCoordinator {
         span.add_event(Event::new("relative_program"));
         span.add_event(Event::new("committing"));
 
+        // From here on there is no further early return before the decode
+        // completes, so this is the one safe place to open the timing record
+        // and bump `decodes_in_flight` — every earlier `?` above would leak an
+        // increment placed at function entry (decode_and_commit has several
+        // cancellation early-returns between entry and here).
+        let decode_start_ns = crate::misc::util::timestamp_ns();
+        let concurrent = self.decodes_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let mut timing = coordinator::WindowTiming {
+            explore_ns,
+            leader_arrived_ns,
+            mandatory_ready_ns,
+            decode_start_ns,
+            concurrent_decodes: concurrent,
+            num_committing: commit_region.len() as u32,
+            num_gadgets: window.len() as u32,
+            window_gids: {
+                let mut gids: Vec<u64> = window.iter().cloned().collect();
+                gids.sort();
+                gids
+            },
+            ..Default::default()
+        };
+
         let (parity_factor, errors) = self
-            .decode_parity_factor(center_gid, committing_cids, &relative_program, &mapping, &span)
+            .decode_parity_factor(center_gid, committing_cids, &relative_program, &mapping, &span, &mut timing)
             .await;
         span.add_event(Event::new("decoded"));
 
@@ -1624,6 +1730,17 @@ impl WindowCoordinator {
             leader_gid: center_gid,
         }))
         .await;
+        timing.decode_end_ns = crate::misc::util::timestamp_ns();
+        // Post-decode bookkeeping is the exact remainder of the handler span once
+        // every measured phase is subtracted (all share timestamp_ns()'s clock),
+        // so prep+build+merge+compact+load+decode+finalize == decode_end -
+        // decode_start with no unaccounted gap.
+        timing.finalize_ns = timing.decode_end_ns.saturating_sub(timing.decode_start_ns).saturating_sub(
+            timing.prep_ns + timing.build_ns + timing.merge_ns + timing.compact_ns + timing.load_ns + timing.decode_ns,
+        );
+        self.decodes_in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        timing.cache_size = self.loaded_decoders.read().await.len() as u32;
+        self.timing_log.push(timing);
         span.add_property(|| {
             let global_subgraph = Self::global_subgraph_of(&mapping, &errors, &parity_factor.subgraph);
             ("parity_factor", format!("{:?}", global_subgraph))
@@ -1791,6 +1908,7 @@ impl WindowCoordinator {
             .collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn decode_parity_factor(
         &self,
         gid: u64,
@@ -1798,6 +1916,7 @@ impl WindowCoordinator {
         relative_program: &RelativeProgram,
         mapping: &RelativeMapping,
         span: &Span,
+        timing: &mut coordinator::WindowTiming,
     ) -> (blackbox_decoder::ParityFactor, Arc<Vec<ErrorIndex>>) {
         // calculate syndrome
         span.add_event(Event::new("calculate_syndrome"));
@@ -1820,6 +1939,18 @@ impl WindowCoordinator {
         };
         span.add_event(Event::new("syndrome_calculated"));
         span.add_property(|| ("syndrome", format!("{:?}", syndrome)));
+
+        timing.syndrome_weight = syndrome.data.iter().map(|b| b.count_ones()).sum::<u32>();
+        timing.syndrome_bytes = syndrome.data.len() as u64;
+        timing.syndrome_ready_ns = {
+            let map = self.syndrome_ready_at.lock().unwrap();
+            mapping
+                .global_cid_of
+                .iter()
+                .filter_map(|cid| map.get(cid).copied())
+                .max()
+                .unwrap_or(0)
+        };
 
         let cache_key = if self.config.persistent_decoder {
             // Lock order: error_model_types (field 4) BEFORE error_models
@@ -1851,6 +1982,13 @@ impl WindowCoordinator {
                 } else {
                     syndrome.clone()
                 };
+                timing.path = coordinator::DecodePath::CacheHit as i32;
+                timing.num_hyperedges = loaded.hyperedge_vertices.len() as u32;
+                timing.num_vertices = loaded.vertex_num as u32;
+                // Front of the handler: syndrome assembly + cache-key lookup up to
+                // here, anchored to the absolute decode_start stamp (same clock).
+                timing.prep_ns = crate::misc::util::timestamp_ns().saturating_sub(timing.decode_start_ns);
+                let decode_started = std::time::Instant::now();
                 let parity_factor = self
                     .black_box_decoder
                     .clone()
@@ -1860,6 +1998,10 @@ impl WindowCoordinator {
                     })
                     .await
                     .unwrap();
+                timing.decode_ns = decode_started.elapsed().as_nanos() as u64;
+                timing.decoder_compute_ns = parity_factor.compute_ns;
+                timing.correction_weight = parity_factor.subgraph.len() as u32;
+                timing.parity_factor_bytes = parity_factor.encoded_len() as u64;
                 if self.config.assert_parity_factor {
                     assert_parity_factor(loaded.decoding_hypergraph.as_ref().unwrap(), &parity_factor, &decode_syndrome);
                 }
@@ -1879,12 +2021,18 @@ impl WindowCoordinator {
 
         // when the decoder is not available, construct the decoding hypergraph for the window
         // and instantiate such a decoder
+        // Front of the handler: syndrome assembly + cache-key fingerprint up to
+        // here (build begins next), anchored to the absolute decode_start stamp.
+        timing.prep_ns = crate::misc::util::timestamp_ns().saturating_sub(timing.decode_start_ns);
+        let build_started = std::time::Instant::now();
         let (mut decoding_hypergraph, mut errors, mut committed) =
             self.decoding_hypergraph(committing_cids, relative_program, mapping).await;
+        timing.build_ns = build_started.elapsed().as_nanos() as u64;
         let mut constituents = None;
 
         // merge the decoding hypergraph edges if their syndromes are the same
         if self.config.merge_hyperedges {
+            let merge_started = std::time::Instant::now();
             let original_errors = errors.clone();
             let original_committed = committed.clone();
             let mut original_to_merged = Vec::with_capacity(errors.len());
@@ -1939,6 +2087,7 @@ impl WindowCoordinator {
             constituents = Some(Arc::new(constituent_vec));
             errors = Arc::new(merged_errors);
             committed = merged_committed;
+            timing.merge_ns = merge_started.elapsed().as_nanos() as u64;
         }
         let committed = Arc::new(committed);
 
@@ -1952,12 +2101,19 @@ impl WindowCoordinator {
         // remap both the hypergraph and syndrome to a contiguous vertex space.
         // This is necessary because some decoders (e.g. MWPF) reject graphs
         // with isolated vertices.
+        let compact_started = std::time::Instant::now();
         let (decoding_hypergraph, syndrome, vertex_remap) = Self::compact_vertices(decoding_hypergraph, &syndrome);
+        timing.compact_ns = compact_started.elapsed().as_nanos() as u64;
 
         let decoding_hypergraph = Arc::new(decoding_hypergraph);
+        timing.num_hyperedges = decoding_hypergraph.hyperedges.len() as u32;
+        timing.num_vertices = decoding_hypergraph.vertex_num as u32;
+        timing.hypergraph_bytes = decoding_hypergraph.as_ref().encoded_len() as u64;
 
         let parity_factor = if let Some(cache_key) = cache_key {
+            timing.path = coordinator::DecodePath::BuiltLoaded as i32;
             span.add_event(Event::new("decoding").with_property(|| ("type", "loading")));
+            let load_started = std::time::Instant::now();
             let hid = self
                 .black_box_decoder
                 .clone()
@@ -1965,6 +2121,7 @@ impl WindowCoordinator {
                 .await
                 .unwrap()
                 .hid;
+            timing.load_ns = load_started.elapsed().as_nanos() as u64;
             let mut loaded_decoders = self.loaded_decoders.write().await;
             loaded_decoders.insert(
                 cache_key,
@@ -1976,28 +2133,41 @@ impl WindowCoordinator {
                     vertex_remap: vertex_remap.clone(),
                     hyperedge_vertices: hyperedge_vertices.clone(),
                     committed: Some(committed.clone()),
+                    vertex_num: decoding_hypergraph.vertex_num,
                 },
             );
             drop(loaded_decoders);
-            self.black_box_decoder
+            let decode_started = std::time::Instant::now();
+            let parity_factor = self
+                .black_box_decoder
                 .clone()
                 .decode_loaded(blackbox_decoder::LoadedDecodingProblem {
                     hid,
                     syndrome: Some(syndrome.clone()),
                 })
                 .await
-                .unwrap()
+                .unwrap();
+            timing.decode_ns = decode_started.elapsed().as_nanos() as u64;
+            parity_factor
         } else {
+            timing.path = coordinator::DecodePath::Temporary as i32;
             span.add_event(Event::new("decoding").with_property(|| ("type", "temporary")));
-            self.black_box_decoder
+            let decode_started = std::time::Instant::now();
+            let parity_factor = self
+                .black_box_decoder
                 .clone()
                 .decode(blackbox_decoder::DecodingProblem {
                     hypergraph: Some(decoding_hypergraph.as_ref().clone()),
                     syndrome: Some(syndrome.clone()),
                 })
                 .await
-                .unwrap()
+                .unwrap();
+            timing.decode_ns = decode_started.elapsed().as_nanos() as u64;
+            parity_factor
         };
+        timing.decoder_compute_ns = parity_factor.compute_ns;
+        timing.correction_weight = parity_factor.subgraph.len() as u32;
+        timing.parity_factor_bytes = parity_factor.encoded_len() as u64;
 
         if self.config.assert_parity_factor {
             assert_parity_factor(&decoding_hypergraph, &parity_factor, &syndrome);
@@ -2813,6 +2983,7 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                 let check_model_gid = check_model.gid;
                 let trace_shot = self.trace_shot.clone();
                 let has_trace = self.config.trace_filepath.is_some();
+                let syndrome_ready_at = self.syndrome_ready_at.clone();
                 tokio::spawn(async move {
                     let _guard = _guard;
                     let expanded_remote_gadgets =
@@ -2875,6 +3046,14 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                     check_model.expanded_remote_gadgets = Some(expanded_remote_gadgets);
                     check_model.syndrome.send_replace(Some(syndrome));
                     drop(check_models);
+                    // Always-on: record when this cid's syndrome became complete,
+                    // for WindowTiming.syndrome_ready_ns (decode_parity_factor takes
+                    // the max over the window's cids). Unconditional (not gated on
+                    // has_trace) — the timing log has no enable flag.
+                    syndrome_ready_at
+                        .lock()
+                        .unwrap()
+                        .insert(cid, crate::misc::util::timestamp_ns());
                     // Record syndrome-ready trace event
                     if has_trace {
                         trace_shot.lock().await.events.push(trace::Event {
@@ -2905,6 +3084,20 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                     }
                 }
                 let modified_remote = Arc::new(modified_remote);
+
+                // DEM: fold the probability modifiers into the etype's error
+                // list and precompute the required-slot metadata BEFORE taking
+                // the instance locks below — both the clone and the scan are
+                // O(errors) on the etype's whole list (~100 µs for
+                // surface-code etypes) and only need `error_model_types`,
+                // which is already held. Under the locks they serialized
+                // every concurrent registration/submit behind this arm.
+                let prepared_dem = self.dem_log.is_enabled().then(|| {
+                    coordinator::dem::PreparedErrorModel::new(
+                        coordinator::dem::effective_errors(error_model_type, &error_model),
+                        &modified_remote,
+                    )
+                });
 
                 // Acquire locks in ordering: gadgets(read) → check_models(write) →
                 // error_models(write).  All three are held throughout to ensure
@@ -2942,19 +3135,13 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                 check_model.attaching_eid_vec.push(eid);
 
                 // record the new error mechanisms in the DEM increment log
-                // (record-only, probability modifiers folded in). Registered
-                // BEFORE the resolution loop below so its on_remote_resolved
-                // emissions land on a known eid. is_enabled guard: skips the
-                // effective_errors clone of the etype's whole error list when
-                // the log is off (later hooks are no-ops on their own).
-                if self.dem_log.is_enabled() {
-                    self.dem_log.on_error_model(
-                        check_model.instance.gid,
-                        eid,
-                        error_model.cid,
-                        coordinator::dem::effective_errors(error_model_type, &error_model),
-                        &modified_remote,
-                    );
+                // (record-only, probability modifiers folded in — hoisted
+                // above the locks). Registered BEFORE the resolution loop
+                // below so its on_remote_resolved emissions land on a known
+                // eid.
+                if let Some(prepared) = prepared_dem {
+                    self.dem_log
+                        .on_error_model_prepared(check_model.instance.gid, eid, error_model.cid, prepared);
                 }
 
                 // Register referring_eids for resolved targets; defer unresolved ones.
@@ -3034,6 +3221,10 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
         let outcomes = request.into_inner();
         let gid = outcomes.gid;
 
+        // Window-formation stamp: this window's leader gadget entered decode().
+        // Threaded into the WindowTiming record (like `explore_ns`).
+        let leader_arrived_ns = crate::misc::util::timestamp_ns();
+
         // Load outcomes
         let is_free_hop;
         {
@@ -3069,6 +3260,13 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                     coordinator::apply_loss_random_imputation(&mut outcome_data, loss_mask, &mut *rng);
                 }
                 gadget.outcomes.send_replace(Some(outcome_data));
+                // First-arrival stamp: this branch is the None→Some transition
+                // (guarded by `!already_submitted`); a prior `submit_outcomes`
+                // already stamped it otherwise.
+                self.outcome_arrivals.lock().unwrap().push(coordinator::OutcomeArrival {
+                    gid,
+                    received_ns: crate::misc::util::timestamp_ns(),
+                });
             }
             // decode() has been entered: the caller's error model (if any) has
             // finished loading, so this gadget is now safe to commit. This is the
@@ -3103,6 +3301,18 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
 
         // Hop-counted gadget: five-step window exploration then commit loop.
 
+        // Register this leader for the ordered hand-off (see the defer check
+        // in the commit loop's claim branch). Registered HERE — at decode()
+        // entry, before the mandatory-zone waits — not at commit-loop entry:
+        // decode() entries arrive in stream order, while step 1/2 wake-ups
+        // under load do not, and a later leader that reached the loop first
+        // used to claim (and commit) the tail ahead of an earlier leader
+        // still waiting on its mandatory syndrome. Deferring to a leader that
+        // is still in steps 1-2 cannot hang: those steps complete iff the
+        // program's gadgets keep arriving, which this decode()'s own return
+        // already depends on.
+        let _waiting = WaitingLeaderGuard::register(&self.waiting_leaders, gid);
+
         // Step 1: Explore mandatory zone (blocking BFS up to buffer_radius).
         let mut explored = self
             .explore_mandatory_zone(gid)
@@ -3114,19 +3324,46 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
         self.await_mandatory_zone_syndrome(&explored)
             .await
             .ok_or_else(|| Status::cancelled("decode cancelled by reset"))?;
+        // Window-formation stamp: mandatory-zone syndrome wait completed.
+        let mandatory_ready_ns = crate::misc::util::timestamp_ns();
 
-        // Step 3: Explore lookahead zone (non-blocking BFS, lookahead_radius more hops).
-        self.explore_lookahead_zone(&mut explored)
-            .await
-            .ok_or_else(|| Status::cancelled("decode cancelled by reset"))?;
-
-        // Commit loop: check window for Decoding gadgets, run steps 3+4,
-        // mark entire window as Decoding, then proceed.
+        // Commit loop: run step 3, check window for Decoding gadgets, run
+        // steps 4+5, mark entire window as Decoding, then proceed.
+        //
+        // Step 3 (lookahead) runs at the TOP of every iteration, not once
+        // before the loop: a leader can sit blocked here for a long time —
+        // released from another window's buffer, or waiting out a neighbor's
+        // decode — and gadgets that registered and became syndrome-ready in
+        // the meantime were invisible to a frozen first-pass window.
+        // Committing from that stale window strands the skipped gadgets for
+        // an extra straggler window and lets a late tail leader commit ahead
+        // of an earlier one (out-of-order commits at the stream tail). The
+        // first iteration consumes step 1's frontier exactly as before;
+        // retries re-seed the frontier from the already-explored set so the
+        // non-blocking BFS can pick up newly available neighbors.
+        //
+        // Window-exploration compute (select_commit_region + shrink_window), for
+        // WindowTiming.explore_ns. Set inside the retry loop below (only the
+        // iteration that reaches the break actually runs steps 4-5); hoisted here
+        // so it's in scope at the decode_and_commit call site after the loop.
+        #[allow(unused_assignments)]
+        let mut explore_ns: u64 = 0;
+        let mut explore_pass: u32 = 0;
         loop {
             let token = self.cancellation.read().await.clone();
             if token.is_cancelled() {
                 return Err(Status::cancelled("decode cancelled by reset"));
             }
+
+            // Step 3: Explore lookahead zone (non-blocking BFS, lookahead_radius
+            // more hops). Re-seeded on retries (see the loop comment above).
+            if explore_pass > 0 {
+                Self::reseed_lookahead_frontier(&mut explored);
+            }
+            explore_pass += 1;
+            self.explore_lookahead_zone(&mut explored)
+                .await
+                .ok_or_else(|| Status::cancelled("decode cancelled by reset"))?;
 
             let blocking_gids: Vec<u64>;
             {
@@ -3198,11 +3435,53 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                 }
 
                 if blocked.is_empty() {
+                    // Ordered hand-off: an EARLIER leader (smaller center gid;
+                    // gid order is topological — a Create::Gadget's connectors
+                    // may only reference already-registered gadgets) is still
+                    // blocked in this same loop and its center sits in OUR
+                    // window. Claiming now would grab that center as buffer
+                    // and commit this window's region ahead of it — the
+                    // out-of-order tail commit (a late leader wins the wake
+                    // race after a buffer release and commits {tail} while an
+                    // earlier round is left for a straggler window). Defer:
+                    // wait for that leader's center to leave Uncommitted (it
+                    // claims, or another window commits it), then retry. The
+                    // smallest-gid waiting leader never defers, so the
+                    // hand-off chain cannot cycle.
+                    let earlier_waiting = {
+                        let waiting = self.waiting_leaders.lock().unwrap();
+                        waiting.iter().copied().find(|w| {
+                            *w < gid
+                                && explored.gadgets.contains(w)
+                                && gadgets
+                                    .get(w)
+                                    .is_some_and(|g| matches!(*g.state.borrow(), GadgetState::Uncommitted))
+                        })
+                    };
+                    if let Some(w) = earlier_waiting {
+                        let mut rx = gadgets
+                            .get(&w)
+                            .expect("waiting leader's gadget exists in the map")
+                            .state
+                            .subscribe();
+                        let token_c = token.clone();
+                        drop(gadgets);
+                        tokio::select! {
+                            result = rx.wait_for(|s| !matches!(s, GadgetState::Uncommitted)) => {
+                                let _ = result;
+                            }
+                            _ = token_c.cancelled() => {}
+                        }
+                        continue;
+                    }
+
+                    let explore_started = std::time::Instant::now();
                     // Step 4: Select commit region.
                     self.select_commit_region(&mut explored, &gadgets);
 
                     // Step 5: Shrink window to minimal decoder window.
                     self.shrink_window(&mut explored, &gadgets);
+                    explore_ns = explore_started.elapsed().as_nanos() as u64;
 
                     // Emit WindowExploreEvent trace.
                     let mandatory_zone_gids: Vec<u64> = explored
@@ -3277,6 +3556,9 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
             &explored.commit_region,
             &explored.committing_cids,
             &explored.decoder_window,
+            explore_ns,
+            leader_arrived_ns,
+            mandatory_ready_ns,
         )
         .await
         .ok_or_else(|| Status::cancelled("decode cancelled by reset"))?;
@@ -3314,6 +3596,13 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
         self.pending_referring_by_gid.lock().await.clear();
         self.pending_referring_by_port.lock().await.clear();
         self.dem_log.reset();
+        self.timing_log.reset();
+        self.syndrome_ready_at.lock().unwrap().clear();
+        self.outcome_arrivals.lock().unwrap().clear();
+        // Defensive: in-flight decode() tasks were cancelled above and their
+        // RAII guards unregister on drop; clear anyway so a stale entry can
+        // never make a next-shot leader defer to a dead one.
+        self.waiting_leaders.lock().unwrap().clear();
         *self.next_gid.lock().await = 1;
         *self.next_cid.lock().await = 1;
         *self.next_eid.lock().await = 1;
@@ -3406,6 +3695,17 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
     async fn set_dem_enabled(&self, request: Request<coordinator::DemEnabledRequest>) -> Result<Response<()>, Status> {
         self.set_dem_enabled(request.into_inner().enabled);
         Ok(Response::new(()))
+    }
+
+    async fn drain_window_timings(
+        &self,
+        _request: Request<()>,
+    ) -> Result<Response<coordinator::WindowTimingsResponse>, Status> {
+        Ok(Response::new(coordinator::WindowTimingsResponse {
+            timings: self.timing_log.drain(),
+            drained_at_ns: crate::misc::util::timestamp_ns(),
+            outcome_arrivals: std::mem::take(&mut self.outcome_arrivals.lock().unwrap()),
+        }))
     }
 }
 
@@ -4085,8 +4385,9 @@ mod tests {
         let committing_cids: HashSet<u64> = [201].into_iter().collect();
         let span = Span::root("test", SpanContext::random());
 
+        let mut timing = coordinator::WindowTiming::default();
         let (_parity_factor, _errors) = coordinator
-            .decode_parity_factor(101, &committing_cids, &relative_program, &mapping, &span)
+            .decode_parity_factor(101, &committing_cids, &relative_program, &mapping, &span, &mut timing)
             .await;
 
         assert_eq!(
@@ -4115,8 +4416,9 @@ mod tests {
         let committing_cids: HashSet<u64> = [201].into_iter().collect();
         let span = Span::root("test", SpanContext::random());
 
+        let mut timing = coordinator::WindowTiming::default();
         let (_parity_factor, _errors) = coordinator
-            .decode_parity_factor(101, &committing_cids, &relative_program, &mapping, &span)
+            .decode_parity_factor(101, &committing_cids, &relative_program, &mapping, &span, &mut timing)
             .await;
 
         assert_eq!(
@@ -4143,8 +4445,9 @@ mod tests {
         let cached_committing_cids: HashSet<u64> = [202].into_iter().collect();
         let span = Span::root("test", SpanContext::random());
 
+        let mut timing = coordinator::WindowTiming::default();
         let (_parity_factor, _errors) = coordinator
-            .decode_parity_factor(101, &committing_cids, &relative_program, &mapping, &span)
+            .decode_parity_factor(101, &committing_cids, &relative_program, &mapping, &span, &mut timing)
             .await;
         let _ = coordinator.dem_log.drain_predictions();
         let mut cached_cm = local_check_model(202, 401, 102);
@@ -4153,8 +4456,16 @@ mod tests {
             .syndrome
             .send_replace(Some(bit_vector::from_sparse_indices(1, &[0])));
         coordinator.check_models.write().await.insert(202, cached_cm);
+        let mut cached_timing = coordinator::WindowTiming::default();
         let (_parity_factor, _errors) = coordinator
-            .decode_parity_factor(102, &cached_committing_cids, &cached_relative_program, &cached_mapping, &span)
+            .decode_parity_factor(
+                102,
+                &cached_committing_cids,
+                &cached_relative_program,
+                &cached_mapping,
+                &span,
+                &mut cached_timing,
+            )
             .await;
 
         assert_eq!(

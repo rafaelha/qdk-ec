@@ -166,6 +166,39 @@ async fn test_mock_decoder_reset() {
 }
 
 #[tokio::test]
+async fn mock_decode_reports_compute_ns() {
+    let decoder = MockDecoder::new();
+    // A configured delay guarantees measurably nonzero compute time.
+    decoder.set_decode_delay(std::time::Duration::from_millis(5));
+
+    let hypergraph = blackbox_decoder::DecodingHypergraph {
+        vertex_num: 1,
+        hyperedges: vec![blackbox_decoder::Hyperedge {
+            vertices: vec![0],
+            probability: 0.1,
+        }],
+    };
+    let syndrome = deq_runtime::misc::bit_vector::from_sparse_indices(1, &[0]);
+
+    let response = BlackBoxDecoder::decode(
+        &decoder,
+        Request::new(blackbox_decoder::DecodingProblem {
+            hypergraph: Some(hypergraph),
+            syndrome: Some(syndrome),
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+
+    assert!(
+        response.compute_ns >= 5_000_000,
+        "compute_ns={} should cover the 5ms delay",
+        response.compute_ns
+    );
+}
+
+#[tokio::test]
 async fn test_mock_decoder_decode_loaded_not_found() {
     let decoder = MockDecoder::new();
 
