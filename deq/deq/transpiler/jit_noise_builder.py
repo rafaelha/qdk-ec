@@ -18,12 +18,21 @@ tests.
 
 Two complementary techniques drive the computation:
 
-- **Heisenberg walk** (:func:`walk_pauli_forward`) propagates a single
-  Pauli at a body position forward through the remaining instructions,
-  tracking which real measurements it flips and the residual Pauli at
-  the body's end.  Used by :func:`compute_noise_errors` (each noise
-  mechanism's footprint) and by :func:`compute_implicit_readout_propagation`
-  (input-port-observable readouts).
+- **Reverse sensitivity sweep** (:class:`_ReverseSensitivityTracker`,
+  modelled on Stim's ``SparseUnsignedRevFrameTracker`` /
+  ``ErrorAnalyzer``) walks the decomposed body *backwards once*,
+  maintaining for every qubit the sparse set of final outcome bits
+  (checks, readouts, observable residuals) that an X or Z error at the
+  current position would flip.  Each noise mechanism's footprint —
+  with check/readout memberships already parity-folded — is then the
+  XOR of the per-qubit sets under its Pauli components: O(footprint)
+  per mechanism, with no per-mechanism propagation or per-check scans.
+  Used by :func:`compute_noise_errors` /
+  :func:`iter_noise_errors_with_origin` (feedback-aware profile) and
+  by :func:`compute_implicit_readout_propagation` (legacy-walker
+  profile; see :class:`_ReverseSensitivityTracker` for the two
+  profiles).  The forward walker (:func:`walk_pauli_forward`) is
+  retained as an executable reference of the legacy semantics.
 - **Symplectic flow analysis** (:func:`_compute_pc_logical_via_flows`)
   drives **all** logical-row entries of ``correction_propagation`` and
   ``physical_correction``.  A single GF(2) null-space computation on
@@ -57,9 +66,9 @@ This module provides:
 from dataclasses import dataclass
 from typing import Iterator, Literal, Sequence
 
+import numpy as np
 import stim
 from binar import BitMatrix, BitVector, EchelonForm, null_space
-from paulimer import FramePropagator, SparsePauli, UnitaryOpcode
 
 import deq.proto.deq_bin_pb2 as pb
 import deq.proto.deq_jit_pb2 as jit_pb
@@ -563,6 +572,233 @@ def walk_pauli_forward(
 
 
 # ---------------------------------------------------------------------------
+# Reverse sensitivity sweep (stim-style DEM error tracking)
+# ---------------------------------------------------------------------------
+#
+# This mirrors the algorithm of Stim's ``SparseUnsignedRevFrameTracker``
+# (``src/stim/simulators/sparse_rev_frame_tracker.cc``), specialised to
+# the ``{H, S, CX, M, R, MPAD}`` gate set that ``_build_decomposed_body``
+# produces:
+#
+# - ``xs[q]`` / ``zs[q]`` hold the sparse set of *final outcome bits*
+#   that an X / Z error on qubit ``q`` at the current sweep position
+#   would flip (Y sensitivity is implicitly ``xs[q] ^ zs[q]``).
+# - When a measurement is swept over, the bits that depend on its
+#   outcome (check memberships, readouts, pc rows — the analogue of
+#   Stim's ``rec_bits`` populated by DETECTOR/OBSERVABLE) are XORed
+#   into the measured qubit's ``xs``, together with any pending
+#   classical-feedback sensitivity accumulated for that outcome.
+#
+# The tracker supports the module's two historical propagation
+# profiles:
+#
+# - *feedback-aware* (``track_feedback=True, reset_clears_z=True``):
+#   matches the frame-propagation semantics used for noise-mechanism
+#   footprints — ``CX rec[-k] q`` injects an X on ``q`` whenever the
+#   error flipped the referenced outcome, and a reset discards the
+#   whole frame on the reset qubit.
+# - *legacy-walker* (``track_feedback=False, reset_clears_z=False``):
+#   matches :func:`walk_pauli_forward`, which models feedback as
+#   conjugation (a sign-only effect that every footprint test
+#   ignores) and lets a ``Z`` survive ``R``.  Used by
+#   :func:`compute_implicit_readout_propagation`.
+
+
+def _compile_reverse_ops(
+    decomposed: _DecomposedBody,
+) -> list[tuple[str, list]]:
+    """Precompile decomposed instructions for the reverse sweep.
+
+    Extracting targets from ``stim.CircuitInstruction`` is relatively
+    expensive; doing it once per gadget keeps the sweep cheap.
+
+    Returns one ``(kind, payload)`` op per decomposed instruction:
+
+    - ``("H"|"S"|"R", [qubit, ...])``
+    - ``("CX", [(ctrl, tgt), ...])`` with ``ctrl = -1 - meas_index``
+      encoding a measurement-record control (``ctrl >= 0`` is a qubit)
+    - ``("M", [(qubit, meas_index), ...])``
+    - ``("MPAD", [meas_index, ...])``
+
+    ``meas_index`` is the index in the decomposed body's combined
+    measurement stream (identical to the forward walker's ``real_idx``
+    numbering, which also counts MPAD entries).
+    """
+    ops: list[tuple[str, list]] = []
+    meas_start_at = decomposed.meas_start_at
+    for i, inst in enumerate(decomposed.instructions):
+        name = inst.name
+        raw_targets = inst.targets_copy()
+        if name in ("H", "S", "R"):
+            ops.append((name, [t.value for t in raw_targets]))
+        elif name == "CX":
+            pairs: list[tuple[int, int]] = []
+            for j in range(0, len(raw_targets), 2):
+                ctrl = raw_targets[j]
+                tgt = raw_targets[j + 1]
+                if ctrl.is_measurement_record_target:
+                    # Same resolution as the forward walker: the record
+                    # offset counts back from the number of measurement
+                    # stream entries before this instruction.
+                    pairs.append((-1 - (meas_start_at[i] + ctrl.value), tgt.value))
+                else:
+                    pairs.append((ctrl.value, tgt.value))
+            ops.append((name, pairs))
+        elif name == "M":
+            ops.append(
+                (
+                    name,
+                    [
+                        (t.value, meas_start_at[i] + offset)
+                        for offset, t in enumerate(raw_targets)
+                    ],
+                )
+            )
+        elif name == "MPAD":
+            ops.append(
+                (name, [meas_start_at[i] + offset for offset in range(len(raw_targets))])
+            )
+        else:
+            raise ValueError(
+                f"jit_noise_builder: unexpected instruction in decomposed "
+                f"circuit: {name}"
+            )
+    return ops
+
+
+class _ReverseSensitivityTracker:
+    """Per-qubit sparse error-sensitivity state for the reverse sweep.
+
+    See the section comment above for the two semantic profiles
+    selected by ``track_feedback`` / ``reset_clears_z``.
+    """
+
+    __slots__ = ("xs", "zs", "meas_sens", "static_meas_bits", "track_feedback", "reset_clears_z")
+
+    def __init__(
+        self,
+        num_qubits: int,
+        static_meas_bits: dict[int, set[int]],
+        *,
+        track_feedback: bool,
+        reset_clears_z: bool,
+    ) -> None:
+        self.xs: list[set[int]] = [set() for _ in range(num_qubits)]
+        self.zs: list[set[int]] = [set() for _ in range(num_qubits)]
+        # Pending classical-feedback sensitivity per measurement-stream
+        # index (Stim's ``rec_bits``), consumed at the measurement.
+        self.meas_sens: dict[int, set[int]] = {}
+        # Fixed check/readout/pc-row memberships per measurement.
+        self.static_meas_bits = static_meas_bits
+        self.track_feedback = track_feedback
+        self.reset_clears_z = reset_clears_z
+
+    def seed_residual(self, pauli: stim.PauliString, bits: set[int]) -> None:
+        """Seed end-of-body sensitivity for an output stabilizer/observable.
+
+        A residual X on qubit ``q`` anticommutes with *pauli* iff the
+        pauli has a Z component there (Z or Y), and vice versa — so the
+        given outcome ``bits`` toggle under exactly those components.
+        """
+        if not bits:
+            return
+        xa, za = pauli.to_numpy(bit_packed=False)
+        n = min(len(xa), len(self.xs))
+        for q in np.flatnonzero(za[:n]):
+            self.xs[q].symmetric_difference_update(bits)
+        for q in np.flatnonzero(xa[:n]):
+            self.zs[q].symmetric_difference_update(bits)
+
+    def undo(self, op: tuple[str, list]) -> None:
+        """Sweep one decomposed instruction backwards.
+
+        Conjugation rules (error inserted before gate U ≡ error UEU†
+        after it): H swaps X/Z; S maps X→Y (xs ^= zs); CX maps
+        X_c→X_cX_t and Z_t→Z_cZ_t.  Within an instruction, targets are
+        processed in reverse to undo the forward sequential order.
+        """
+        kind, payload = op
+        xs, zs = self.xs, self.zs
+        if kind == "CX":
+            for c, t in reversed(payload):
+                if c >= 0:
+                    if xs[t]:
+                        xs[c].symmetric_difference_update(xs[t])
+                    if zs[c]:
+                        zs[t].symmetric_difference_update(zs[c])
+                elif self.track_feedback:
+                    # Feedback X on t conditioned on outcome m: if the
+                    # error flips m, everything an X-on-t would now
+                    # flip flips too.
+                    if xs[t]:
+                        m = -1 - c
+                        pending = self.meas_sens.get(m)
+                        if pending is None:
+                            self.meas_sens[m] = set(xs[t])
+                        else:
+                            pending.symmetric_difference_update(xs[t])
+        elif kind == "H":
+            for q in reversed(payload):
+                xs[q], zs[q] = zs[q], xs[q]
+        elif kind == "S":
+            for q in reversed(payload):
+                if zs[q]:
+                    xs[q].symmetric_difference_update(zs[q])
+        elif kind == "M":
+            # An X (or Y) before a Z-basis measurement flips the outcome:
+            # its static memberships plus any pending feedback effects.
+            for q, m in reversed(payload):
+                static = self.static_meas_bits.get(m)
+                if static:
+                    xs[q].symmetric_difference_update(static)
+                pending = self.meas_sens.pop(m, None)
+                if pending:
+                    xs[q].symmetric_difference_update(pending)
+        elif kind == "R":
+            for q in reversed(payload):
+                xs[q] = set()
+                if self.reset_clears_z:
+                    zs[q] = set()
+        else:  # MPAD: deterministic outcomes are never flipped.
+            for m in reversed(payload):
+                self.meas_sens.pop(m, None)
+
+    def footprint_of(self, components: list[tuple[int, int]]) -> set[int]:
+        """XOR of the sensitivity sets under a sparse Pauli's components."""
+        footprint: set[int] = set()
+        for q, p in components:
+            if p != 3:  # X or Y component
+                footprint.symmetric_difference_update(self.xs[q])
+            if p != 1:  # Z or Y component
+                footprint.symmetric_difference_update(self.zs[q])
+        return footprint
+
+
+def _sparse_components(pauli: stim.PauliString) -> list[tuple[int, int]]:
+    """Return ``(qubit, pauli_int)`` components in ascending qubit order."""
+    xa, za = pauli.to_numpy(bit_packed=False)
+    components: list[tuple[int, int]] = []
+    for q in np.flatnonzero(xa | za):
+        if xa[q]:
+            p = 2 if za[q] else 1  # Y if both, else X
+        else:
+            p = 3  # Z
+        components.append((int(q), p))
+    return components
+
+
+def _format_components(
+    components: list[tuple[int, int]], pauli: stim.PauliString
+) -> str:
+    """Render like :func:`_format_pauli`, using precomputed components."""
+    if pauli.sign != 1:
+        return _format_pauli(pauli)
+    if not components:
+        return "I"
+    return "*".join(f"{_INT_TO_PAULI[p]}{q}" for q, p in components)
+
+
+# ---------------------------------------------------------------------------
 # Output-observable flow analysis for measurement-bearing bodies
 # ---------------------------------------------------------------------------
 #
@@ -605,6 +841,42 @@ def walk_pauli_forward(
 # observable's value as the default constant, which is correct as
 # long as no downstream gadget consumes the observable's specific
 # value.
+
+
+def _symplectic_np(ps: stim.PauliString, num_qubits: int) -> np.ndarray:
+    """Numpy variant of :func:`_pauli_string_to_symplectic` (same layout)."""
+    xs, zs = ps.to_numpy(bit_packed=False)
+    out = np.zeros(2 * num_qubits, dtype=np.uint8)
+    n = min(len(xs), num_qubits)
+    out[:n] = xs[:n]
+    out[num_qubits : num_qubits + n] = zs[:n]
+    return out
+
+
+def _bitmatrix_from_numpy(arr: np.ndarray) -> BitMatrix:
+    """Fast dense-numpy → :class:`BitMatrix` conversion.
+
+    ``BitMatrix(iterable)`` walks every element through the Python
+    iteration protocol, which dominated the flow-analysis setup cost.
+    Instead, pack the bits the way binar lays them out internally
+    (little-endian within 64-bit words, rows padded to a 512-bit
+    stride) and hand them to the pickle-reconstruction entry point,
+    which copies the words verbatim.  Verified round-trip-equal with
+    the iterable constructor for binar 0.1.2.
+    """
+    rows, cols = arr.shape
+    if rows == 0 or cols == 0:
+        return BitMatrix([[0] * cols for _ in range(rows)])
+    packed = np.packbits(arr, axis=1, bitorder="little")
+    bytes_per_row = ((cols + 511) // 512) * 64
+    buf = np.zeros((rows, bytes_per_row), dtype=np.uint8)
+    buf[:, : packed.shape[1]] = packed
+    words = np.frombuffer(buf.tobytes(), dtype="<u8")
+    # _from_pickle is binar's own __reduce__ reconstruction hook; stable
+    # for pickled matrices but absent from the type stubs.
+    return BitMatrix._from_pickle(  # type: ignore[attr-defined]
+        rows, cols, words.tolist()
+    )
 
 
 def _compute_pc_logical_via_flows(
@@ -676,36 +948,19 @@ def _compute_pc_logical_via_flows(
     if n_flow == 0 or n_out == 0:
         return [], set(), set()
 
-    input_symp = [
-        _pauli_string_to_symplectic(p, num_qubits) for p in input_obs_paulis
-    ]
-    output_symp = [
-        _pauli_string_to_symplectic(p, num_qubits) for p in output_obs_paulis
-    ]
-    flow_in_symp = [
-        _pauli_string_to_symplectic(g.input_copy(), num_qubits) for g in flows
-    ]
-    flow_out_symp = [
-        _pauli_string_to_symplectic(g.output_copy(), num_qubits) for g in flows
-    ]
-
     # Augmented symplectic system A · (Y, u, v)^T = 0:
     #   top 2N eqs: P_in · Y + I · u = 0    (input-side symplectic match)
     #   bottom 2N eqs: P_out · Y + O · v = 0 (output-side symplectic match)
-    a_rows: list[list[int]] = []
-    for b in range(2 * num_qubits):
-        a_rows.append(
-            [flow_in_symp[g][b] for g in range(n_flow)]
-            + [input_symp[j][b] for j in range(n_in)]
-            + [0] * n_out
-        )
-    for b in range(2 * num_qubits):
-        a_rows.append(
-            [flow_out_symp[g][b] for g in range(n_flow)]
-            + [0] * n_in
-            + [output_symp[i][b] for i in range(n_out)]
-        )
-    a_matrix = BitMatrix(a_rows)
+    n2 = 2 * num_qubits
+    a = np.zeros((2 * n2, n_flow + n_in + n_out), dtype=np.uint8)
+    for g, flow in enumerate(flows):
+        a[:n2, g] = _symplectic_np(flow.input_copy(), num_qubits)
+        a[n2:, g] = _symplectic_np(flow.output_copy(), num_qubits)
+    for j, pauli in enumerate(input_obs_paulis):
+        a[:n2, n_flow + j] = _symplectic_np(pauli, num_qubits)
+    for i, pauli in enumerate(output_obs_paulis):
+        a[n2:, n_flow + n_in + i] = _symplectic_np(pauli, num_qubits)
+    a_matrix = _bitmatrix_from_numpy(a)
     kernel_rows = null_space(a_matrix).rows
 
     u_rows: list[list[int]] = []
@@ -713,23 +968,23 @@ def _compute_pc_logical_via_flows(
     w_rows: list[list[int]] = []
     sigma_bits: list[int] = []
     for vec_bv in kernel_rows:
-        vec = [int(bit) for bit in vec_bv]
-        y_coeffs = vec[:n_flow]
-        u_coeffs = vec[n_flow : n_flow + n_in]
-        v_coeffs = vec[n_flow + n_in :]
+        support = set(vec_bv.support)
 
         # Flows whose output component vanishes in the output basis
         # don't constrain propagation rows; they encode measurement
         # relations (handled by readout_propagation) or trivial
         # identity flows.  Skip them.
-        if not any(v_coeffs):
+        if not any(idx >= n_flow + n_in for idx in support):
             continue
+
+        u_coeffs = [1 if n_flow + j in support else 0 for j in range(n_in)]
+        v_coeffs = [1 if n_flow + n_in + i in support else 0 for i in range(n_out)]
 
         w_row = [0] * n_meas
         combined_input = stim.PauliString(num_qubits)
         combined_output = stim.PauliString(num_qubits)
-        for g_idx, y_bit in enumerate(y_coeffs):
-            if not y_bit:
+        for g_idx in range(n_flow):
+            if g_idx not in support:
                 continue
             for m in flows[g_idx].measurements_copy():
                 w_row[m] ^= 1
@@ -937,36 +1192,6 @@ def compute_noise_errors(
     return errors
 
 
-def _stim_pauli_to_sparse(ps: stim.PauliString) -> SparsePauli:
-    """Convert a ``stim.PauliString`` to a ``paulimer.SparsePauli`` (sign
-    dropped: frame propagation only tracks anticommutation, not phase)."""
-    return SparsePauli(
-        {q: _INT_TO_PAULI[ps[q]] for q in range(len(ps)) if ps[q]}
-    )
-
-
-# Decomposed-body Clifford gates as paulimer unitary opcodes.
-_FP_H = UnitaryOpcode.Hadamard
-_FP_S = UnitaryOpcode.SqrtZ
-_FP_CX = UnitaryOpcode.ControlledX
-
-
-@dataclass(frozen=True)
-class _MechanismFlips:
-    """One noise mechanism's projected footprint from the batched pass.
-
-    * ``flipped_real`` — real (internal) measurement indices the mechanism
-      flipped.
-    * ``stab_flips[i]`` — whether the residual anticommutes with output-port
-      stabilizer ``i``.
-    * ``obs_flips[j]`` — whether the residual anticommutes with observable ``j``.
-    """
-
-    flipped_real: set[int]
-    stab_flips: Sequence[bool]
-    obs_flips: Sequence[bool]
-
-
 @dataclass(frozen=True)
 class _GadgetErrorContext:
     """Per-gadget invariants shared by every error-row builder.
@@ -1000,142 +1225,6 @@ class _NoiseMechanism:
     pauli: stim.PauliString
     probability: float
     site_name: str
-
-
-def _apply_decomposed_instruction(
-    frame_propagator: FramePropagator,
-    inst: stim.CircuitInstruction,
-    outcome_of_real: list[int],
-) -> None:
-    """Apply one decomposed body instruction to ``frame_propagator``.
-
-    ``M``/``MPAD`` append their outcome id to ``outcome_of_real`` (whose length
-    is the next real-measurement index); a measurement-record-controlled ``CX``
-    reads back through it as a conditional Pauli.
-    """
-    raw = inst.targets_copy()
-    match inst.name:
-        case "H":
-            for t in raw:
-                frame_propagator.apply_unitary(_FP_H, [t.value])
-        case "S":
-            for t in raw:
-                frame_propagator.apply_unitary(_FP_S, [t.value])
-        case "CX":
-            for j in range(0, len(raw), 2):
-                ctrl, tgt = raw[j], raw[j + 1]
-                if ctrl.is_measurement_record_target:
-                    rec_idx = len(outcome_of_real) + ctrl.value
-                    assert 0 <= rec_idx < len(outcome_of_real), (
-                        f"rec[{ctrl.value}] out of range for {inst.name}"
-                    )
-                    frame_propagator.apply_conditional_pauli(
-                        SparsePauli.x(tgt.value), [outcome_of_real[rec_idx]]
-                    )
-                else:
-                    frame_propagator.apply_unitary(_FP_CX, [ctrl.value, tgt.value])
-        case "M":
-            for t in raw:
-                outcome_of_real.append(frame_propagator.measure(SparsePauli.z(t.value)))
-        case "R":
-            for t in raw:
-                frame_propagator.reset_qubit(t.value)
-        case "MPAD":
-            for t in raw:
-                outcome_of_real.append(frame_propagator.measure(SparsePauli.identity()))
-        case other:
-            raise ValueError(
-                f"jit_noise_builder: unexpected instruction in decomposed "
-                f"circuit: {other}"
-            )
-
-
-def _batched_mechanism_flips(
-    mechanisms: Sequence[tuple[int, stim.PauliString]],
-    decomposed: _DecomposedBody,
-    num_qubits: int,
-    stab_paulis: Sequence[stim.PauliString],
-    obs_paulis: Sequence[stim.PauliString],
-) -> list[_MechanismFlips]:
-    """Propagate every mechanism through the body in a single batched
-    :class:`FramePropagator` pass and return one :class:`_MechanismFlips`
-    per mechanism.
-
-    Each mechanism is one shot; ``mechanisms[k] = (walk_start, pauli)`` injects
-    ``pauli`` into shot ``k`` at decomposed index ``walk_start`` (the position
-    just after its noise instruction).  Internal ``M``/``MPAD`` are recorded via
-    :meth:`FramePropagator.measure`, giving ``flipped_real``; the port
-    stabilizers and observables are measured after the body, giving the
-    residual's anticommutation (``stab_flips`` / ``obs_flips``) without ever
-    materialising the residual Pauli.
-
-    Reset uses :meth:`FramePropagator.reset_qubit`, i.e. Stim's
-    discard-and-prepare semantics that clear the whole frame on the reset qubit.
-    A ``Z`` killed by a reset stays in the code stabilizer group, so it commutes
-    with every port stabilizer and logical observable and never reaches an
-    emitted row.
-    """
-    shot_count = len(mechanisms)
-    instructions = decomposed.instructions
-    n_real = decomposed.total_measurements
-
-    frame_propagator = FramePropagator(
-        num_qubits, n_real + len(stab_paulis) + len(obs_paulis), shot_count
-    )
-
-    by_start: dict[int, list[int]] = {}
-    for shot, (walk_start, _pauli) in enumerate(mechanisms):
-        by_start.setdefault(walk_start, []).append(shot)
-
-    injected = 0
-
-    def inject_at(index: int) -> None:
-        nonlocal injected
-        for shot in by_start.get(index, ()):
-            frame_propagator.inject_pauli(
-                shot, _stim_pauli_to_sparse(mechanisms[shot][1])
-            )
-            injected += 1
-
-    # outcome id assigned to each real (internal) measurement, in body order;
-    # a measurement's real index is just its position here.
-    outcome_of_real: list[int] = []
-
-    for index, inst in enumerate(instructions):
-        inject_at(index)
-        _apply_decomposed_instruction(frame_propagator, inst, outcome_of_real)
-    inject_at(len(instructions))
-    assert injected == shot_count, "each mechanism must be injected exactly once"
-
-    stab_oids = [
-        frame_propagator.measure(_stim_pauli_to_sparse(s)) for s in stab_paulis
-    ]
-    obs_oids = [
-        frame_propagator.measure(_stim_pauli_to_sparse(o)) for o in obs_paulis
-    ]
-
-    # ``outcome_deltas`` has one row per outcome id; that row's ``support`` is
-    # the set of shots whose outcome the injected mechanism flipped.  Iterating
-    # rows + support materialises one Python BitVector per outcome; a single
-    # ``outcome_deltas.sparse_rows()`` call would avoid that once that binding
-    # lands on binar's main.
-    shots_by_outcome = [row.support for row in frame_propagator.outcome_deltas.rows]
-    flipped_real: list[set[int]] = [set() for _ in range(shot_count)]
-    for real_idx, oid in enumerate(outcome_of_real):
-        for shot in shots_by_outcome[oid]:
-            flipped_real[shot].add(real_idx)
-    stab_flips = [[False] * len(stab_paulis) for _ in range(shot_count)]
-    for si, oid in enumerate(stab_oids):
-        for shot in shots_by_outcome[oid]:
-            stab_flips[shot][si] = True
-    obs_flips = [[False] * len(obs_paulis) for _ in range(shot_count)]
-    for oi, oid in enumerate(obs_oids):
-        for shot in shots_by_outcome[oid]:
-            obs_flips[shot][oi] = True
-    return [
-        _MechanismFlips(flipped_real[shot], stab_flips[shot], obs_flips[shot])
-        for shot in range(shot_count)
-    ]
 
 
 def _collect_noise_mechanisms(
@@ -1186,24 +1275,105 @@ def _collect_noise_mechanisms(
 
 def _build_mechanism_rows(
     mechanisms: Sequence[_NoiseMechanism],
-    flips: Sequence[_MechanismFlips],
+    decomposed: _DecomposedBody,
+    num_qubits: int,
+    stab_paulis: Sequence[stim.PauliString],
+    obs_paulis: Sequence[stim.PauliString],
     context: _GadgetErrorContext,
 ) -> list[tuple[int, jit_pb.JitGadgetType.Error | None]]:
-    """Build one ``(body_index, error_row)`` per mechanism from its footprint."""
-    rows: list[tuple[int, jit_pb.JitGadgetType.Error | None]] = []
-    for mechanism, mechanism_flips in zip(mechanisms, flips):
-        rows.append(
-            (
+    """Build one ``(body_index, error_row)`` per mechanism, in order.
+
+    A single reverse sensitivity sweep over the decomposed body (see
+    :class:`_ReverseSensitivityTracker`) resolves every mechanism's
+    footprint at its injection boundary in O(footprint).  The sweep
+    carries *final outcome bits* — finished checks, unfinished checks,
+    readouts, observable-residual columns, and pc logical rows (in
+    that id order) — so check/readout memberships arrive already
+    parity-folded and no per-mechanism scan over the checks is needed.
+    """
+    num_finished = len(context.finished_member_lists)
+    num_unfinished = len(context.unfinished_member_lists)
+    num_readouts = len(context.readout_meas_sets)
+    obs_base = num_finished + num_unfinished + num_readouts
+    pc_base = obs_base + len(obs_paulis)
+
+    # Static memberships: which bits toggle when real measurement m flips.
+    static_meas_bits: dict[int, set[int]] = {}
+    # Which check bits toggle when the residual anticommutes with an
+    # output-virtual stabilizer (indexed by position in stab_paulis).
+    stab_pos = {g: idx for idx, g in enumerate(context.stab_global_indices)}
+    ov_start = (
+        context.stab_global_indices[0] if context.stab_global_indices else None
+    )
+    virtual_bits: dict[int, set[int]] = {}
+    for check_bit, members in enumerate(
+        list(context.finished_member_lists) + list(context.unfinished_member_lists)
+    ):
+        for g in members:
+            if g >= context.input_virtual_count and (
+                ov_start is None or g < ov_start
+            ):
+                static_meas_bits.setdefault(
+                    g - context.input_virtual_count, set()
+                ).add(check_bit)
+            elif g in stab_pos:
+                virtual_bits.setdefault(stab_pos[g], set()).add(check_bit)
+    for r_idx, meas_set in enumerate(context.readout_meas_sets):
+        for m in meas_set:
+            static_meas_bits.setdefault(m, set()).add(
+                num_finished + num_unfinished + r_idx
+            )
+    for row, cols in context.pc_logical_rows.items():
+        for m in cols:
+            static_meas_bits.setdefault(m, set()).add(pc_base + row)
+
+    ops = _compile_reverse_ops(decomposed)
+    tracker = _ReverseSensitivityTracker(
+        num_qubits,
+        static_meas_bits,
+        track_feedback=True,
+        reset_clears_z=True,
+    )
+    for stab_idx, bits in virtual_bits.items():
+        tracker.seed_residual(stab_paulis[stab_idx], bits)
+    for obs_idx in context.logical_col_set:
+        tracker.seed_residual(obs_paulis[obs_idx], {obs_base + obs_idx})
+
+    by_start: dict[int, list[int]] = {}
+    for k, mechanism in enumerate(mechanisms):
+        by_start.setdefault(mechanism.walk_start, []).append(k)
+
+    rows: list[tuple[int, jit_pb.JitGadgetType.Error | None]] = [
+        (m.body_index, None) for m in mechanisms
+    ]
+
+    def _resolve_at(boundary: int) -> None:
+        for k in by_start.pop(boundary, ()):
+            mechanism = mechanisms[k]
+            components = _sparse_components(mechanism.pauli)
+            rows[k] = (
                 mechanism.body_index,
-                _build_error_row_from_flips(
+                _footprint_error_row(
                     site_name=mechanism.site_name,
                     site_pauli=mechanism.pauli,
+                    components=components,
                     probability=mechanism.probability,
-                    flips=mechanism_flips,
-                    context=context,
+                    footprint=tracker.footprint_of(components),
+                    num_finished=num_finished,
+                    num_unfinished=num_unfinished,
+                    num_readouts=num_readouts,
+                    obs_base=obs_base,
+                    pc_base=pc_base,
+                    unfinished_to_column=context.unfinished_to_column,
                 ),
             )
-        )
+
+    _resolve_at(len(ops))
+    for j in range(len(ops) - 1, -1, -1):
+        tracker.undo(ops[j])
+        _resolve_at(j)
+    assert not by_start, "each mechanism must be resolved exactly once"
+
     return rows
 
 
@@ -1275,14 +1445,9 @@ def iter_noise_errors_with_origin(
     mechanisms = _collect_noise_mechanisms(
         body_flat, num_qubits, orig_to_decomposed, len(decomposed.instructions)
     )
-    flips = _batched_mechanism_flips(
-        [(m.walk_start, m.pauli) for m in mechanisms],
-        decomposed,
-        num_qubits,
-        stab_paulis,
-        obs_paulis,
+    mechanism_rows = _build_mechanism_rows(
+        mechanisms, decomposed, num_qubits, stab_paulis, obs_paulis, context
     )
-    mechanism_rows = _build_mechanism_rows(mechanisms, flips, context)
 
     # Yield in body order, interleaving noisy-measurement errors (which need no
     # propagation) with the precomputed pure-noise rows.
@@ -1394,71 +1559,68 @@ def _build_measurement_flip_error(
     )
 
 
-def _build_error_row_from_flips(
+def _footprint_error_row(
     *,
     site_name: str,
     site_pauli: stim.PauliString,
+    components: list[tuple[int, int]],
     probability: float,
-    flips: _MechanismFlips,
-    context: _GadgetErrorContext,
+    footprint: set[int],
+    num_finished: int,
+    num_unfinished: int,
+    num_readouts: int,
+    obs_base: int,
+    pc_base: int,
+    unfinished_to_column: Sequence[int | None],
 ) -> jit_pb.JitGadgetType.Error | None:
-    """Build an ``Error`` row from a mechanism's already-projected footprint,
-    or return ``None`` if it has no observable effect.
+    """Build the ``Error`` row for a mechanism's outcome-bit footprint,
+    or return ``None`` if the mechanism has no observable effect.
 
-    The logical-row residual is the *post-runtime* frame error, i.e.
-    ``P_E[r] ⊕ (pc · M_e)[r]``: the raw projection onto each output observable,
-    XORed with the runtime's automatic Pauli-frame update derived from the
-    flipped body measurements through ``physical_correction``.
+    The footprint comes from the reverse sensitivity sweep and already
+    accounts for measurement flips, feedback, residual anticommutation
+    with output stabilizers/observables, and the pc-matrix frame update
+    (all linear, so their parities land in disjoint bit ranges).  The
+    logical-row residual is the *post-runtime* frame error, i.e.
+    ``P_E[r] ⊕ (pc · M_e)[r]``: the observable-residual bit XORed with
+    the pc-row bit of the same output column.
     """
-    flipped_globals: set[int] = {
-        real + context.input_virtual_count for real in flips.flipped_real
-    }
-
-    # Output-virtual flips from residual.
-    for stab_idx, flipped in enumerate(flips.stab_flips):
-        if flipped:
-            flipped_globals.add(context.stab_global_indices[stab_idx])
+    del num_readouts  # ids above obs_base are observables; range implied
 
     finished_flipped: list[int] = []
-    for check_idx, members in enumerate(context.finished_member_lists):
-        if len(members & flipped_globals) % 2 == 1:
-            finished_flipped.append(check_idx)
-
     unfinished_flipped: list[int] = []
-    for check_idx, members in enumerate(context.unfinished_member_lists):
-        if len(members & flipped_globals) % 2 == 1:
-            unfinished_flipped.append(check_idx)
-
+    readout_flipped: list[int] = []
     residual_indices: set[int] = set()
-    # Logical rows: raw projection P_E[r].
-    for obs_idx, flipped in enumerate(flips.obs_flips):
-        if obs_idx in context.logical_col_set and flipped:
-            residual_indices.add(obs_idx)
-    # Logical rows: XOR (pc · M_e)[r] to subtract out the runtime's
-    # automatic frame update on the flipped body measurements.
-    for logical_row, cols in context.pc_logical_rows.items():
-        if len(cols & flips.flipped_real) % 2 == 1:
-            residual_indices ^= {logical_row}
+    readout_base = num_finished + num_unfinished
+    for bit in footprint:
+        if bit < num_finished:
+            finished_flipped.append(bit)
+        elif bit < readout_base:
+            unfinished_flipped.append(bit - num_finished)
+        elif bit < obs_base:
+            readout_flipped.append(bit - readout_base)
+        elif bit < pc_base:
+            residual_indices ^= {bit - obs_base}
+        else:
+            residual_indices ^= {bit - pc_base}
+
+    finished_flipped.sort()
+    unfinished_flipped.sort()
+    readout_flipped.sort()
 
     # Stabilizer generator columns: set from unfinished check triggers
     # rather than raw anticommutation.
     for uc_idx in unfinished_flipped:
-        col = context.unfinished_to_column[uc_idx]
+        col = unfinished_to_column[uc_idx]
         if col is not None:
             residual_indices ^= {col}
     sorted_residual = sorted(residual_indices)
-
-    readout_flipped: list[int] = []
-    for r_idx, meas_set in enumerate(context.readout_meas_sets):
-        if len(meas_set & flips.flipped_real) % 2 == 1:
-            readout_flipped.append(r_idx)
 
     if not (
         finished_flipped or unfinished_flipped or sorted_residual or readout_flipped
     ):
         return None
 
-    tag = f"{site_name} {_format_pauli(site_pauli)}"
+    tag = f"{site_name} {_format_components(components, site_pauli)}"
     base = pb.ErrorModelType.Error(
         tag=tag,
         residual=sorted_residual,
@@ -2057,16 +2219,28 @@ def compute_implicit_readout_propagation(
 
     input_paulis = _build_input_port_paulis(input_ports, codes, num_qubits)
 
-    contributions: list[set[int]] = [set() for _ in readout_measurement_sets]
+    # One reverse sensitivity sweep over the whole body (bit ``r`` =
+    # readout ``r``); each input observable's readout parity is then the
+    # XOR of the per-qubit sensitivity sets under its components,
+    # instead of one full forward walk per input column.  The sweep uses
+    # the legacy-walker profile to preserve this function's historical
+    # semantics (see :class:`_ReverseSensitivityTracker`).
+    static_meas_bits: dict[int, set[int]] = {}
+    for r_idx, meas_set in enumerate(readout_measurement_sets):
+        for m in meas_set:
+            static_meas_bits.setdefault(m, set()).add(r_idx)
+    ops = _compile_reverse_ops(decomposed)
+    tracker = _ReverseSensitivityTracker(
+        num_qubits,
+        static_meas_bits,
+        track_feedback=False,
+        reset_clears_z=False,
+    )
+    for j in range(len(ops) - 1, -1, -1):
+        tracker.undo(ops[j])
 
+    contributions: list[set[int]] = [set() for _ in readout_measurement_sets]
     for col, initial in enumerate(input_paulis):
-        result = walk_pauli_forward(
-            decomposed,
-            start_index=0,
-            initial=initial,
-            num_qubits=num_qubits,
-        )
-        for row, meas_set in enumerate(readout_measurement_sets):
-            if len(meas_set & result.flipped_real) % 2 == 1:
-                contributions[row].add(col)
+        for row in tracker.footprint_of(_sparse_components(initial)):
+            contributions[row].add(col)
     return contributions
