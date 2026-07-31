@@ -730,6 +730,8 @@ impl MonolithicCoordinator {
         };
         timing.num_gadgets = gadgets.len() as u32;
         timing.num_committing = timing.num_gadgets;
+        // Monolithic commits the whole subgraph.
+        timing.commit_region_gids = timing.window_gids.clone();
 
         let cache_key = if self.config.persistent_decoder {
             let error_model_types = self.error_model_types.read().await;
