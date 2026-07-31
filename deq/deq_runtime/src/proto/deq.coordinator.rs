@@ -259,6 +259,14 @@ pub struct WindowTiming {
     /// \[decode_start, decode_end\] span with no unaccounted gap.
     #[prost(uint64, tag = "28")]
     pub finalize_ns: u64,
+    #[prost(uint64, repeated, tag = "30")]
+    pub commit_region_gids: ::prost::alloc::vec::Vec<u64>,
+    /// Uncommitted buffer/lookahead collar gadgets (subset of window_gids).
+    /// Does NOT include already-committed gadgets that remain in the decoder
+    /// window as check-only context — those are window \ commit \ buffer.
+    /// Empty on older servers / monolithic (which commits the whole window).
+    #[prost(uint64, repeated, tag = "31")]
+    pub buffer_region_gids: ::prost::alloc::vec::Vec<u64>,
 }
 /// The first time a gadget's measurement outcomes are set on a coordinator
 /// (via SubmitOutcomes or Decode), stamped with the server clock.

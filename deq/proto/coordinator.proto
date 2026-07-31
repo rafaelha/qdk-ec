@@ -237,6 +237,16 @@ message WindowTiming {
   // subtracted, so prep+build+merge+compact+load+decode+finalize tiles the whole
   // [decode_start, decode_end] span with no unaccounted gap.
   uint64 finalize_ns = 28;
+  // Gadgets in the commit region (subset of window_gids). Empty on older servers.
+  // (tag 29 reserved — briefly used for a removed leader_gid field)
+  reserved 29;
+  reserved "leader_gid";
+  repeated uint64 commit_region_gids = 30;
+  // Uncommitted buffer/lookahead collar gadgets (subset of window_gids).
+  // Does NOT include already-committed gadgets that remain in the decoder
+  // window as check-only context — those are window \ commit \ buffer.
+  // Empty on older servers / monolithic (which commits the whole window).
+  repeated uint64 buffer_region_gids = 31;
 }
 
 // The first time a gadget's measurement outcomes are set on a coordinator

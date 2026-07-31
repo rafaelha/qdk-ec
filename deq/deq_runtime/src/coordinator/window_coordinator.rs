@@ -1705,6 +1705,23 @@ impl WindowCoordinator {
         // cancellation early-returns between entry and here).
         let decode_start_ns = crate::misc::util::timestamp_ns();
         let concurrent = self.decodes_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        // Buffer = uncommitted gadgets still in the decoder window but outside
+        // the commit region. Already-Committed gadgets can remain in `window`
+        // as check-only context — they are neither commit nor buffer.
+        let buffer_region_gids = {
+            let gadgets = self.gadgets.read().await;
+            let mut gids: Vec<u64> = window
+                .iter()
+                .copied()
+                .filter(|gid| !commit_region.contains(gid))
+                .filter(|gid| match gadgets.get(gid) {
+                    Some(g) => !matches!(*g.state.borrow(), GadgetState::Committed),
+                    None => false,
+                })
+                .collect();
+            gids.sort();
+            gids
+        };
         let mut timing = coordinator::WindowTiming {
             explore_ns,
             leader_arrived_ns,
@@ -1718,6 +1735,12 @@ impl WindowCoordinator {
                 gids.sort();
                 gids
             },
+            commit_region_gids: {
+                let mut gids: Vec<u64> = commit_region.iter().copied().collect();
+                gids.sort();
+                gids
+            },
+            buffer_region_gids,
             ..Default::default()
         };
 
