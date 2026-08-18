@@ -32,6 +32,10 @@ pub struct LoadedDecodingProblem {
 pub struct ParityFactor {
     #[prost(uint64, repeated, tag = "1")]
     pub subgraph: ::prost::alloc::vec::Vec<u64>,
+    /// decoder-side wall-clock of the service handler's actual decoding work,
+    /// for separating decoder compute from transport overhead. 0 = not reported.
+    #[prost(uint64, tag = "2")]
+    pub compute_ns: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DecodingHypergraph {

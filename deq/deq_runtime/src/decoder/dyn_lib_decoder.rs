@@ -103,7 +103,7 @@ impl DecoderInstance for DynLibInstance {
         // so it passes through with no conversion.
         let mut subgraph = Vec::new();
         match self.loaded.decode(syndrome.size, &syndrome.data, &mut subgraph) {
-            Ok(()) => ParityFactor { subgraph },
+            Ok(()) => ParityFactor { subgraph, compute_ns: 0 },
             // DecoderInstance::decode has no error channel; panic so ThreadPoolingDecoder's
             // catch_unwind turns it into a gRPC Status::internal, mirroring PythonDecoder.
             Err(e) => panic!("dylib decode failed: {e}"),

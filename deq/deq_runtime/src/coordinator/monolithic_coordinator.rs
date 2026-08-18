@@ -37,6 +37,7 @@ use crate::misc::util::exclusive_probability_of;
 use crate::util::BitVector;
 use binar::{BitVec, BitwiseMut};
 use hashbrown::{HashMap, HashSet};
+use prost::Message;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 #[cfg(feature = "cli")]
@@ -130,6 +131,22 @@ pub struct MonolithicCoordinator {
     /// entropy when no seed was supplied).  ``None`` when imputation is
     /// disabled, so the field doesn't even allocate.
     pub loss_imputation_rng: Option<Mutex<crate::simulator::DeterministicRng>>,
+    /// DEM increment log for the playground's decoding-graph view: execute()
+    /// records detector groups / error mechanisms here (record-only, no effect
+    /// on decoding). Arc so the spawned expansion tasks can report resolutions.
+    /// Disabled by default on the server (see `new`) — the playground enables it
+    /// per replay shot via the `set_dem_enabled` RPC.
+    pub dem_log: Arc<coordinator::dem::DemLog>,
+    /// Always-on per-window decode timing log (drained by DrainWindowTimings,
+    /// cleared on reset). Mirrors `WindowCoordinator::timing_log`; monolithic
+    /// decodes the whole connected subgraph as one "window" per record. See
+    /// coordinator::timing.
+    pub timing_log: coordinator::timing::TimingLog,
+    /// Per-gid stamp of the FIRST time a gadget's outcomes were set (always via
+    /// the `decode` handler here — monolithic's `submit_outcomes` is a no-op).
+    /// Cleared on reset, drained + cleared with the timing log. Mirrors
+    /// `WindowCoordinator::outcome_arrivals`.
+    pub outcome_arrivals: std::sync::Mutex<Vec<coordinator::OutcomeArrival>>,
 }
 
 /// Per-coordinator [`FingerprintSource`] adapter for the monolithic
@@ -151,12 +168,29 @@ pub struct LoadedDecoder {
     /// note that one have to use the relative program mapping to map it to the
     /// global id
     pub errors: Arc<Vec<ErrorIndex>>,
+    /// merged hyperedge index -> ALL constituent error refs
+    /// (`None` = no merging: 1:1 with `errors`)
+    pub constituents: Option<Arc<Vec<Vec<ErrorIndex>>>>,
     /// decoding hypergraph for sanity check only
     pub decoding_hypergraph: Option<Arc<DecodingHypergraph>>,
     /// maps compact vertex index → original vertex index; used to remap
     /// syndromes when reusing a cached decoder that had isolated vertices
     /// stripped.  `None` means no compaction was needed (identity mapping).
     pub vertex_remap: Option<Arc<Vec<u64>>>,
+    /// per merged hyperedge: its PRE-compaction window-local vertex list —
+    /// what `dem::prediction_flips` XOR-reduces into the detector flips a
+    /// cached decode explains (local ids: the global mapping differs per
+    /// window instance sharing this cache entry)
+    pub hyperedge_vertices: Arc<Vec<Vec<u64>>>,
+    /// per merged hyperedge: whether its owning gadget is in the commit region
+    /// (window coordinator) — the DEM flips/fired must count ONLY these, to
+    /// match `update_pauli_frame`'s `committing_cids` filter. `None` when every
+    /// hyperedge commits (monolithic). Cache-stable: `committing_local_cids` is
+    /// part of the decoder cache key, so windows sharing an entry agree here.
+    pub committed: Option<Arc<Vec<bool>>>,
+    /// post-compaction vertex count of the loaded hypergraph, for O(1)
+    /// WindowTiming.num_vertices on cache hits
+    pub vertex_num: u64,
 }
 
 pub struct Gadget {
@@ -166,12 +200,15 @@ pub struct Gadget {
     pub binding_cid: watch::Sender<Option<u64>>,
     /// the peer gadgets' gid connected to each output port
     pub outputs: Vec<watch::Sender<Option<bin::gadget::Connector>>>,
-    /// oneshot channel to send over the readout values; note that only the last
-    /// loaded gadget is responsible for running the actual decoding, while the rest
-    /// of them simply listen to the receiver channel,
-    pub tx: oneshot::Sender<BitVector>,
+    /// oneshot channel to send over the `(readouts, detectors)` values; note that
+    /// only the last loaded gadget is responsible for running the actual decoding,
+    /// while the rest of them simply listen to the receiver channel. Detectors ride
+    /// this channel (computed by `decode_subgraph` while the subgraph state is still
+    /// alive) because `take_subgraph` drains the gadgets/check_models out of `self`
+    /// before `decode` returns — so `decode` can no longer compute them itself.
+    pub tx: oneshot::Sender<(BitVector, BitVector)>,
     /// the receiver of the channel will be taken out by the async task
-    pub rx: Option<oneshot::Receiver<BitVector>>,
+    pub rx: Option<oneshot::Receiver<(BitVector, BitVector)>>,
 }
 
 pub struct CheckModel {
@@ -202,6 +239,12 @@ impl MonolithicCoordinator {
         } else {
             None
         };
+        // Deliberate deviation from the fork (whose DemLog default is enabled):
+        // the server starts with DEM recording OFF so stats-only shots pay no
+        // accumulation cost. The playground turns it on per replay shot via the
+        // `set_dem_enabled` RPC (Task 8).
+        let dem_log: Arc<coordinator::dem::DemLog> = Default::default();
+        dem_log.set_enabled(false);
         Self {
             config,
             port_types: Default::default(),
@@ -222,6 +265,9 @@ impl MonolithicCoordinator {
             cancellation: RwLock::new(CancellationToken::new()),
             task_counter: TaskCounter::new(),
             loss_imputation_rng,
+            dem_log,
+            timing_log: Default::default(),
+            outcome_arrivals: Default::default(),
         }
     }
 
@@ -234,6 +280,49 @@ impl MonolithicCoordinator {
     pub async fn cancel_pending(&self) {
         let token = self.cancellation.read().await;
         token.cancel();
+    }
+
+    /// Enable/disable DEM recording. The server starts disabled (see `new`);
+    /// the playground turns it on per replay shot via the `set_dem_enabled` RPC.
+    pub fn set_dem_enabled(&self, enabled: bool) {
+        self.dem_log.set_enabled(enabled);
+    }
+
+    /// Drain DEM increments. `final_flush` waits for all spawned expansion
+    /// tasks first, then falls back to reading the expansion watches of the
+    /// error models still in the map, recovering any missed async-hook
+    /// resolution. Remote slots normally resolve via the async expansion
+    /// task's hook (async_expand=true) or the synchronous decode-time
+    /// batch_expand hook (async_expand=false); models already taken out by a
+    /// decode are no longer visible to this fallback and rely on those hooks.
+    /// CAUTION: `task_counter` also guards in-flight `decode()` calls —
+    /// only call with `final_flush=true` after all decodes have completed.
+    pub async fn drain_dem(&self, final_flush: bool) -> coordinator::dem::DemDrain {
+        if final_flush {
+            self.task_counter.wait_for_zero().await;
+            if self.dem_log.has_pending() {
+                let error_models = self.error_models.read().await;
+                for (eid, em) in error_models.iter() {
+                    if let Some(expanded) = em.expanded_remote_check_models.borrow().as_ref() {
+                        // guarded: a cancelled expansion can leave a truncated
+                        // vector in the watch (e.g. a remote gadget consumed by
+                        // take_subgraph before binding, or reset() racing this
+                        // flush)
+                        self.dem_log
+                            .on_remotes_resolved_guarded(*eid, expanded, em.modified_remote_check_models.len());
+                    }
+                }
+            }
+        }
+        self.dem_log.drain()
+    }
+
+    pub fn drain_dem_predictions(&self) -> Vec<coordinator::dem::DemPrediction> {
+        self.dem_log.drain_predictions()
+    }
+
+    pub fn drain_dem_predictions_for(&self, gid: u64) -> Vec<coordinator::dem::DemPrediction> {
+        self.dem_log.drain_predictions_for(gid)
     }
 
     /// gather all the gadgets in the connected subgraph starting from the given gid;
@@ -360,7 +449,7 @@ impl MonolithicCoordinator {
         }
 
         let check_models_locked = RwLock::new(check_models);
-        for error_model in error_models.values_mut() {
+        for (&eid, error_model) in error_models.iter_mut() {
             let expanded_remote_check_models = Self::expand_remote_check_models(
                 &error_model.instance,
                 &error_model.modified_remote_check_models,
@@ -369,6 +458,16 @@ impl MonolithicCoordinator {
                 token.clone(),
             )
             .await;
+            // report the resolved slots to the DEM increment log: with
+            // async_expand=false this synchronous decode-time expansion is the
+            // ONLY resolution source (take_subgraph already removed these
+            // error models from self.error_models, so neither the async task
+            // hook nor the drain_dem watch-reading fallback can see them).
+            self.dem_log.on_remotes_resolved_guarded(
+                eid,
+                &expanded_remote_check_models,
+                error_model.modified_remote_check_models.len(),
+            );
             error_model
                 .expanded_remote_check_models
                 .send_replace(Some(expanded_remote_check_models));
@@ -442,17 +541,93 @@ impl MonolithicCoordinator {
         let (relative_program, mapping) = RelativeProgram::new(&expanded_gadgets);
 
         let (parity_factor, errors) = self
-            .decode_parity_factor(&relative_program, &mapping, &gadgets, &check_models, &error_models)
+            .decode_parity_factor(gid, &relative_program, &mapping, &gadgets, &check_models, &error_models)
             .await;
 
         let updates = self
             .update_pauli_frame(&parity_factor, &errors, &relative_program, &mapping, &error_models)
             .await;
 
+        // Compute detectors for every gadget while the subgraph state is still
+        // alive. `decode` used to compute these itself after `rx.await`, but by then
+        // `take_subgraph` has removed the gadgets/check_models from `self`, so the
+        // lookup found nothing and every detector bus came back empty (the DEM view
+        // then left every detector node "unmeasured"). They ride the readout channel
+        // instead. Detectors are a pure function of the loaded outcomes.
+        let mut detectors_of: HashMap<u64, BitVector> = HashMap::new();
+        for &gid in gid_vec.iter() {
+            let detectors = self.get_gadget_detectors(gid, &gadgets, &check_models).await;
+            detectors_of.insert(gid, detectors);
+        }
+
         for (gid, readouts) in updates {
             let gadget = gadgets.remove(&gid).unwrap();
-            let _ = gadget.tx.send(readouts);
+            let detectors = detectors_of
+                .remove(&gid)
+                .unwrap_or_else(|| bit_vector::from_sparse_indices(0, &[]));
+            let _ = gadget.tx.send((readouts, detectors));
         }
+    }
+
+    /// The monolithic coordinator computes detectors as part of the full-subgraph
+    /// decode, so it has no early standalone syndrome to surface ahead of the
+    /// decode; callers still receive detectors via the normal decode result.
+    /// Early standalone detectors are a window-coordinator feature — return an
+    /// empty bus here so the split-decode API is uniform across coordinators.
+    pub async fn wait_for_detectors(&self, _gid: u64) -> Result<BitVector, Status> {
+        Ok(bit_vector::from_sparse_indices(0, &[]))
+    }
+
+    /// Compute one gadget's finished-detector bits from its bound check model,
+    /// reusing the same defect computation as `get_syndrome` but for a single
+    /// check model indexed from 0. Returns an empty `BitVector` if the gadget has
+    /// no bound check model or its check model defines no checks.
+    async fn get_gadget_detectors(
+        &self,
+        gid: u64,
+        gadgets: &HashMap<u64, Gadget>,
+        check_models: &HashMap<u64, CheckModel>,
+    ) -> BitVector {
+        let gadget = match gadgets.get(&gid) {
+            Some(g) => g,
+            None => return bit_vector::from_sparse_indices(0, &[]),
+        };
+        let cid = match *gadget.binding_cid.borrow() {
+            Some(cid) => cid,
+            None => return bit_vector::from_sparse_indices(0, &[]),
+        };
+        let check_model = match check_models.get(&cid) {
+            Some(cm) => cm,
+            None => return bit_vector::from_sparse_indices(0, &[]),
+        };
+        let check_model_types = self.check_model_types.read().await;
+        let check_model_type = check_model_types.get(&check_model.instance.ctype).unwrap();
+        let n = check_model_type.checks.len();
+        let mut detectors = bit_vector::from_sparse_indices(n as u64, &[]);
+        let expanded_remote_ref = check_model.expanded_remote_gadgets.borrow();
+        let expanded_remotes = expanded_remote_ref.as_ref();
+        let local_outcomes = gadget.outcomes.as_ref().unwrap();
+        for (check_index, check) in check_model_type.checks.iter().enumerate() {
+            let mut is_defect = check.naturally_flipped;
+            for measurement in &check.measurements {
+                if let Some(ri) = measurement.remote_gadget {
+                    let remote_gid = expanded_remotes.unwrap()[ri as usize].unwrap();
+                    let remote_gadget = gadgets.get(&remote_gid).unwrap();
+                    is_defect ^= get_bit(
+                        remote_gadget.outcomes.as_ref().unwrap(),
+                        measurement.measurement_index
+                            + check_model.modified_remote_gadgets[ri as usize]
+                                .as_ref()
+                                .unwrap()
+                                .measurement_bias,
+                    );
+                } else {
+                    is_defect ^= get_bit(local_outcomes, measurement.measurement_index);
+                }
+            }
+            set_bit(&mut detectors, check_index as u64, is_defect);
+        }
+        detectors
     }
 
     async fn update_pauli_frame(
@@ -512,14 +687,51 @@ impl MonolithicCoordinator {
 
     async fn decode_parity_factor(
         &self,
+        gid: u64,
         relative_program: &RelativeProgram,
         mapping: &RelativeMapping,
         gadgets: &HashMap<u64, Gadget>,
         check_models: &HashMap<u64, CheckModel>,
         error_models: &HashMap<u64, ErrorModel>,
     ) -> (blackbox_decoder::ParityFactor, Arc<Vec<ErrorIndex>>) {
+        // Always-on per-decode timing (mirrors WindowCoordinator::decode_parity_factor,
+        // Task 3). Monolithic has no per-window readiness event, so decode entry is
+        // the spec-blessed approximation for `syndrome_ready_ns`; there is exactly
+        // one "window" here (the whole connected subgraph), so `concurrent_decodes`
+        // is always 1 (monolithic never decodes two overlapping windows at once).
+        let decode_start_ns = crate::misc::util::timestamp_ns();
+        let mut timing = coordinator::WindowTiming {
+            syndrome_ready_ns: decode_start_ns,
+            // Monolithic has no per-window readiness event; both window-formation
+            // stamps approximate with the decode entry (mirrors syndrome_ready_ns).
+            leader_arrived_ns: decode_start_ns,
+            mandatory_ready_ns: decode_start_ns,
+            decode_start_ns,
+            concurrent_decodes: 1,
+            ..Default::default()
+        };
+
         // calculate syndrome
         let syndrome = self.get_syndrome(relative_program, mapping, gadgets, check_models).await;
+        timing.syndrome_weight = syndrome.data.iter().map(|b| b.count_ones()).sum::<u32>();
+        timing.syndrome_bytes = syndrome.data.len() as u64;
+
+        // `window_gids`/`num_gadgets`/`num_committing` must all derive from the
+        // SAME gadget set: the `gadgets` map is the actual connected subgraph
+        // monolithic is deciding over (NOT `mapping.global_gid_of`, which can
+        // additionally include outside-window error-only gadgets on other
+        // coordinators — see the WindowCoordinator regression fix this mirrors).
+        // Monolithic always commits every gadget in that subgraph at once, so
+        // `num_committing == num_gadgets == window_gids.len()` holds trivially.
+        timing.window_gids = {
+            let mut gids: Vec<u64> = gadgets.keys().cloned().collect();
+            gids.sort();
+            gids
+        };
+        timing.num_gadgets = gadgets.len() as u32;
+        timing.num_committing = timing.num_gadgets;
+        // Monolithic commits the whole subgraph.
+        timing.commit_region_gids = timing.window_gids.clone();
 
         let cache_key = if self.config.persistent_decoder {
             let error_model_types = self.error_model_types.read().await;
@@ -537,6 +749,10 @@ impl MonolithicCoordinator {
             let loaded = loaded_decoders.get(cache_key);
             if let Some(loaded) = loaded {
                 // we can use the loaded decoding hypergraph to call the decoding service
+                timing.path = coordinator::DecodePath::CacheHit as i32;
+                timing.num_hyperedges = loaded.hyperedge_vertices.len() as u32;
+                timing.num_vertices = loaded.vertex_num as u32;
+                let decode_started = std::time::Instant::now();
                 let parity_factor = self
                     .black_box_decoder
                     .clone()
@@ -546,21 +762,41 @@ impl MonolithicCoordinator {
                     })
                     .await
                     .unwrap();
+                timing.decode_ns = decode_started.elapsed().as_nanos() as u64;
+                timing.decoder_compute_ns = parity_factor.compute_ns;
+                timing.correction_weight = parity_factor.subgraph.len() as u32;
+                timing.parity_factor_bytes = parity_factor.encoded_len() as u64;
                 if self.config.assert_parity_factor {
                     assert_parity_factor(loaded.decoding_hypergraph.as_ref().unwrap(), &parity_factor, &syndrome);
                 }
+                self.record_dem_prediction(
+                    gid,
+                    &parity_factor,
+                    &loaded.errors,
+                    loaded.constituents.as_deref(),
+                    &loaded.hyperedge_vertices,
+                    mapping,
+                );
+                timing.decode_end_ns = crate::misc::util::timestamp_ns();
+                timing.cache_size = self.loaded_decoders.read().await.len() as u32;
+                self.timing_log.push(timing);
                 return (parity_factor, loaded.errors.clone());
             }
         }
 
         // when the decoder is not available, construct a monolithic decoding hypergraph
         // and instantiate such a decoder
+        let build_started = std::time::Instant::now();
         let (mut decoding_hypergraph, mut errors) = self
             .decoding_hypergraph(relative_program, mapping, check_models, error_models)
             .await;
+        timing.build_ns = build_started.elapsed().as_nanos() as u64;
+        let mut constituents = None;
 
         // merge the decoding hypergraph edges if their syndromes are the same
         if self.config.merge_hyperedges {
+            let merge_started = std::time::Instant::now();
+            let original_errors = errors.clone();
             let mut original_to_merged = Vec::with_capacity(errors.len());
             let mut merged: HashMap<Vec<u64>, (usize, f64)> = HashMap::new();
             let mut merged_hyperedges: Vec<Hyperedge> = Vec::with_capacity(errors.len());
@@ -596,11 +832,27 @@ impl MonolithicCoordinator {
                 vertex_num: decoding_hypergraph.vertex_num,
                 hyperedges: merged_hyperedges,
             };
+            let mut constituent_vec: Vec<Vec<ErrorIndex>> = vec![Vec::new(); merged_errors.len()];
+            for (orig_idx, &mi) in original_to_merged.iter().enumerate() {
+                constituent_vec[mi].push(original_errors[orig_idx].clone());
+            }
+            constituents = Some(Arc::new(constituent_vec));
             errors = Arc::new(merged_errors);
+            timing.merge_ns = merge_started.elapsed().as_nanos() as u64;
         }
+        // Vertex lists per (merged) hyperedge — the monolithic path never
+        // compacts, so these are the final local indices the DEM flips map
+        // back to global (cid, idx).
+        let hyperedge_vertices: Arc<Vec<Vec<u64>>> =
+            Arc::new(decoding_hypergraph.hyperedges.iter().map(|h| h.vertices.clone()).collect());
         let decoding_hypergraph = Arc::new(decoding_hypergraph);
+        timing.num_hyperedges = decoding_hypergraph.hyperedges.len() as u32;
+        timing.num_vertices = decoding_hypergraph.vertex_num as u32;
+        timing.hypergraph_bytes = decoding_hypergraph.as_ref().encoded_len() as u64;
 
         let parity_factor = if let Some(cache_key) = cache_key {
+            timing.path = coordinator::DecodePath::BuiltLoaded as i32;
+            let load_started = std::time::Instant::now();
             let hid = self
                 .black_box_decoder
                 .clone()
@@ -608,41 +860,132 @@ impl MonolithicCoordinator {
                 .await
                 .unwrap()
                 .hid;
+            timing.load_ns = load_started.elapsed().as_nanos() as u64;
             let mut loaded_decoders = self.loaded_decoders.write().await;
             loaded_decoders.insert(
                 cache_key,
                 LoadedDecoder {
                     hid,
                     errors: errors.clone(),
+                    constituents: constituents.clone(),
                     decoding_hypergraph: self.config.assert_parity_factor.then_some(decoding_hypergraph.clone()),
                     vertex_remap: None,
+                    hyperedge_vertices: hyperedge_vertices.clone(),
+                    // monolithic decodes the whole subgraph at once: all committed
+                    committed: None,
+                    vertex_num: decoding_hypergraph.vertex_num,
                 },
             );
             drop(loaded_decoders);
-            self.black_box_decoder
+            let decode_started = std::time::Instant::now();
+            let parity_factor = self
+                .black_box_decoder
                 .clone()
                 .decode_loaded(blackbox_decoder::LoadedDecodingProblem {
                     hid,
                     syndrome: Some(syndrome.clone()),
                 })
                 .await
-                .unwrap()
+                .unwrap();
+            timing.decode_ns = decode_started.elapsed().as_nanos() as u64;
+            parity_factor
         } else {
-            self.black_box_decoder
+            timing.path = coordinator::DecodePath::Temporary as i32;
+            let decode_started = std::time::Instant::now();
+            let parity_factor = self
+                .black_box_decoder
                 .clone()
                 .decode(blackbox_decoder::DecodingProblem {
                     hypergraph: Some(decoding_hypergraph.as_ref().clone()),
                     syndrome: Some(syndrome.clone()),
                 })
                 .await
-                .unwrap()
+                .unwrap();
+            timing.decode_ns = decode_started.elapsed().as_nanos() as u64;
+            parity_factor
         };
+        timing.decoder_compute_ns = parity_factor.compute_ns;
+        timing.correction_weight = parity_factor.subgraph.len() as u32;
+        timing.parity_factor_bytes = parity_factor.encoded_len() as u64;
 
         if self.config.assert_parity_factor {
             assert_parity_factor(&decoding_hypergraph, &parity_factor, &syndrome);
         }
 
+        self.record_dem_prediction(
+            gid,
+            &parity_factor,
+            &errors,
+            constituents.as_deref(),
+            &hyperedge_vertices,
+            mapping,
+        );
+        timing.decode_end_ns = crate::misc::util::timestamp_ns();
+        timing.cache_size = self.loaded_decoders.read().await.len() as u32;
+        self.timing_log.push(timing);
         (parity_factor, errors)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_dem_prediction(
+        &self,
+        gid: u64,
+        parity_factor: &blackbox_decoder::ParityFactor,
+        errors: &[ErrorIndex],
+        constituents: Option<&Vec<Vec<ErrorIndex>>>,
+        hyperedge_vertices: &[Vec<u64>],
+        mapping: &RelativeMapping,
+    ) {
+        // Zero-overhead contract for stats-only shots: skip all membership/flip
+        // computation when the DEM log is disabled (push_prediction would no-op).
+        if !self.dem_log.is_enabled() {
+            return;
+        }
+        let mut fired = vec![];
+        let mut push = |local: &ErrorIndex| {
+            fired.push((mapping.global_eid_of[local.eid as usize], local.error_index));
+        };
+        for &ei in parity_factor.subgraph.iter() {
+            match constituents {
+                Some(cons) => cons[ei as usize].iter().for_each(&mut push),
+                None => push(&errors[ei as usize]),
+            }
+        }
+        // Monolithic decodes the whole subgraph at once: every decoded mechanism is
+        // committed, nothing is tentative.
+        let mut committed_edges = vec![];
+        for ei in 0..hyperedge_vertices.len() {
+            let mut push = |local: &ErrorIndex| {
+                committed_edges.push((mapping.global_eid_of[local.eid as usize], local.error_index));
+            };
+            match constituents {
+                Some(cons) => cons[ei].iter().for_each(&mut push),
+                None => push(&errors[ei]),
+            }
+        }
+        let flips = coordinator::dem::prediction_flips(
+            &parity_factor.subgraph,
+            hyperedge_vertices,
+            None, // monolithic: every hyperedge is committed
+            None, // monolithic: every vertex is in the commit region
+            &mapping.start_indices,
+            &mapping.global_cid_of,
+        );
+        debug_assert!(
+            fired.iter().all(|e| committed_edges.contains(e)),
+            "fired must be a subset of committed_edges"
+        );
+        self.dem_log.push_prediction(coordinator::dem::DemPrediction {
+            gid,
+            // seq is assigned by push_prediction
+            window_gids: mapping.global_gid_of.clone(),
+            committed_edges,
+            buffer_edges: vec![],
+            fired,
+            fired_buffer: vec![],
+            flips,
+            ..Default::default()
+        });
     }
 
     async fn get_syndrome(
@@ -1130,6 +1473,11 @@ impl coordinator::coordinator_server::Coordinator for MonolithicCoordinator {
                 let modified_remote = Arc::new(modified_remote);
                 let mut check_model = check_model;
                 check_model.cid = cid;
+                // record the new detector group in the DEM increment log
+                // (record-only); announcing the cid may release pending DEM
+                // edges that reference it
+                self.dem_log
+                    .on_check_model(check_model.gid, cid, check_model_type.checks.len() as u64);
                 check_models.insert(
                     cid,
                     CheckModel {
@@ -1205,6 +1553,20 @@ impl coordinator::coordinator_server::Coordinator for MonolithicCoordinator {
                         expanded_remote_check_models: watch::channel(None).0,
                     },
                 );
+                // record the new error mechanisms in the DEM increment log
+                // (record-only, probability modifiers folded in); remote slots
+                // resolve later via the expansion task's on_remotes_resolved.
+                // is_enabled guard: effective_errors clones the etype's whole
+                // error list — skip it entirely when the log is off.
+                if self.dem_log.is_enabled() {
+                    self.dem_log.on_error_model(
+                        check_model.instance.gid,
+                        eid,
+                        error_model.cid,
+                        coordinator::dem::effective_errors(error_model_type, &error_model),
+                        &modified_remote,
+                    );
+                }
                 // expanding the remote check models may not be immediately possible if the gadgets
                 // are not instantiated yet, so we spawn an async task to do it.
                 let gadgets = self.gadgets.clone();
@@ -1213,6 +1575,7 @@ impl coordinator::coordinator_server::Coordinator for MonolithicCoordinator {
                 if self.config.async_expand {
                     let token = self.cancellation.read().await.clone();
                     let _guard = self.task_counter.guard();
+                    let dem_log = self.dem_log.clone();
                     tokio::spawn(async move {
                         let _guard = _guard;
                         let expanded_remote_check_models = Self::expand_remote_check_models(
@@ -1223,6 +1586,9 @@ impl coordinator::coordinator_server::Coordinator for MonolithicCoordinator {
                             token,
                         )
                         .await;
+                        // report the resolved slots to the DEM increment log
+                        // (before the vec is moved into the watch)
+                        dem_log.on_remotes_resolved_guarded(eid, &expanded_remote_check_models, modified_remote.len());
                         let mut error_models = error_models.write().await;
                         if let Some(em) = error_models.get_mut(&eid) {
                             em.expanded_remote_check_models
@@ -1263,6 +1629,13 @@ impl coordinator::coordinator_server::Coordinator for MonolithicCoordinator {
             coordinator::apply_loss_random_imputation(&mut outcome_data, loss_mask, &mut *rng);
         }
         gadget.outcomes.replace(outcome_data);
+        // First-arrival stamp: the early return above on `is_some()` guarantees
+        // this is the None→Some transition. Monolithic's submit_outcomes is a
+        // no-op, so decode() is the only place outcomes are set.
+        self.outcome_arrivals.lock().unwrap().push(coordinator::OutcomeArrival {
+            gid,
+            received_ns: crate::misc::util::timestamp_ns(),
+        });
         let mut pending_subgraphs = self.pending_subgraphs.lock().await;
         let gid_to_union_index = self.gid_to_union_index.lock().await;
         let union_index = gid_to_union_index[&gid];
@@ -1292,10 +1665,15 @@ impl coordinator::coordinator_server::Coordinator for MonolithicCoordinator {
             // and inform all other async tasks
             self.decode_subgraph(gid).await;
         }
-        let readouts = rx.await.map_err(|_| Status::internal(format!("gid={} receive error", gid)))?;
+        // Detectors ride the readout channel: `decode_subgraph` computed them while
+        // the subgraph gadgets/check_models were still resident. Re-reading them from
+        // `self` here would find nothing, because `take_subgraph` (invoked by the
+        // final gadget's `decode_subgraph`) has already drained them out.
+        let (readouts, detectors) = rx.await.map_err(|_| Status::internal(format!("gid={} receive error", gid)))?;
         return Ok((coordinator::Readouts {
             gid,
             readouts: Some(readouts),
+            detectors: Some(detectors),
             ..Default::default()
         })
         .into());
@@ -1323,6 +1701,9 @@ impl coordinator::coordinator_server::Coordinator for MonolithicCoordinator {
         self.gadgets.write().await.clear();
         self.check_models.write().await.clear();
         self.error_models.write().await.clear();
+        self.dem_log.reset();
+        self.timing_log.reset();
+        self.outcome_arrivals.lock().unwrap().clear();
         *self.next_gid.lock().await = 1;
         *self.next_cid.lock().await = 1;
         *self.next_eid.lock().await = 1;
@@ -1344,6 +1725,63 @@ impl coordinator::coordinator_server::Coordinator for MonolithicCoordinator {
             loaded_decoders.clear();
         }
         Ok(().into())
+    }
+
+    /// The monolithic coordinator only decodes once every output port is
+    /// connected and all measurements are loaded, so it surfaces detectors
+    /// through `decode`; publishing outcomes early is a no-op.
+    async fn submit_outcomes(&self, _request: Request<coordinator::Outcomes>) -> Result<Response<()>, Status> {
+        Ok(Response::new(()))
+    }
+
+    async fn wait_for_detectors(
+        &self,
+        request: Request<coordinator::DetectorRequest>,
+    ) -> Result<Response<coordinator::Readouts>, Status> {
+        let gid = request.into_inner().gid;
+        let detectors = self.wait_for_detectors(gid).await?;
+        Ok(Response::new(coordinator::Readouts {
+            gid,
+            detectors: Some(detectors),
+            ..Default::default()
+        }))
+    }
+
+    // ─── DEM gRPC surface (Task 8) ───────────────────────────────────────
+    // Non-blocking drain (see the WindowCoordinator handler for the rationale
+    // — the Empty request carries no `final_flush` flag).
+
+    async fn drain_dem(&self, _request: Request<()>) -> Result<Response<coordinator::DemDrainResponse>, Status> {
+        Ok(Response::new(self.drain_dem(false).await.into()))
+    }
+
+    async fn drain_dem_predictions(
+        &self,
+        request: Request<coordinator::DemPredictionsRequest>,
+    ) -> Result<Response<coordinator::DemPredictionsResponse>, Status> {
+        let predictions = match request.into_inner().gid {
+            Some(gid) => self.drain_dem_predictions_for(gid),
+            None => self.drain_dem_predictions(),
+        };
+        Ok(Response::new(coordinator::DemPredictionsResponse {
+            predictions: predictions.into_iter().map(Into::into).collect(),
+        }))
+    }
+
+    async fn set_dem_enabled(&self, request: Request<coordinator::DemEnabledRequest>) -> Result<Response<()>, Status> {
+        self.set_dem_enabled(request.into_inner().enabled);
+        Ok(Response::new(()))
+    }
+
+    async fn drain_window_timings(
+        &self,
+        _request: Request<()>,
+    ) -> Result<Response<coordinator::WindowTimingsResponse>, Status> {
+        Ok(Response::new(coordinator::WindowTimingsResponse {
+            timings: self.timing_log.drain(),
+            drained_at_ns: crate::misc::util::timestamp_ns(),
+            outcome_arrivals: std::mem::take(&mut self.outcome_arrivals.lock().unwrap()),
+        }))
     }
 }
 
@@ -1548,5 +1986,773 @@ mod tests {
         let fps_a = build_modifier_fingerprints(&mapping, &models_a, &emts);
         let fps_b = build_modifier_fingerprints(&mapping, &models_b, &emts);
         assert_eq!(fps_a, fps_b);
+    }
+
+    // ─── get_gadget_detectors ────────────────────────────────────────────
+    //
+    // `get_gadget_detectors` mirrors the per-check defect computation in
+    // `get_syndrome`, but for a single gadget's bound check model indexed from
+    // 0. These tests pin down that the detector bits it produces match the
+    // corresponding slice of the full syndrome.
+    use crate::bin::check_model_type::{Check, RemoteGadget, RemoteMeasurement};
+
+    /// Build a `CheckModelType` whose checks are pure local-measurement parities.
+    /// Each entry of `checks` is the list of local measurement indices XORed
+    /// together for that check.
+    fn local_check_model_type(ctype: u64, checks: &[&[u64]]) -> bin::CheckModelType {
+        bin::CheckModelType {
+            ctype,
+            checks: checks
+                .iter()
+                .map(|measurement_indices| Check {
+                    measurements: measurement_indices
+                        .iter()
+                        .map(|&measurement_index| RemoteMeasurement {
+                            remote_gadget: None,
+                            measurement_index,
+                        })
+                        .collect(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Construct a local `Gadget` carrying the given outcome bits.
+    fn gadget_with_outcomes(gid: u64, gtype: u64, binding_cid: Option<u64>, outcomes: BitVector) -> Gadget {
+        let (tx, rx) = oneshot::channel();
+        Gadget {
+            instance: bin::Gadget {
+                gid,
+                gtype,
+                ..Default::default()
+            },
+            outcomes: Some(outcomes),
+            binding_cid: watch::channel(binding_cid).0,
+            outputs: vec![],
+            tx,
+            rx: Some(rx),
+        }
+    }
+
+    /// Construct a local `CheckModel` bound to `gid`/`ctype` with no remotes.
+    fn local_check_model(cid: u64, ctype: u64, gid: u64) -> CheckModel {
+        CheckModel {
+            instance: bin::CheckModel {
+                cid,
+                ctype,
+                gid,
+                ..Default::default()
+            },
+            attaching_eid_vec: vec![],
+            modified_remote_gadgets: Arc::new(vec![]),
+            expanded_remote_gadgets: watch::channel(Some(vec![])).0,
+        }
+    }
+
+    #[tokio::test]
+    async fn gadget_detectors_match_syndrome_slice() {
+        // ctype=10: two finished checks over local measurements [0,1] and [1,2].
+        let ctype = 10;
+        let coordinator = MonolithicCoordinator::new(
+            serde_json::json!({}),
+            BlackBoxDecoderClient::from_mock(Arc::new(crate::decoder::MockDecoder::new())),
+        );
+        coordinator
+            .check_model_types
+            .write()
+            .await
+            .insert(ctype, Arc::new(local_check_model_type(ctype, &[&[0, 1], &[1, 2]])));
+
+        // outcomes = 0b110 (bit0=0, bit1=1, bit2=1): m0^m1 = 1, m1^m2 = 0.
+        let gid = 1;
+        let cid = 1;
+        let outcomes = bit_vector::from_sparse_indices(3, &[1, 2]);
+        let mut gadgets: HashMap<u64, Gadget> = HashMap::new();
+        gadgets.insert(gid, gadget_with_outcomes(gid, /* gtype */ 0, Some(cid), outcomes));
+        let mut check_models: HashMap<u64, CheckModel> = HashMap::new();
+        check_models.insert(cid, local_check_model(cid, ctype, gid));
+
+        let detectors = coordinator.get_gadget_detectors(gid, &gadgets, &check_models).await;
+        assert_eq!(detectors.size, 2);
+        assert_eq!(bit_vector::to_sparse_indices(&detectors), vec![0]);
+    }
+
+    #[tokio::test]
+    async fn gadget_detectors_empty_when_no_binding() {
+        // A gadget with no bound check model yields a zero-length detector vector.
+        let coordinator = MonolithicCoordinator::new(
+            serde_json::json!({}),
+            BlackBoxDecoderClient::from_mock(Arc::new(crate::decoder::MockDecoder::new())),
+        );
+        let gid = 1;
+        let mut gadgets: HashMap<u64, Gadget> = HashMap::new();
+        gadgets.insert(
+            gid,
+            gadget_with_outcomes(
+                gid,
+                /* gtype */ 0,
+                /* binding_cid */ None,
+                bit_vector::from_sparse_indices(2, &[0]),
+            ),
+        );
+        let check_models: HashMap<u64, CheckModel> = HashMap::new();
+
+        let detectors = coordinator.get_gadget_detectors(gid, &gadgets, &check_models).await;
+        assert_eq!(detectors.size, 0);
+    }
+
+    #[tokio::test]
+    async fn gadget_detectors_use_remote_measurement_with_bias() {
+        // ctype=20: one finished check mixing a local measurement (index 0) and a
+        // remote measurement (remote_gadget index 0, measurement_index 1) whose
+        // remote gadget carries measurement_bias=2, so the remote bit actually
+        // read is index 1+2=3.
+        let ctype = 20;
+        let coordinator = MonolithicCoordinator::new(
+            serde_json::json!({}),
+            BlackBoxDecoderClient::from_mock(Arc::new(crate::decoder::MockDecoder::new())),
+        );
+        let check_model_type = bin::CheckModelType {
+            ctype,
+            checks: vec![Check {
+                measurements: vec![
+                    RemoteMeasurement {
+                        remote_gadget: None,
+                        measurement_index: 0,
+                    },
+                    RemoteMeasurement {
+                        remote_gadget: Some(0),
+                        measurement_index: 1,
+                    },
+                ],
+                naturally_flipped: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        coordinator
+            .check_model_types
+            .write()
+            .await
+            .insert(ctype, Arc::new(check_model_type));
+
+        let gid = 1;
+        let cid = 1;
+        let remote_gid = 2;
+        // local outcomes: bit 0 set → local term = 1.
+        let local_outcomes = bit_vector::from_sparse_indices(1, &[0]);
+        // remote outcomes: bit 1 set, bit 3 clear. With bias=2 the check reads
+        // bit 3 (=0), NOT bit 1 (=1) — so a bug ignoring the bias would flip the
+        // result. Expected: 0 (naturally_flipped) ^ 1 (local) ^ 0 (remote) = 1.
+        let remote_outcomes = bit_vector::from_sparse_indices(4, &[1]);
+
+        let mut gadgets: HashMap<u64, Gadget> = HashMap::new();
+        gadgets.insert(gid, gadget_with_outcomes(gid, /* gtype */ 0, Some(cid), local_outcomes));
+        gadgets.insert(
+            remote_gid,
+            gadget_with_outcomes(remote_gid, /* gtype */ 0, None, remote_outcomes),
+        );
+
+        let mut check_models: HashMap<u64, CheckModel> = HashMap::new();
+        check_models.insert(
+            cid,
+            CheckModel {
+                instance: bin::CheckModel {
+                    cid,
+                    ctype,
+                    gid,
+                    ..Default::default()
+                },
+                attaching_eid_vec: vec![],
+                modified_remote_gadgets: Arc::new(vec![Some(RemoteGadget {
+                    measurement_bias: 2,
+                    ..Default::default()
+                })]),
+                expanded_remote_gadgets: watch::channel(Some(vec![Some(remote_gid)])).0,
+            },
+        );
+
+        // Sanity: confirm the bias is load-bearing for this fixture.
+        assert!(!get_bit(&gadgets[&remote_gid].outcomes.as_ref().unwrap().clone(), 3));
+        assert!(get_bit(&gadgets[&remote_gid].outcomes.as_ref().unwrap().clone(), 1));
+
+        let detectors = coordinator.get_gadget_detectors(gid, &gadgets, &check_models).await;
+        assert_eq!(detectors.size, 1);
+        // 0 ^ local(1) ^ remote@3(0) = 1.
+        assert_eq!(bit_vector::to_sparse_indices(&detectors), vec![0]);
+    }
+
+    // ─── DEM increment log (ported from fork DEM family; note the deliberate
+    // deviation: the coordinator starts DEM DISABLED, so each test enables it) ──
+    use crate::bin::error_model_type::{RemoteCheck, RemoteCheckModel};
+    use crate::coordinator::coordinator_server::Coordinator as _;
+    use crate::coordinator::dem::{DemDetectorGroup, DemEdge};
+    use crate::misc::bit_matrix::zeros;
+
+    /// A DEM-recording coordinator: MockDecoder-backed and, unlike the fork,
+    /// explicitly enabled (the server default is disabled).
+    fn dem_coordinator(config: serde_json::Value) -> MonolithicCoordinator {
+        let coordinator = MonolithicCoordinator::new(
+            config,
+            BlackBoxDecoderClient::from_mock(Arc::new(crate::decoder::MockDecoder::new())),
+        );
+        coordinator.set_dem_enabled(true);
+        coordinator
+    }
+
+    async fn execute_create(coordinator: &MonolithicCoordinator, create: bin::instruction::Create) -> u64 {
+        coordinator
+            .execute(Request::new(bin::Instruction { create: Some(create) }))
+            .await
+            .unwrap()
+            .into_inner()
+            .id
+    }
+
+    // ─── decode-time prediction recording ────────────────────────────────
+    // The fork drives these with a real BP `LocalDecoder`; the target's unit
+    // harness has only `MockDecoder`, so the fixture pins the decoder's returned
+    // subgraph explicitly via `set_response` for the fixture's (deterministic)
+    // 1-bit syndrome. This exercises `record_dem_prediction`'s
+    // fired/committed_edges/global-id wiring at the coordinator level.
+
+    type PredictionFixture = (
+        RelativeProgram,
+        RelativeMapping,
+        HashMap<u64, Gadget>,
+        HashMap<u64, CheckModel>,
+        HashMap<u64, ErrorModel>,
+    );
+
+    fn local_prediction_fixture_with_ids(gid: u64, cid: u64, eid: u64) -> PredictionFixture {
+        let ctype = 401;
+        let etype = 501;
+        let expanded = vec![relative_program::ExpandedGadget {
+            gid,
+            gtype: 0,
+            inputs: vec![],
+            outputs: vec![],
+            check_model: Some(relative_program::ExpandedCheckModel {
+                cid,
+                ctype,
+                remote_gadgets: vec![],
+                count_checks: 1,
+            }),
+            error_models: vec![relative_program::ExpandedErrorModel {
+                eid,
+                etype,
+                remote_check_models: vec![],
+            }],
+        }];
+        let (relative_program, mapping) = RelativeProgram::new(&expanded);
+        let mut gadgets = HashMap::new();
+        gadgets.insert(
+            gid,
+            gadget_with_outcomes(gid, /* gtype */ 0, Some(cid), bit_vector::from_sparse_indices(1, &[0])),
+        );
+        let mut check_models = HashMap::new();
+        check_models.insert(
+            cid,
+            CheckModel {
+                instance: bin::CheckModel {
+                    cid,
+                    ctype,
+                    gid,
+                    ..Default::default()
+                },
+                attaching_eid_vec: vec![eid],
+                modified_remote_gadgets: Arc::new(vec![]),
+                expanded_remote_gadgets: watch::channel(Some(vec![])).0,
+            },
+        );
+        let mut error_models = HashMap::new();
+        error_models.insert(
+            eid,
+            ErrorModel {
+                instance: bin::ErrorModel {
+                    eid,
+                    etype,
+                    cid,
+                    ..Default::default()
+                },
+                modified_remote_check_models: Arc::new(vec![]),
+                expanded_remote_check_models: watch::channel(Some(vec![])).0,
+            },
+        );
+        (relative_program, mapping, gadgets, check_models, error_models)
+    }
+
+    fn local_prediction_fixture() -> PredictionFixture {
+        local_prediction_fixture_with_ids(101, 201, 301)
+    }
+
+    /// Build a DEM-enabled monolithic coordinator whose MockDecoder returns
+    /// subgraph `[0]` for the fixture's 1-bit syndrome (a single hyperedge
+    /// explaining the lone detector). Also registers the fixture's check/error
+    /// model types.
+    async fn coordinator_for_prediction_fixture(
+        config: serde_json::Value,
+        error_probabilities: Vec<f64>,
+    ) -> MonolithicCoordinator {
+        let mock = Arc::new(crate::decoder::MockDecoder::new());
+        // fixture syndrome: one check reading measurement 0 (=1) → single set bit.
+        mock.set_response(bit_vector::from_sparse_indices(1, &[0]).data, vec![0])
+            .await;
+        let coordinator = MonolithicCoordinator::new(config, BlackBoxDecoderClient::from_mock(mock));
+        coordinator.set_dem_enabled(true);
+        coordinator
+            .check_model_types
+            .write()
+            .await
+            .insert(401, Arc::new(local_check_model_type(401, &[&[0]])));
+        coordinator.error_model_types.write().await.insert(
+            501,
+            Arc::new(bin::ErrorModelType {
+                etype: 501,
+                ctype: 401,
+                errors: error_probabilities
+                    .into_iter()
+                    .map(|probability| Error {
+                        probability,
+                        checks: vec![RemoteCheck {
+                            remote_check_model: None,
+                            check_index: 0,
+                        }],
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }),
+        );
+        coordinator
+    }
+
+    #[tokio::test]
+    async fn decode_pushes_global_fired_prediction() {
+        let coordinator = coordinator_for_prediction_fixture(
+            serde_json::json!({ "persistent_decoder": false, "merge_hyperedges": false }),
+            vec![0.1],
+        )
+        .await;
+        let (relative_program, mapping, gadgets, check_models, error_models) = local_prediction_fixture();
+
+        let (_parity_factor, _errors) = coordinator
+            .decode_parity_factor(101, &relative_program, &mapping, &gadgets, &check_models, &error_models)
+            .await;
+
+        assert_eq!(
+            coordinator.dem_log.drain_predictions(),
+            vec![coordinator::dem::DemPrediction {
+                gid: 101,
+                window_gids: vec![101],
+                committed_edges: vec![(301, 0)],
+                fired: vec![(301, 0)],
+                fired_buffer: vec![],
+                flips: vec![(201, 0)],
+                ..Default::default()
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn decode_expands_merged_hyperedge_prediction_constituents() {
+        let coordinator =
+            coordinator_for_prediction_fixture(serde_json::json!({ "persistent_decoder": false }), vec![0.1, 0.09]).await;
+        let (relative_program, mapping, gadgets, check_models, error_models) = local_prediction_fixture();
+
+        let (_parity_factor, _errors) = coordinator
+            .decode_parity_factor(101, &relative_program, &mapping, &gadgets, &check_models, &error_models)
+            .await;
+
+        assert_eq!(
+            coordinator.dem_log.drain_predictions(),
+            vec![coordinator::dem::DemPrediction {
+                gid: 101,
+                window_gids: vec![101],
+                committed_edges: vec![(301, 0), (301, 1)],
+                fired: vec![(301, 0), (301, 1)],
+                fired_buffer: vec![],
+                flips: vec![(201, 0)],
+                ..Default::default()
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn decode_cache_hit_pushes_global_fired_prediction() {
+        let coordinator = coordinator_for_prediction_fixture(serde_json::json!({}), vec![0.1]).await;
+        let (relative_program, mapping, gadgets, check_models, error_models) = local_prediction_fixture();
+        let (cached_relative_program, cached_mapping, cached_gadgets, cached_check_models, cached_error_models) =
+            local_prediction_fixture_with_ids(102, 202, 301);
+
+        let (_parity_factor, _errors) = coordinator
+            .decode_parity_factor(101, &relative_program, &mapping, &gadgets, &check_models, &error_models)
+            .await;
+        let _ = coordinator.dem_log.drain_predictions();
+        let (_parity_factor, _errors) = coordinator
+            .decode_parity_factor(
+                102,
+                &cached_relative_program,
+                &cached_mapping,
+                &cached_gadgets,
+                &cached_check_models,
+                &cached_error_models,
+            )
+            .await;
+
+        assert_eq!(
+            coordinator.dem_log.drain_predictions(),
+            vec![coordinator::dem::DemPrediction {
+                gid: 102,
+                seq: 1,
+                window_gids: vec![102],
+                committed_edges: vec![(301, 0)],
+                fired: vec![(301, 0)],
+                fired_buffer: vec![],
+                flips: vec![(202, 0)],
+                ..Default::default()
+            }]
+        );
+    }
+
+    /// Build the minimal library for the DEM invariant test:
+    /// - a "source" gadget type (no inputs, one output port) and a "sink"
+    ///   gadget type (one input port, no outputs) so a two-gadget chain
+    ///   connects (a single 1-in/1-out type cannot start a chain because
+    ///   `Create::Gadget` asserts `connectors.len() == inputs.len()`);
+    /// - one check model type with 2 local checks (wildcard gtype);
+    /// - one error model type with two errors: e0 local (check 0, p=0.01)
+    ///   and e1 remote (check 1, p=0.02) via a JIT-style `absolute_cid=1`
+    ///   remote check model targeting the FIRST gadget's check model.
+    fn dem_invariant_library() -> bin::Library {
+        let port_type = bin::PortType {
+            ptype: 1,
+            observables: vec![bin::port_type::Observable::default()],
+            ..Default::default()
+        };
+        // matrix shapes satisfy PauliFrameTracker::add_gadget's debug_asserts
+        // (1 observable per port, no measurements, no readouts)
+        let source = bin::GadgetType {
+            gtype: 100,
+            outputs: vec![bin::gadget_type::Port {
+                ptype: 1,
+                ..Default::default()
+            }],
+            correction_propagation: Some(zeros(1, 1)),
+            readout_propagation: Some(zeros(0, 1)),
+            logical_correction: Some(zeros(1, 0)),
+            physical_correction: Some(zeros(1, 0)),
+            ..Default::default()
+        };
+        let sink = bin::GadgetType {
+            gtype: 101,
+            inputs: vec![bin::gadget_type::Port {
+                ptype: 1,
+                ..Default::default()
+            }],
+            correction_propagation: Some(zeros(0, 2)),
+            readout_propagation: Some(zeros(0, 2)),
+            logical_correction: Some(zeros(0, 0)),
+            physical_correction: Some(zeros(0, 0)),
+            ..Default::default()
+        };
+        let check_model_type = bin::CheckModelType {
+            ctype: 10,
+            gtype: WILDCARD, // attaches to both source and sink gadgets
+            checks: vec![Check::default(), Check::default()],
+            ..Default::default()
+        };
+        let error_model_type = bin::ErrorModelType {
+            etype: 20,
+            ctype: 10,
+            remote_check_models: vec![RemoteCheckModel {
+                absolute_cid: Some(1),
+                ..Default::default()
+            }],
+            errors: vec![
+                Error {
+                    probability: 0.01,
+                    checks: vec![RemoteCheck {
+                        remote_check_model: None,
+                        check_index: 0,
+                    }],
+                    ..Default::default()
+                },
+                Error {
+                    probability: 0.02,
+                    checks: vec![RemoteCheck {
+                        remote_check_model: Some(0),
+                        check_index: 1,
+                    }],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        bin::Library {
+            port_types: vec![port_type],
+            gadget_types: vec![source, sink],
+            check_model_types: vec![check_model_type],
+            error_model_types: vec![error_model_type],
+            ..Default::default()
+        }
+    }
+
+    /// Invariant test: everything goes through `execute()` (NOT direct map
+    /// inserts) so the growth hooks under test actually fire, including the
+    /// spawned expansion task's `on_remotes_resolved` for the JIT-style
+    /// `absolute_cid` remote reference.
+    #[tokio::test]
+    async fn dem_log_matches_execute_increments() {
+        let coordinator = dem_coordinator(serde_json::json!({}));
+        coordinator.load_library(Request::new(dem_invariant_library())).await.unwrap();
+
+        // g1 (source), c1 @ g1, g2 (sink connected to g1 port 0), c2 @ g2, e @ c2
+        let g1 = execute_create(
+            &coordinator,
+            bin::instruction::Create::Gadget(bin::Gadget {
+                gtype: 100,
+                ..Default::default()
+            }),
+        )
+        .await;
+        let c1 = execute_create(
+            &coordinator,
+            bin::instruction::Create::CheckModel(bin::CheckModel {
+                ctype: 10,
+                gid: g1,
+                ..Default::default()
+            }),
+        )
+        .await;
+        let g2 = execute_create(
+            &coordinator,
+            bin::instruction::Create::Gadget(bin::Gadget {
+                gtype: 101,
+                connectors: vec![bin::gadget::Connector { gid: g1, port: 0 }],
+                ..Default::default()
+            }),
+        )
+        .await;
+        let c2 = execute_create(
+            &coordinator,
+            bin::instruction::Create::CheckModel(bin::CheckModel {
+                ctype: 10,
+                gid: g2,
+                ..Default::default()
+            }),
+        )
+        .await;
+        let e = execute_create(
+            &coordinator,
+            bin::instruction::Create::ErrorModel(bin::ErrorModel {
+                etype: 20,
+                cid: c2,
+                ..Default::default()
+            }),
+        )
+        .await;
+        // ids auto-assign from 1 in execution order; the library's
+        // absolute_cid=1 therefore targets c1
+        assert_eq!((g1, c1, g2, c2, e), (1, 1, 2, 2, 1));
+
+        // wait for the spawned expansion tasks to settle (deterministic:
+        // execute() creates the task guard before spawning)
+        coordinator.task_counter.wait_for_zero().await;
+        // the on_remotes_resolved hook — not the drain_dem fallback —
+        // must have released the pending remote edge
+        assert!(!coordinator.dem_log.has_pending());
+
+        let drain = coordinator.dem_log.drain();
+        assert_eq!(
+            drain.detector_groups,
+            vec![
+                DemDetectorGroup {
+                    gid: g1,
+                    cid: c1,
+                    count: 2
+                },
+                DemDetectorGroup {
+                    gid: g2,
+                    cid: c2,
+                    count: 2
+                },
+            ]
+        );
+        // edges: e0 → [(cid_of_c2, 0)] (local), e1 → [(cid_of_c1, 1)] (absolute_cid path)
+        let mut dets: Vec<Vec<(u64, u64)>> = drain.edges.iter().map(|e| e.detectors.clone()).collect();
+        dets.sort();
+        assert_eq!(dets, vec![vec![(c1, 1)], vec![(c2, 0)]]);
+        // both edges belong to the one error model, with probabilities intact
+        assert!(drain.edges.iter().all(|edge| edge.eid == e));
+        let mut probabilities: Vec<f64> = drain.edges.iter().map(|e| e.probability).collect();
+        probabilities.sort_by(f64::total_cmp);
+        assert_eq!(probabilities, vec![0.01, 0.02]);
+        // drain moved everything out
+        assert_eq!(coordinator.dem_log.drain(), Default::default());
+    }
+
+    /// Same fixture as `dem_log_matches_execute_increments` but with
+    /// async_expand=false — the playground's default monolithic config. In
+    /// this mode no expansion tasks are spawned: remote slots resolve only on
+    /// the synchronous decode-time batch expansion, AFTER take_subgraph has
+    /// already removed the error models from `self.error_models` (so the
+    /// drain_dem watch-reading fallback cannot see them either). The
+    /// batch_expand hook must therefore report the resolutions itself.
+    #[tokio::test]
+    async fn dem_log_matches_execute_increments_sync_expand() {
+        let coordinator = dem_coordinator(serde_json::json!({"async_expand": false, "persistent_decoder": false}));
+        coordinator.load_library(Request::new(dem_invariant_library())).await.unwrap();
+
+        let g1 = execute_create(
+            &coordinator,
+            bin::instruction::Create::Gadget(bin::Gadget {
+                gtype: 100,
+                ..Default::default()
+            }),
+        )
+        .await;
+        let c1 = execute_create(
+            &coordinator,
+            bin::instruction::Create::CheckModel(bin::CheckModel {
+                ctype: 10,
+                gid: g1,
+                ..Default::default()
+            }),
+        )
+        .await;
+        let g2 = execute_create(
+            &coordinator,
+            bin::instruction::Create::Gadget(bin::Gadget {
+                gtype: 101,
+                connectors: vec![bin::gadget::Connector { gid: g1, port: 0 }],
+                ..Default::default()
+            }),
+        )
+        .await;
+        let c2 = execute_create(
+            &coordinator,
+            bin::instruction::Create::CheckModel(bin::CheckModel {
+                ctype: 10,
+                gid: g2,
+                ..Default::default()
+            }),
+        )
+        .await;
+        let e = execute_create(
+            &coordinator,
+            bin::instruction::Create::ErrorModel(bin::ErrorModel {
+                etype: 20,
+                cid: c2,
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!((g1, c1, g2, c2, e), (1, 1, 2, 2, 1));
+
+        // no expansion task was spawned: the remote edge stays pending
+        assert!(coordinator.dem_log.has_pending());
+
+        // both gadget types have zero measurements, so the outcome vectors are
+        // empty; decode(g1) parks on its readout channel until the final
+        // gadget (g2, the sink completing the subgraph) runs decode_subgraph,
+        // so the two calls must be joined concurrently
+        let empty = || bit_vector::from_sparse_indices(0, &[]);
+        let (r1, r2) = tokio::join!(
+            coordinator.decode(Request::new(coordinator::Outcomes {
+                gid: g1,
+                outcomes: Some(empty()),
+                ..Default::default()
+            })),
+            coordinator.decode(Request::new(coordinator::Outcomes {
+                gid: g2,
+                outcomes: Some(empty()),
+                ..Default::default()
+            })),
+        );
+        r1.unwrap();
+        r2.unwrap();
+
+        // the decode-time batch expansion resolved the remote slot
+        assert!(!coordinator.dem_log.has_pending());
+        let drain = coordinator.dem_log.drain();
+        assert_eq!(
+            drain.detector_groups,
+            vec![
+                DemDetectorGroup {
+                    gid: g1,
+                    cid: c1,
+                    count: 2
+                },
+                DemDetectorGroup {
+                    gid: g2,
+                    cid: c2,
+                    count: 2
+                },
+            ]
+        );
+        // same edges as the async variant
+        let mut dets: Vec<Vec<(u64, u64)>> = drain.edges.iter().map(|e| e.detectors.clone()).collect();
+        dets.sort();
+        assert_eq!(dets, vec![vec![(c1, 1)], vec![(c2, 0)]]);
+        assert!(drain.edges.iter().all(|edge| edge.eid == e));
+    }
+
+    /// drain_dem final-flush fallback: an error model whose expansion watch
+    /// already holds the resolved slots but whose `on_remotes_resolved` hook
+    /// was somehow missed is recovered by `drain_dem(true)` re-reading the
+    /// watches. Mirrors the existing tests' direct-construction style to
+    /// simulate the missed hook.
+    #[tokio::test]
+    async fn drain_dem_final_flush_recovers_missed_resolution() {
+        let coordinator = dem_coordinator(serde_json::json!({}));
+        // announce the remote target cid so only the slot resolution gates emission
+        coordinator.dem_log.on_check_model(1, 7, 2);
+        // ErrorModel whose watch is pre-populated with the resolved slot...
+        let slots = vec![Some(RemoteCheckModel::default())];
+        coordinator.error_models.write().await.insert(
+            11,
+            ErrorModel {
+                instance: bin::ErrorModel {
+                    eid: 11,
+                    cid: 5,
+                    ..Default::default()
+                },
+                modified_remote_check_models: Arc::new(slots.clone()),
+                expanded_remote_check_models: watch::channel(Some(vec![Some(7)])).0,
+            },
+        );
+        // ...while the DemLog still has the model pending (hook "missed")
+        let remote_error = Error {
+            probability: 0.02,
+            checks: vec![RemoteCheck {
+                remote_check_model: Some(0),
+                check_index: 1,
+            }],
+            ..Default::default()
+        };
+        coordinator.dem_log.on_error_model(1, 11, 5, vec![remote_error], &slots);
+        assert!(coordinator.dem_log.has_pending());
+
+        // a non-final drain does not consult the watches: the edge stays pending
+        let drain = coordinator.drain_dem(false).await;
+        assert!(drain.edges.is_empty());
+        assert!(coordinator.dem_log.has_pending());
+
+        // the final flush re-reads the expansion watches and recovers the edge
+        let drain = coordinator.drain_dem(true).await;
+        assert_eq!(
+            drain.edges,
+            vec![DemEdge {
+                gid: 1,
+                eid: 11,
+                error_index: 0,
+                detectors: vec![(7, 1)],
+                probability: 0.02
+            }]
+        );
+        assert!(!coordinator.dem_log.has_pending());
     }
 }

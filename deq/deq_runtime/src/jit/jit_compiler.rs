@@ -11,6 +11,15 @@ pub struct JitCompiler {
     pub jit_gadget_types: RwLock<HashMap<u64, Arc<jit::JitGadgetType>>>,
     pub current_gid: AtomicU64,
     pub gadgets: RwLock<HashMap<u64, JitGadgetState>>,
+    waits: RwLock<CompileWaits>,
+    progress_revision: watch::Sender<u64>,
+}
+
+#[derive(Default)]
+struct CompileWaits {
+    output_ports: HashMap<u64, HashSet<u64>>,
+    dependencies: HashMap<u64, HashSet<u64>>,
+    ready: HashSet<u64>,
 }
 
 pub struct JitGadgetState {
@@ -44,11 +53,14 @@ struct ExplicitCheck {
 
 impl JitCompiler {
     pub fn new() -> Arc<Self> {
+        let (progress_revision, _) = watch::channel(0);
         Arc::new(Self {
             jit_port_types: RwLock::new(HashMap::new()),
             jit_gadget_types: RwLock::new(HashMap::new()),
             gadgets: RwLock::new(HashMap::new()),
             current_gid: AtomicU64::new(1),
+            waits: RwLock::new(CompileWaits::default()),
+            progress_revision,
         })
     }
 
@@ -57,10 +69,93 @@ impl JitCompiler {
         let mut gadgets = self.gadgets.write().await;
         self.current_gid.store(1, Ordering::SeqCst);
         gadgets.clear();
+        *self.waits.write().await = CompileWaits::default();
+        self.bump_progress();
     }
 
     pub async fn contains_gid(&self, gid: u64) -> bool {
         self.gadgets.read().await.contains_key(&gid)
+    }
+
+    fn bump_progress(&self) {
+        let revision = *self.progress_revision.borrow();
+        self.progress_revision.send_replace(revision + 1);
+    }
+
+    pub fn subscribe_progress(&self) -> watch::Receiver<u64> {
+        self.progress_revision.subscribe()
+    }
+
+    pub async fn decode_progress_state(&self, root: u64) -> crate::coordinator::DecodeProgressState {
+        self.decode_progress_state_for_roots(&[root]).await
+    }
+
+    pub async fn decode_progress_state_for_roots(&self, roots: &[u64]) -> crate::coordinator::DecodeProgressState {
+        fn visit(gid: u64, waits: &CompileWaits, visited: &mut HashSet<u64>, blockers: &mut Vec<(u64, u64)>) {
+            if !visited.insert(gid) {
+                return;
+            }
+            if waits.ready.contains(&gid) {
+                return;
+            }
+            if let Some(ports) = waits.output_ports.get(&gid) {
+                blockers.extend(ports.iter().map(|&port| (gid, port)));
+            }
+            if let Some(peers) = waits.dependencies.get(&gid) {
+                for &peer in peers {
+                    visit(peer, waits, visited, blockers);
+                }
+            }
+        }
+
+        let waits = self.waits.read().await;
+        let mut visited = HashSet::new();
+        let mut blockers = Vec::new();
+        for &gid in roots {
+            visit(gid, &waits, &mut visited, &mut blockers);
+        }
+        blockers.sort_unstable();
+        blockers.dedup();
+        if !blockers.is_empty() {
+            crate::coordinator::DecodeProgressState::NeedsGraph(blockers)
+        } else if roots.iter().all(|gid| waits.ready.contains(gid)) {
+            crate::coordinator::DecodeProgressState::Ready
+        } else {
+            crate::coordinator::DecodeProgressState::Pending
+        }
+    }
+
+    async fn set_output_wait(&self, gid: u64, port: u64, waiting: bool) {
+        let mut waits = self.waits.write().await;
+        if waiting {
+            waits.output_ports.entry(gid).or_default().insert(port);
+        } else if let Some(ports) = waits.output_ports.get_mut(&gid) {
+            ports.remove(&port);
+            if ports.is_empty() {
+                waits.output_ports.remove(&gid);
+            }
+        }
+        drop(waits);
+        self.bump_progress();
+    }
+
+    async fn set_dependency_wait(&self, gid: u64, peer: u64, waiting: bool) {
+        let mut waits = self.waits.write().await;
+        if waiting {
+            waits.dependencies.entry(gid).or_default().insert(peer);
+        } else if let Some(peers) = waits.dependencies.get_mut(&gid) {
+            peers.remove(&peer);
+            if peers.is_empty() {
+                waits.dependencies.remove(&gid);
+            }
+        }
+        drop(waits);
+        self.bump_progress();
+    }
+
+    pub async fn mark_error_model_ready(&self, gid: u64) {
+        self.waits.write().await.ready.insert(gid);
+        self.bump_progress();
     }
 
     async fn get_output_connector(
@@ -74,7 +169,12 @@ impl JitCompiler {
         drop(gadgets);
         match connector {
             Ok(value) => Some(value),
-            Err(handle) => handle.await.unwrap_or(None),
+            Err(handle) => {
+                self.set_output_wait(gid, port_index as u64, true).await;
+                let connector = handle.await.unwrap_or(None);
+                self.set_output_wait(gid, port_index as u64, false).await;
+                connector
+            }
         }
     }
 
@@ -85,6 +185,7 @@ impl JitCompiler {
 
     async fn get_output_virtual_checks(
         &self,
+        owner_gid: u64,
         gid: u64,
         token: CancellationToken,
     ) -> Option<Arc<Vec<HashSet<ExplicitCheck>>>> {
@@ -93,7 +194,12 @@ impl JitCompiler {
         drop(gadgets);
         match receiver {
             Ok(value) => Some(value),
-            Err(handle) => handle.await.unwrap_or(None),
+            Err(handle) => {
+                self.set_dependency_wait(owner_gid, gid, true).await;
+                let checks = handle.await.unwrap_or(None);
+                self.set_dependency_wait(owner_gid, gid, false).await;
+                checks
+            }
         }
     }
 
@@ -277,7 +383,8 @@ impl JitCompiler {
                     // note that this is rarely happening
                     if !check.unfinished_checks.is_empty() {
                         if peer_output_virtual_checks.is_none() {
-                            peer_output_virtual_checks = this.get_output_virtual_checks(connector.gid, token.clone()).await;
+                            peer_output_virtual_checks =
+                                this.get_output_virtual_checks(gid, connector.gid, token.clone()).await;
                         }
                         let Some(peer_output_virtual_checks_arc) = peer_output_virtual_checks.as_ref() else {
                             cancelled = true;

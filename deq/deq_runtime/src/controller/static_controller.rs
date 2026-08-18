@@ -307,6 +307,7 @@ impl static_controller_server::StaticController for StaticController {
                 gid: 0,
                 readouts: Some(BitVector { size: 0, data: vec![] }),
                 probabilities: vec![],
+                detectors: None,
             }));
         }
 
@@ -349,6 +350,7 @@ impl static_controller_server::StaticController for StaticController {
             gid: 0,
             readouts: Some(gathered_readouts),
             probabilities: vec![],
+            detectors: None,
         }))
     }
 

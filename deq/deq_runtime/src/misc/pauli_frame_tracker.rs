@@ -28,6 +28,9 @@ use std::sync::Arc;
 
 pub struct PauliFrameTracker {
     pub gadgets: HashMap<u64, PauliFrameGadget>,
+    /// Dependents whose remote readout source has a reserved gid but has not
+    /// registered yet. Forward references are valid for streamed programs.
+    pending_remote_dependents: HashMap<u64, Vec<u64>>,
 }
 
 pub struct PauliFrameGadget {
@@ -108,11 +111,13 @@ impl PauliFrameTracker {
     pub fn new() -> Self {
         Self {
             gadgets: Default::default(),
+            pending_remote_dependents: Default::default(),
         }
     }
 
     pub fn reset(&mut self) {
         self.gadgets.clear();
+        self.pending_remote_dependents.clear();
     }
 
     pub fn add_gadget(
@@ -179,6 +184,9 @@ impl PauliFrameTracker {
         debug_assert!(gadget.readout_propagation.row_count() == gadget.num_readouts());
         debug_assert!(gadget.readout_propagation.column_count() == gadget.num_input_observables() + 1);
         self.gadgets.insert(gid, gadget);
+        if let Some(dependents) = self.pending_remote_dependents.remove(&gid) {
+            self.gadgets.get_mut(&gid).unwrap().remote_dependents.extend(dependents);
+        }
         for (port, connector) in connectors.iter().enumerate() {
             self.gadgets.get_mut(&connector.gid).unwrap().outputs[connector.port as usize]
                 .replace(bin::gadget::Connector { gid, port: port as u64 });
@@ -186,13 +194,24 @@ impl PauliFrameTracker {
         // register remote dependencies so that remote gadgets can trigger propagation
         if let Some((remote_refs, _)) = remote_conditional_correction {
             for remote_ref in remote_refs {
-                self.gadgets.get_mut(&remote_ref.gid).unwrap().remote_dependents.push(gid);
+                if let Some(remote) = self.gadgets.get_mut(&remote_ref.gid) {
+                    remote.remote_dependents.push(gid);
+                } else {
+                    self.pending_remote_dependents.entry(remote_ref.gid).or_default().push(gid);
+                }
             }
         }
     }
 
     pub fn load_raw(&mut self, gid: u64, raw_readouts: &[bool], raw_measurements: &util::BitVector) {
         let gadget = self.gadgets.get_mut(&gid).unwrap();
+        // Idempotent: outcomes reach the tracker from BOTH submit_outcomes
+        // (measurement time) and decode() (which re-sends the same outcomes);
+        // whichever lands first wins, the repeat is a no-op.
+        if gadget.raw_measurements.is_some() {
+            debug_assert_eq!(gadget.num_measurements() as u64, raw_measurements.size);
+            return;
+        }
         debug_assert!(gadget.raw_readouts.is_none());
         debug_assert!(gadget.raw_measurements.is_none());
         debug_assert!(gadget.num_readouts() == raw_readouts.len());
@@ -237,7 +256,9 @@ impl PauliFrameTracker {
         let remote_readouts_vec: Option<BitVec> = if let Some((remote_refs, _)) = &gadget.remote_conditional_correction {
             let mut values = Vec::with_capacity(remote_refs.len());
             for remote_ref in remote_refs {
-                let remote_gadget = self.gadgets.get(&remote_ref.gid).unwrap();
+                let Some(remote_gadget) = self.gadgets.get(&remote_ref.gid) else {
+                    return;
+                };
                 if let Some(frame) = remote_gadget.frame.as_ref() {
                     use binar::Bitwise;
                     values.push(frame.readouts.index(remote_ref.readout_index as usize));
@@ -473,11 +494,6 @@ mod tests {
             let mut tracker = PauliFrameTracker::new();
             let port_types = build_port_types();
 
-            // G_A: source gadget with 1 output, 1 readout
-            let gadget_type_a = build_gadget_type(0, 1, 1);
-            tracker.add_gadget(1, &gadget_type_a, None, &port_types, &[]);
-            tracker.load_raw(1, &[true], &crate::misc::bit_vector::from_sparse_indices(0, &[]));
-
             // G_B: source gadget with 1 output, 0 readouts
             let gadget_type_b = build_gadget_type(0, 1, 0);
             tracker.add_gadget(2, &gadget_type_b, None, &port_types, &[]);
@@ -509,6 +525,11 @@ mod tests {
                 &[bin::gadget::Connector { gid: 2, port: 0 }],
             );
             tracker.load_raw(3, &[false], &crate::misc::bit_vector::from_sparse_indices(0, &[]));
+
+            // G_A registers after G_C has already referenced its reserved gid.
+            let gadget_type_a = build_gadget_type(0, 1, 1);
+            tracker.add_gadget(1, &gadget_type_a, None, &port_types, &[]);
+            tracker.load_raw(1, &[true], &crate::misc::bit_vector::from_sparse_indices(0, &[]));
             tracker
         }
 

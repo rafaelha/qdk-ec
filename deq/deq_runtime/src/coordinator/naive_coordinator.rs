@@ -56,6 +56,12 @@ impl NaiveCoordinator {
             next_eid: AtomicU64::new(id_bias),
         }
     }
+
+    /// The naive coordinator does no real syndrome computation, so it has no
+    /// detectors to surface early — return an empty bus (uniform split-decode API).
+    pub async fn wait_for_detectors(&self, _gid: u64) -> Result<BitVector, Status> {
+        Ok(crate::misc::bit_vector::from_sparse_indices(0, &[]))
+    }
 }
 
 #[tonic::async_trait]
@@ -173,5 +179,51 @@ impl coordinator::coordinator_server::Coordinator for NaiveCoordinator {
         self.next_cid.store(self.config.id_bias, Ordering::Relaxed);
         self.next_eid.store(self.config.id_bias, Ordering::Relaxed);
         Ok(().into())
+    }
+
+    /// The naive coordinator has no notion of measurement-time detectors, so
+    /// publishing outcomes early is a no-op; detectors are surfaced (as all-0)
+    /// through `decode`.
+    async fn submit_outcomes(&self, _request: Request<coordinator::Outcomes>) -> Result<Response<()>, Status> {
+        Ok(Response::new(()))
+    }
+
+    async fn wait_for_detectors(
+        &self,
+        request: Request<coordinator::DetectorRequest>,
+    ) -> Result<Response<coordinator::Readouts>, Status> {
+        let gid = request.into_inner().gid;
+        let detectors = self.wait_for_detectors(gid).await?;
+        Ok(Response::new(coordinator::Readouts {
+            gid,
+            detectors: Some(detectors),
+            ..Default::default()
+        }))
+    }
+
+    // ─── DEM gRPC surface (Task 8) ───────────────────────────────────────
+    // The naive coordinator owns no DemLog, so every drain is empty and the
+    // enable switch is a no-op.
+
+    async fn drain_dem(&self, _request: Request<()>) -> Result<Response<coordinator::DemDrainResponse>, Status> {
+        Ok(Response::new(coordinator::DemDrainResponse::default()))
+    }
+
+    async fn drain_dem_predictions(
+        &self,
+        _request: Request<coordinator::DemPredictionsRequest>,
+    ) -> Result<Response<coordinator::DemPredictionsResponse>, Status> {
+        Ok(Response::new(coordinator::DemPredictionsResponse::default()))
+    }
+
+    async fn set_dem_enabled(&self, _request: Request<coordinator::DemEnabledRequest>) -> Result<Response<()>, Status> {
+        Ok(Response::new(()))
+    }
+
+    async fn drain_window_timings(
+        &self,
+        _request: Request<()>,
+    ) -> Result<Response<coordinator::WindowTimingsResponse>, Status> {
+        Ok(Response::new(coordinator::WindowTimingsResponse::default()))
     }
 }

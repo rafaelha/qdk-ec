@@ -523,6 +523,7 @@ impl coordinator_server::Coordinator for MockCoordinator {
             gid: outcomes.gid,
             readouts: Some(crate::util::BitVector::default()),
             probabilities: vec![],
+            detectors: None,
         }))
     }
 
@@ -544,5 +545,47 @@ impl coordinator_server::Coordinator for MockCoordinator {
         state.next_cid = 1;
         state.next_eid = 1;
         Ok(Response::new(()))
+    }
+
+    async fn submit_outcomes(&self, _request: Request<coordinator::Outcomes>) -> Result<Response<()>, Status> {
+        Ok(Response::new(()))
+    }
+
+    async fn wait_for_detectors(
+        &self,
+        request: Request<coordinator::DetectorRequest>,
+    ) -> Result<Response<coordinator::Readouts>, Status> {
+        let gid = request.into_inner().gid;
+        Ok(Response::new(coordinator::Readouts {
+            gid,
+            detectors: Some(crate::util::BitVector::default()),
+            ..Default::default()
+        }))
+    }
+
+    // ─── DEM gRPC surface (Task 8) ───────────────────────────────────────
+    // The mock coordinator owns no DemLog: every drain is empty and the
+    // enable switch is a no-op.
+
+    async fn drain_dem(&self, _request: Request<()>) -> Result<Response<coordinator::DemDrainResponse>, Status> {
+        Ok(Response::new(coordinator::DemDrainResponse::default()))
+    }
+
+    async fn drain_dem_predictions(
+        &self,
+        _request: Request<coordinator::DemPredictionsRequest>,
+    ) -> Result<Response<coordinator::DemPredictionsResponse>, Status> {
+        Ok(Response::new(coordinator::DemPredictionsResponse::default()))
+    }
+
+    async fn set_dem_enabled(&self, _request: Request<coordinator::DemEnabledRequest>) -> Result<Response<()>, Status> {
+        Ok(Response::new(()))
+    }
+
+    async fn drain_window_timings(
+        &self,
+        _request: Request<()>,
+    ) -> Result<Response<coordinator::WindowTimingsResponse>, Status> {
+        Ok(Response::new(coordinator::WindowTimingsResponse::default()))
     }
 }

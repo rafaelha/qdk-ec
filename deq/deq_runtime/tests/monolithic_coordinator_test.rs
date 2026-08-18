@@ -1,6 +1,7 @@
 //! Tests for MonolithicCoordinator using MockDecoder
 
 use deq_runtime::bin::{self, instruction};
+use deq_runtime::coordinator;
 use deq_runtime::coordinator::coordinator_server::Coordinator;
 use deq_runtime::coordinator::monolithic_coordinator::MonolithicCoordinator;
 use deq_runtime::decoder::{BlackBoxDecoderClient, MockDecoder};
@@ -1894,4 +1895,110 @@ async fn test_persistent_decoder_reuses_cache_when_modifier_unchanged() {
     );
     let loaded_decoders = coordinator.loaded_decoders.read().await;
     assert_eq!(loaded_decoders.len(), 1, "Expected a single cache entry");
+}
+
+// ─── monolithic decode timing (Task 4) ─────────────────────────────────────
+
+/// Mirrors `drain_window_timings_returns_and_clears_records` (window
+/// coordinator, Task 3): run a canonical shot through the persistent-decoder
+/// monolithic coordinator, then confirm `DrainWindowTimings` reports exactly
+/// one settled record with monolithic's spec-blessed semantics (no
+/// exploration, no compaction, and `num_gadgets == num_committing ==
+/// window_gids.len()` since monolithic always commits the whole subgraph),
+/// and that draining clears the log.
+#[tokio::test]
+async fn monolithic_drain_window_timings_records_decodes() {
+    let mock = make_mock_decoder();
+    let coord = make_persistent_coordinator(mock.clone());
+
+    Coordinator::load_library(&coord, Request::new(make_default_library()))
+        .await
+        .unwrap();
+    run_canonical_shot(&coord, None, None).await;
+
+    let resp = Coordinator::drain_window_timings(&coord, Request::new(()))
+        .await
+        .unwrap()
+        .into_inner();
+    let timings = resp.timings;
+    assert!(!timings.is_empty(), "at least one monolithic decode must be recorded");
+    for t in &timings {
+        assert!(t.decode_ns > 0, "decode duration must be measured");
+        assert_eq!(t.explore_ns, 0, "monolithic does no window exploration");
+        assert_eq!(t.compact_ns, 0, "monolithic never compacts vertices");
+        assert_eq!(t.num_gadgets, t.num_committing, "monolithic commits the whole subgraph");
+        assert_eq!(
+            t.num_gadgets as usize,
+            t.window_gids.len(),
+            "window_gids must be derived from the same gadget set as num_gadgets"
+        );
+        assert!(t.decode_end_ns >= t.decode_start_ns);
+        // Monolithic approximates both window-formation stamps with its decode
+        // entry (it has no per-window readiness event), mirroring syndrome_ready_ns.
+        assert_eq!(t.leader_arrived_ns, t.decode_start_ns);
+        assert_eq!(t.mandatory_ready_ns, t.decode_start_ns);
+    }
+    // Every decoded gadget stamps an outcome arrival (monolithic loads outcomes
+    // in the decode() handler).
+    assert!(!resp.outcome_arrivals.is_empty(), "outcome arrivals must be recorded");
+    for a in &resp.outcome_arrivals {
+        assert!(a.received_ns > 0, "arrival stamp must carry a server-clock timestamp");
+        assert!(a.received_ns <= resp.drained_at_ns);
+    }
+    let again = Coordinator::drain_window_timings(&coord, Request::new(()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(again.timings.is_empty(), "drain must clear the log");
+    assert!(again.outcome_arrivals.is_empty(), "drain must clear the arrivals");
+}
+
+/// Companion to `monolithic_drain_window_timings_records_decodes`: the first
+/// shot only exercises the `BUILT_LOADED` branch of `decode_parity_factor`
+/// (fresh hypergraph construction). This test drives a second shot with the
+/// same modifier — mirroring
+/// `test_persistent_decoder_reuses_cache_when_modifier_unchanged`'s
+/// `reset_keeping_library_and_decoder` pattern, which keeps `loaded_decoders`
+/// alive across the reset — so `decode_parity_factor` takes the `CACHE_HIT`
+/// early-return branch instead, and asserts on that record specifically.
+#[tokio::test]
+async fn monolithic_drain_window_timings_records_cache_hit() {
+    let mock = make_mock_decoder();
+    let coord = make_persistent_coordinator(mock.clone());
+
+    Coordinator::load_library(&coord, Request::new(make_default_library()))
+        .await
+        .unwrap();
+
+    // Shot 1: populates `loaded_decoders` via the BUILT_LOADED path.
+    run_canonical_shot(&coord, None, None).await;
+    Coordinator::drain_window_timings(&coord, Request::new(())).await.unwrap();
+
+    reset_keeping_library_and_decoder(&coord).await;
+
+    // Shot 2: same (absent) modifier, same topology — same `DecoderCacheKey`,
+    // so `decode_parity_factor` must hit the cache this time.
+    run_canonical_shot(&coord, None, None).await;
+
+    let timings = Coordinator::drain_window_timings(&coord, Request::new(()))
+        .await
+        .unwrap()
+        .into_inner()
+        .timings;
+    assert!(!timings.is_empty(), "the second shot's cache-hit decode must be recorded");
+    for t in &timings {
+        assert_eq!(
+            t.path,
+            coordinator::DecodePath::CacheHit as i32,
+            "second shot with an unchanged modifier must hit the persistent decoder cache"
+        );
+        assert!(t.decode_end_ns >= t.decode_start_ns);
+        assert_eq!(t.num_gadgets, t.num_committing, "monolithic commits the whole subgraph");
+        assert_eq!(
+            t.num_gadgets as usize,
+            t.window_gids.len(),
+            "window_gids must be derived from the same gadget set as num_gadgets"
+        );
+        assert_eq!(t.hypergraph_bytes, 0, "no hypergraph is rebuilt on a cache hit");
+    }
 }

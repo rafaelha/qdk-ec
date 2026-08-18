@@ -172,12 +172,6 @@ impl WindowCoordinatorConfig {
         }
         self.lookahead_radius.unwrap_or(self.buffer_radius)
     }
-
-    /// Effective window radius: `buffer_radius + lookahead_radius`.
-    /// This is how far the BFS expands from the center gadget.
-    pub fn effective_window_radius(&self) -> usize {
-        self.buffer_radius + self.lookahead_radius()
-    }
 }
 
 fn default_true() -> bool {
@@ -201,10 +195,14 @@ pub struct WindowCoordinator {
     pub gadgets: Arc<RwLock<HashMap<u64, Gadget>>>,
     pub check_models: Arc<RwLock<HashMap<u64, CheckModel>>>,
     pub error_models: Arc<RwLock<HashMap<u64, ErrorModel>>>,
+    decode_progress: RwLock<HashMap<u64, watch::Sender<coordinator::DecodeProgress>>>,
+    decode_dependencies: RwLock<HashMap<u64, HashSet<u64>>>,
     /// Error models waiting for a target gadget to get a binding check model.
-    /// Key: target gadget GID. Value: list of eids to register in referring_eids
-    /// once the check model is created. Cleared on reset.
-    pending_referring_by_gid: Mutex<HashMap<u64, Vec<u64>>>,
+    /// Key: target gadget GID. Value: list of `(eid, ri)` pairs — the eid to
+    /// register in referring_eids once the check model is created, and which
+    /// remote slot of that error model resolved there (for the DEM increment
+    /// log). Cleared on reset.
+    pending_referring_by_gid: Mutex<HashMap<u64, Vec<(u64, usize)>>>,
     /// Error models blocked on an unconnected output port.
     /// Key: (source_gid, output_port). Value: pending referrals to re-resolve
     /// when the port is connected. Cleared on reset.
@@ -234,10 +232,73 @@ pub struct WindowCoordinator {
     /// ``config.loss_random_imputation`` is enabled.  Seeded once at
     /// construction; ``None`` when imputation is disabled.
     pub loss_imputation_rng: Option<Mutex<crate::simulator::DeterministicRng>>,
+    /// DEM increment log for the playground's decoding-graph view: execute()
+    /// records detector groups / error mechanisms here (record-only, no effect
+    /// on decoding). Unlike the monolithic coordinator, ALL remote-slot
+    /// resolution is synchronous inside execute() (Arc only for API parity).
+    /// Disabled by default on the server (see `new`) — the playground enables it
+    /// per replay shot via the `set_dem_enabled` RPC.
+    pub dem_log: Arc<coordinator::dem::DemLog>,
     /// accumulated trace for the current shot
     pub trace_shot: Arc<Mutex<trace::Shot>>,
     /// accumulated trace across all shots
     pub trace: Mutex<trace::WindowCoordinatorTrace>,
+    /// Always-on per-window decode timing log (drained by DrainWindowTimings,
+    /// cleared on reset). See coordinator::timing.
+    pub timing_log: coordinator::timing::TimingLog,
+    /// cid -> timestamp_ns() when that check model's syndrome became complete.
+    /// decode_parity_factor takes the max over the window's cids as the
+    /// window's syndrome-ready time. Cleared on reset. Arc so the spawned
+    /// syndrome-completion task (which mirrors `trace_shot`'s capture
+    /// pattern) can hold its own handle.
+    pub syndrome_ready_at: Arc<std::sync::Mutex<std::collections::HashMap<u64, u64>>>,
+    /// Window decodes currently between decode_and_commit entry and exit —
+    /// sampled into WindowTiming.concurrent_decodes.
+    pub decodes_in_flight: std::sync::atomic::AtomicU32,
+    /// Per-gid stamp of the FIRST time a gadget's outcomes were set (via
+    /// `submit_outcomes` or `decode`). Cleared on reset, drained + cleared with
+    /// the timing log (same std::mem::take pattern). See coordinator::timing.
+    pub outcome_arrivals: std::sync::Mutex<Vec<coordinator::OutcomeArrival>>,
+    /// Centers of leaders currently BLOCKED in the commit loop (registered via
+    /// an RAII guard, so cancellation unregisters too). A claiming leader
+    /// defers to any EARLIER (smaller-gid) waiting leader whose center sits in
+    /// its explored window — the ordered hand-off that keeps tail commits in
+    /// sliding-window order (see the commit loop in `decode()`). std Mutex:
+    /// held only for sync membership ops, never across an await.
+    waiting_leaders: std::sync::Mutex<std::collections::BTreeSet<u64>>,
+    /// Monotone counter assigning each gadget's FIRST outcome arrival (via
+    /// `submit_outcomes` or `decode`) a coordinator-wide sequence number,
+    /// starting at 1. Replay bookkeeping only — never read by decoding.
+    outcome_seq: std::sync::atomic::AtomicU64,
+    /// Replay-only record of which gadget's outcome arrival completed each
+    /// center's mandatory buffer zone: center gid -> unblocking gid. Written
+    /// in `decode()` after step 2, queried by [`Self::decode_started_by`].
+    /// Cleared on reset. std Mutex: held only for sync map ops.
+    decode_started: std::sync::Mutex<std::collections::HashMap<u64, u64>>,
+}
+
+/// RAII registration in `WindowCoordinator::waiting_leaders`: created when a
+/// leader enters the commit loop, removed on drop — including cancellation
+/// unwinds — so the ordered hand-off never keys on a dead task. A registered
+/// leader whose center has already left `Uncommitted` (it claimed, or another
+/// window committed it) is ignored by the defer check, so the guard living
+/// past the claim is harmless.
+struct WaitingLeaderGuard<'a> {
+    set: &'a std::sync::Mutex<std::collections::BTreeSet<u64>>,
+    gid: u64,
+}
+
+impl<'a> WaitingLeaderGuard<'a> {
+    fn register(set: &'a std::sync::Mutex<std::collections::BTreeSet<u64>>, gid: u64) -> Self {
+        set.lock().unwrap().insert(gid);
+        WaitingLeaderGuard { set, gid }
+    }
+}
+
+impl Drop for WaitingLeaderGuard<'_> {
+    fn drop(&mut self) {
+        self.set.lock().unwrap().remove(&self.gid);
+    }
 }
 
 /// State machine for gadget lifecycle in window decoding.
@@ -262,6 +323,12 @@ pub enum GadgetState {
 pub struct Gadget {
     pub instance: bin::Gadget,
     pub outcomes: watch::Sender<Option<BitVector>>,
+    /// Set when `decode()` is entered. For JIT callers this means the gadget's
+    /// asynchronous error model has finished loading. `submit_outcomes` does NOT
+    /// set this, so a gadget whose outcomes arrived at measurement time cannot be
+    /// committed by a neighbor until its own `decode()` (gated on the error
+    /// model) fires.
+    pub decode_ready: watch::Sender<Option<()>>,
     /// the check model's cid that is binding to this gadget
     pub binding_cid: Option<u64>,
     /// the peer gadgets' gid connected to each output port
@@ -276,6 +343,9 @@ pub struct Gadget {
     /// Gadget lifecycle state: Uncommitted → Decoding → Committed.
     /// Other decode tasks watch this to detect when blocking gadgets finish.
     pub state: watch::Sender<GadgetState>,
+    /// Arrival sequence of this gadget's FIRST outcome load (see
+    /// `WindowCoordinator::outcome_seq`); 0 until outcomes arrive.
+    pub outcome_seq: std::sync::atomic::AtomicU64,
 }
 
 pub struct CheckModel {
@@ -293,6 +363,11 @@ pub struct CheckModel {
     /// a committed gadget is a safe terminal only if all referring_eids' gadgets
     /// are also committed.
     pub referring_eids: Vec<u64>,
+    /// `(outcome_seq, gid)` of the constituent gadget whose outcome arrival
+    /// completed this check's syndrome (the max first-arrival seq among the
+    /// owning + remote gadgets). Set together with `syndrome` by the spawned
+    /// syndrome task; feedback re-publications don't touch it. Replay only.
+    pub finished_by: Option<(u64, u64)>,
 }
 
 pub struct ErrorModel {
@@ -390,6 +465,10 @@ pub struct ExploredWindow {
     pub decoder_window: HashSet<u64>,
 }
 
+fn required_window_readiness(window: &HashSet<u64>, commit_region: &HashSet<u64>) -> (HashSet<u64>, HashSet<u64>) {
+    (window.iter().chain(commit_region).copied().collect(), commit_region.clone())
+}
+
 impl WindowCoordinator {
     pub fn new(config: serde_json::Value, black_box_decoder: BlackBoxDecoderClient) -> Self {
         let config: WindowCoordinatorConfig = serde_json::from_value(config).unwrap();
@@ -400,6 +479,12 @@ impl WindowCoordinator {
         } else {
             None
         };
+        // Deliberate deviation from the fork (whose DemLog default is enabled):
+        // the server starts with DEM recording OFF so stats-only shots pay no
+        // accumulation cost. The playground turns it on per replay shot via the
+        // `set_dem_enabled` RPC (Task 8).
+        let dem_log: Arc<coordinator::dem::DemLog> = Default::default();
+        dem_log.set_enabled(false);
         Self {
             config,
             port_types: Default::default(),
@@ -409,6 +494,8 @@ impl WindowCoordinator {
             gadgets: Default::default(),
             check_models: Default::default(),
             error_models: Default::default(),
+            decode_progress: Default::default(),
+            decode_dependencies: Default::default(),
             pending_referring_by_gid: Default::default(),
             pending_referring_by_port: Default::default(),
             next_gid: Mutex::new(1),
@@ -420,8 +507,30 @@ impl WindowCoordinator {
             cancellation: RwLock::new(CancellationToken::new()),
             task_counter: TaskCounter::new(),
             loss_imputation_rng,
+            dem_log,
             trace_shot: Arc::new(Mutex::new(trace::Shot::default())),
             trace: Mutex::new(trace::WindowCoordinatorTrace::default()),
+            timing_log: Default::default(),
+            syndrome_ready_at: Default::default(),
+            decodes_in_flight: Default::default(),
+            outcome_arrivals: Default::default(),
+            waiting_leaders: Default::default(),
+            outcome_seq: std::sync::atomic::AtomicU64::new(1),
+            decode_started: Default::default(),
+        }
+    }
+
+    /// Stamp a gadget's FIRST outcome arrival with the next coordinator-wide
+    /// sequence number. Call BEFORE `outcomes.send_replace`, so any observer
+    /// that sees the outcomes also sees the seq. Idempotent re-loads (the
+    /// `decode()` call re-sending what `submit_outcomes` delivered) keep the
+    /// original, causally meaningful seq.
+    fn assign_outcome_seq(&self, gadget: &Gadget) {
+        use std::sync::atomic::Ordering;
+        if gadget.outcomes.borrow().is_none() {
+            gadget
+                .outcome_seq
+                .store(self.outcome_seq.fetch_add(1, Ordering::SeqCst), Ordering::SeqCst);
         }
     }
 
@@ -436,12 +545,94 @@ impl WindowCoordinator {
         token.cancel();
     }
 
+    /// Enable/disable DEM recording. The server starts disabled (see `new`);
+    /// the playground turns it on per replay shot via the `set_dem_enabled` RPC.
+    pub fn set_dem_enabled(&self, enabled: bool) {
+        self.dem_log.set_enabled(enabled);
+    }
+
+    /// Drain DEM increments. The window coordinator resolves every remote slot
+    /// synchronously inside execute(), so nothing is left pending by the time a
+    /// decode completes; `final_flush` therefore only waits for spawned tasks
+    /// (syndrome computation) to settle, for API parity with the monolithic
+    /// coordinator. CAUTION: `task_counter` also guards in-flight `decode()`
+    /// calls — only call with `final_flush=true` after all decodes completed.
+    pub async fn drain_dem(&self, final_flush: bool) -> coordinator::dem::DemDrain {
+        if final_flush {
+            self.task_counter.wait_for_zero().await;
+        }
+        self.dem_log.drain()
+    }
+
+    pub fn drain_dem_predictions(&self) -> Vec<coordinator::dem::DemPrediction> {
+        self.dem_log.drain_predictions()
+    }
+
+    pub fn drain_dem_predictions_for(&self, gid: u64) -> Vec<coordinator::dem::DemPrediction> {
+        self.dem_log.drain_predictions_for(gid)
+    }
+
     async fn record_event(&self, event: trace::event::Event) {
         if self.config.trace_filepath.is_some() {
             self.trace_shot.lock().await.events.push(trace::Event {
                 timestamp_ns: crate::misc::util::timestamp_ns(),
                 event: Some(event),
             });
+        }
+    }
+
+    async fn progress_sender(&self, gid: u64) -> watch::Sender<coordinator::DecodeProgress> {
+        self.decode_progress
+            .write()
+            .await
+            .entry(gid)
+            .or_insert_with(|| watch::channel(coordinator::DecodeProgress::default()).0)
+            .clone()
+    }
+
+    async fn publish_progress(&self, gid: u64, state: coordinator::DecodeProgressState) {
+        let sender = self.progress_sender(gid).await;
+        coordinator::publish_decode_progress(&sender, state);
+    }
+
+    async fn record_decode_dependencies(&self, gid: u64, gadgets: &HashSet<u64>) {
+        self.decode_dependencies.write().await.insert(gid, gadgets.clone());
+    }
+
+    pub async fn decode_dependencies(&self, gid: u64) -> Vec<u64> {
+        self.decode_dependencies
+            .read()
+            .await
+            .get(&gid)
+            .map(|gadgets| gadgets.iter().copied().collect())
+            .unwrap_or_else(|| vec![gid])
+    }
+
+    pub async fn wait_decode_progress(
+        &self,
+        gid: u64,
+        after_revision: Option<u64>,
+    ) -> Result<coordinator::DecodeProgress, Status> {
+        let sender = self.progress_sender(gid).await;
+        let mut receiver = sender.subscribe();
+        let current = receiver.borrow().clone();
+        if after_revision.is_none_or(|revision| current.revision > revision) {
+            return Ok(current);
+        }
+        let token = self.cancellation.read().await.clone();
+        loop {
+            tokio::select! {
+                changed = receiver.changed() => {
+                    changed.map_err(|_| Status::cancelled("decode progress reset"))?;
+                    let current = receiver.borrow().clone();
+                    if current.revision > after_revision.unwrap() {
+                        return Ok(current);
+                    }
+                }
+                _ = token.cancelled() => {
+                    return Err(Status::cancelled("decode progress cancelled by reset"));
+                }
+            }
         }
     }
 
@@ -457,12 +648,183 @@ impl WindowCoordinator {
             Err(handle) => handle.await.unwrap_or(None),
         }
         .ok_or_else(|| Status::cancelled("decode cancelled by reset"))?;
+        self.publish_progress(gid, coordinator::DecodeProgressState::Ready).await;
+        let detectors = {
+            // Lock order: check_model_types before gadgets/check_models (field
+            // order). Acquiring it inside get_gadget_detectors while holding the
+            // two read guards below deadlocked against execute(CheckModel)
+            // (holds check_model_types.read, waits gadgets.write) once a
+            // load_library writer queued on check_model_types in between.
+            let check_model_types = self.check_model_types.read().await;
+            let gadgets = self.gadgets.read().await;
+            let check_models = self.check_models.read().await;
+            Self::get_gadget_detectors(gid, &check_model_types, &gadgets, &check_models)
+        };
         Ok((coordinator::Readouts {
             gid,
             readouts: Some(readouts),
+            detectors: Some(detectors),
             ..Default::default()
         })
         .into())
+    }
+
+    /// Compute one gadget's finished-detector bits from its bound check model,
+    /// reusing the same defect computation as the window syndrome pass but for a
+    /// single check model indexed from 0. Returns an empty `BitVector` if the
+    /// gadget has no bound check model or its check model defines no checks.
+    ///
+    /// Deliberately sync: the caller passes all three map guards, acquired in
+    /// field order (check_model_types → gadgets → check_models). This function
+    /// used to acquire `check_model_types.read()` itself while the caller held
+    /// the gadget/check-model guards — a lock-order inversion that could
+    /// deadlock the whole coordinator (see `wait_for_pauli_frame`).
+    fn get_gadget_detectors(
+        gid: u64,
+        check_model_types: &HashMap<u64, Arc<bin::CheckModelType>>,
+        gadgets: &HashMap<u64, Gadget>,
+        check_models: &HashMap<u64, CheckModel>,
+    ) -> BitVector {
+        let gadget = match gadgets.get(&gid) {
+            Some(g) => g,
+            None => return bit_vector::from_sparse_indices(0, &[]),
+        };
+        let cid = match gadget.binding_cid {
+            Some(cid) => cid,
+            None => return bit_vector::from_sparse_indices(0, &[]),
+        };
+        let check_model = match check_models.get(&cid) {
+            Some(cm) => cm,
+            None => return bit_vector::from_sparse_indices(0, &[]),
+        };
+        let check_model_type = check_model_types.get(&check_model.instance.ctype).unwrap();
+        let n = check_model_type.checks.len();
+        let mut detectors = bit_vector::from_sparse_indices(n as u64, &[]);
+        let expanded_remotes = check_model.expanded_remote_gadgets.as_ref();
+        let local_outcomes = gadget.outcomes.borrow().clone().unwrap();
+        for (check_index, check) in check_model_type.checks.iter().enumerate() {
+            let mut is_defect = check.naturally_flipped;
+            for measurement in &check.measurements {
+                if let Some(ri) = measurement.remote_gadget {
+                    let remote_gid = expanded_remotes.unwrap()[ri as usize].unwrap();
+                    let remote_gadget = gadgets.get(&remote_gid).unwrap();
+                    is_defect ^= get_bit(
+                        remote_gadget.outcomes.borrow().as_ref().unwrap(),
+                        measurement.measurement_index
+                            + check_model.modified_remote_gadgets[ri as usize]
+                                .as_ref()
+                                .unwrap()
+                                .measurement_bias,
+                    );
+                } else {
+                    is_defect ^= get_bit(&local_outcomes, measurement.measurement_index);
+                }
+            }
+            set_bit(&mut detectors, check_index as u64, is_defect);
+        }
+        detectors
+    }
+
+    /// Replay-only query: the gid whose outcome arrival completed `gid`'s
+    /// mandatory buffer zone, recorded in `decode()` right after step 2. The
+    /// caller maps it to the virtual time at which decoding could really
+    /// start (readouts be released). `None` for free-hop centers (they skip
+    /// exploration), gids that never decoded, and zones with no finished
+    /// check models. Deliberately NOT part of the decode protocol — a real
+    /// deployment never needs it.
+    pub fn decode_started_by(&self, gid: u64) -> Option<u64> {
+        self.decode_started.lock().unwrap().get(&gid).copied()
+    }
+
+    /// Return a gadget's finished-detector bits (its check-model syndrome) as soon
+    /// as they are computable — i.e. once the gadget's checks are FINISHED (all
+    /// constituent measurement outcomes submitted) — WITHOUT waiting for the BP
+    /// decode. Detectors are a pure function of the measurement outcomes, so the
+    /// syndrome-computation task (spawned in `execute`) already produces exactly
+    /// these bits and publishes them on `check_model.syndrome`, independent of the
+    /// pauli frame. A gadget with no bound check model has no detectors (empty bus).
+    pub async fn wait_for_detectors(&self, gid: u64) -> Result<BitVector, Status> {
+        let token = self.cancellation.read().await.clone();
+        let cid = {
+            let gadgets = self.gadgets.read().await;
+            gadgets
+                .get(&gid)
+                .ok_or_else(|| Status::not_found(format!("gid={gid}")))?
+                .binding_cid
+        };
+        let Some(cid) = cid else {
+            return Ok(bit_vector::from_sparse_indices(0, &[]));
+        };
+        // Subscribe under the lock (no await), then drop it before awaiting so the
+        // syndrome wait never holds the check-model map across an await point.
+        let pending = {
+            let check_models = self.check_models.read().await;
+            let cm = check_models
+                .get(&cid)
+                .ok_or_else(|| Status::not_found(format!("cid={cid}")))?;
+            get_or_receiver(&cm.syndrome, token.clone())
+        };
+        match pending {
+            Ok(syndrome) => Ok(syndrome),
+            Err(handle) => handle
+                .await
+                .unwrap_or(None)
+                .ok_or_else(|| Status::cancelled("detectors cancelled by reset")),
+        }
+    }
+
+    /// Publish a gadget's raw measurement outcomes to its `outcomes` channel
+    /// WITHOUT running the decode. This is what the per-check-model syndrome task
+    /// (spawned in `execute`) waits on, so calling this makes a gadget's finished
+    /// detectors resolvable at measurement time — before, and independent of, the
+    /// error-model load that gates the full `decode`. Decoupling the two is what
+    /// lets an `if` conditioned on a gadget's detector bus resolve even when the
+    /// gadget's own output port is only connected *after* that branch is taken
+    /// (the error model, which needs the output-port gid, would otherwise
+    /// deadlock the decode against the branch). `decode` re-sends the same
+    /// outcomes idempotently, so calling this first is safe.
+    ///
+    /// Also loads the raw outcomes into the Pauli frame tracker: submitting
+    /// outcomes makes this gadget's syndrome computable, which makes windows
+    /// containing it decodable — another gadget's decode() may then COMMIT this
+    /// gadget before its own decode() call arrives (that call waits on the
+    /// error-model load). The tracker's frame propagation requires raw
+    /// measurements for every commit-region member, so they must be loaded at
+    /// outcome-arrival time, not decode() time. (`load_raw` is idempotent.)
+    ///
+    /// It deliberately does NOT set the gadget's `decode_ready` channel: that
+    /// signal is reserved for `decode()`, so that publishing outcomes alone
+    /// cannot let a neighboring gadget commit this one before its error model
+    /// has loaded. Returns a not-found error (not a panic/hang) for an unknown
+    /// gid.
+    pub async fn submit_outcomes(&self, gid: u64, outcomes: BitVector) -> Result<(), Status> {
+        let gadget_types = self.gadget_types.read().await;
+        let gadgets = self.gadgets.read().await;
+        let gadget = gadgets.get(&gid).ok_or_else(|| Status::not_found(format!("gid={gid}")))?;
+        // Stamp the arrival on the None→Some transition only (the first time this
+        // gadget's outcomes are set). `decode`'s later re-submit is idempotent and
+        // must not re-stamp.
+        let was_none = gadget.outcomes.borrow().is_none();
+        self.assign_outcome_seq(gadget);
+        gadget.outcomes.send_replace(Some(outcomes));
+        if was_none {
+            self.outcome_arrivals.lock().unwrap().push(coordinator::OutcomeArrival {
+                gid,
+                received_ns: crate::misc::util::timestamp_ns(),
+            });
+        }
+        let gadget_type = gadget_types.get(&gadget.instance.gtype).unwrap();
+        let mut readouts = Vec::with_capacity(gadget_type.readouts.len());
+        let data: BitVector = gadget.outcomes.borrow().as_ref().unwrap().clone();
+        for readout in gadget_type.readouts.iter() {
+            let mut value = false;
+            for &mi in readout.measurement_indices.iter() {
+                value ^= get_bit(&data, mi);
+            }
+            readouts.push(value);
+        }
+        self.pauli_frame_tracker.lock().await.load_raw(gid, &readouts, &data);
+        Ok(())
     }
 
     // ────────────────────────────────────────────────────────────────────────
@@ -517,7 +879,11 @@ impl WindowCoordinator {
     /// distances, and the BFS frontier ready for step 3.
     /// Returns `None` if cancelled.
     async fn explore_mandatory_zone(&self, center_gid: u64) -> Option<ExploredWindow> {
-        let buffer_radius = self.config.buffer_radius;
+        let mandatory_radius = if self.config.buffer_radius == 0 {
+            0
+        } else {
+            self.config.buffer_radius.saturating_add(1)
+        };
         let token = self.cancellation.read().await.clone();
 
         let mut explored = ExploredWindow {
@@ -537,7 +903,7 @@ impl WindowCoordinator {
             }
             let my_dist = explored.center_distance[&fgid];
             let mut sync_neighbors: Vec<(u64, bool)> = vec![];
-            let mut async_handles: Vec<JoinHandle<Option<bin::gadget::Connector>>> = vec![];
+            let mut async_handles: Vec<((u64, u64), JoinHandle<Option<bin::gadget::Connector>>)> = vec![];
 
             {
                 let gadgets = self.gadgets.read().await;
@@ -550,7 +916,7 @@ impl WindowCoordinator {
                     }
                     let peer = &gadgets[&connector.gid];
                     let peer_dist = if peer.is_free_hop { my_dist } else { my_dist + 1 };
-                    if peer_dist <= buffer_radius {
+                    if peer_dist <= mandatory_radius {
                         explored.gadgets.insert(connector.gid);
                         explored.center_distance.insert(connector.gid, peer_dist);
                         explored.phase.insert(connector.gid, ExplorePhase::MandatoryZone);
@@ -559,13 +925,10 @@ impl WindowCoordinator {
                 }
 
                 // Follow output ports — blocking wait for unconnected ports,
-                // because every direction must have `buffer_radius` buffer.
-                // At the boundary (my_dist == buffer_radius), only free-hop
-                // neighbors (same distance) could be in range — they don't
-                // strengthen the buffer, so we skip blocking for unconnected
-                // ports.  This is critical for buffer_radius = 0 (single-shot
-                // QEC): each gadget decodes independently with no waits.
-                for sender in &gadget.outputs {
+                // because a complete buffer needs an outer measured boundary.
+                // The gadget at exactly `buffer_radius + 1` is included as that
+                // boundary, but its own outputs are not awaited.
+                for (port, sender) in gadget.outputs.iter().enumerate() {
                     match get_or_receiver(sender, token.clone()) {
                         Ok(connector) => {
                             if explored.gadgets.contains(&connector.gid) {
@@ -573,7 +936,7 @@ impl WindowCoordinator {
                             }
                             let peer = gadgets.get(&connector.gid)?;
                             let peer_dist = if peer.is_free_hop { my_dist } else { my_dist + 1 };
-                            if peer_dist <= buffer_radius {
+                            if peer_dist <= mandatory_radius {
                                 explored.gadgets.insert(connector.gid);
                                 explored.center_distance.insert(connector.gid, peer_dist);
                                 explored.phase.insert(connector.gid, ExplorePhase::MandatoryZone);
@@ -581,8 +944,8 @@ impl WindowCoordinator {
                             }
                         }
                         Err(handle) => {
-                            if my_dist < buffer_radius {
-                                async_handles.push(handle);
+                            if my_dist < mandatory_radius {
+                                async_handles.push(((fgid, port as u64), handle));
                             }
                         }
                     }
@@ -592,7 +955,7 @@ impl WindowCoordinator {
             // Enqueue sync neighbors: free-hops to front (distance 0), others to back.
             for (gid, is_free_hop) in sync_neighbors {
                 let peer_dist = explored.center_distance[&gid];
-                if peer_dist < buffer_radius {
+                if peer_dist < mandatory_radius {
                     if is_free_hop {
                         explored.frontier.push_front(gid);
                     } else {
@@ -601,28 +964,42 @@ impl WindowCoordinator {
                 }
             }
 
-            // Await async output handles.
-            for handle in async_handles {
-                if let Some(connector) = handle.await.unwrap_or(None) {
-                    if explored.gadgets.contains(&connector.gid) {
-                        continue;
-                    }
-                    let gadgets = self.gadgets.read().await;
-                    let peer = &gadgets[&connector.gid];
-                    let peer_dist = if peer.is_free_hop { my_dist } else { my_dist + 1 };
-                    if peer_dist <= buffer_radius {
-                        explored.gadgets.insert(connector.gid);
-                        explored.center_distance.insert(connector.gid, peer_dist);
-                        explored.phase.insert(connector.gid, ExplorePhase::MandatoryZone);
-                        if peer_dist < buffer_radius {
-                            if peer.is_free_hop {
-                                explored.frontier.push_front(connector.gid);
-                            } else {
-                                explored.frontier.push_back(connector.gid);
-                            }
+            self.record_decode_dependencies(center_gid, &explored.gadgets).await;
+            if !async_handles.is_empty() {
+                self.publish_progress(
+                    center_gid,
+                    coordinator::DecodeProgressState::NeedsGraph(
+                        async_handles.iter().map(|(blocker, _)| *blocker).collect(),
+                    ),
+                )
+                .await;
+            }
+            let resolved = futures_util::future::join_all(async_handles.into_iter().map(|(_, handle)| handle)).await;
+            let had_resolved_handles = !resolved.is_empty();
+            for connector in resolved.into_iter().flatten().flatten() {
+                if explored.gadgets.contains(&connector.gid) {
+                    continue;
+                }
+                let gadgets = self.gadgets.read().await;
+                let peer = &gadgets[&connector.gid];
+                let peer_dist = if peer.is_free_hop { my_dist } else { my_dist + 1 };
+                if peer_dist <= mandatory_radius {
+                    explored.gadgets.insert(connector.gid);
+                    explored.center_distance.insert(connector.gid, peer_dist);
+                    explored.phase.insert(connector.gid, ExplorePhase::MandatoryZone);
+                    if peer_dist < mandatory_radius {
+                        if peer.is_free_hop {
+                            explored.frontier.push_front(connector.gid);
+                        } else {
+                            explored.frontier.push_back(connector.gid);
                         }
                     }
                 }
+            }
+            self.record_decode_dependencies(center_gid, &explored.gadgets).await;
+            if had_resolved_handles {
+                self.publish_progress(center_gid, coordinator::DecodeProgressState::Pending)
+                    .await;
             }
         }
 
@@ -631,7 +1008,7 @@ impl WindowCoordinator {
         // they were at exactly buffer_radius.
         explored.frontier.clear();
         for &gid in &explored.gadgets {
-            if explored.center_distance[&gid] == buffer_radius {
+            if explored.center_distance[&gid] == mandatory_radius {
                 explored.frontier.push_back(gid);
             } else {
                 // Free-hop gadgets at distances < buffer_radius might also
@@ -727,6 +1104,23 @@ impl WindowCoordinator {
     /// `buffer_radius` boundary-distance requirement.
     ///
     /// Returns `None` if cancelled.
+    /// Re-seed the BFS frontier for a repeat [`Self::explore_lookahead_zone`]
+    /// pass (the commit loop's retry iterations): every explored gadget goes
+    /// back on the frontier, in ascending center-distance order.
+    ///
+    /// The ordering keeps the 0-1 BFS's minimal-distance property for NEWLY
+    /// discovered gadgets: seeds pop in non-decreasing distance, so a new
+    /// neighbor's first discovery is via its closest explored source (already-
+    /// explored gadgets keep their original distances and are skipped by the
+    /// `contains` guard). Re-seeding everything (not just the old boundary) is
+    /// deliberate — a gadget previously skipped because its syndrome was not
+    /// yet ready can sit next to ANY explored gadget, not just the frontier.
+    fn reseed_lookahead_frontier(explored: &mut ExploredWindow) {
+        let mut seeds: Vec<u64> = explored.gadgets.iter().copied().collect();
+        seeds.sort_unstable_by_key(|g| explored.center_distance[g]);
+        explored.frontier = seeds.into();
+    }
+
     async fn explore_lookahead_zone(&self, explored: &mut ExploredWindow) -> Option<()> {
         let lookahead_radius = self.config.lookahead_radius();
         if lookahead_radius == 0 {
@@ -1090,42 +1484,48 @@ impl WindowCoordinator {
     /// gadgets (marks remaining Decoding(leader) back to Uncommitted).
     ///
     /// Returns `None` only on cancellation.
+    #[allow(clippy::too_many_arguments)]
     async fn decode_and_commit(
         &self,
         center_gid: u64,
         commit_region: &HashSet<u64>,
         committing_cids: &HashSet<u64>,
         window: &HashSet<u64>,
+        explore_ns: u64,
+        leader_arrived_ns: u64,
+        mandatory_ready_ns: u64,
     ) -> Option<()> {
         let span = Span::root("decode_window", SpanContext::random());
         span.add_property(|| ("center_gid", format!("{center_gid}")));
         span.add_property(|| ("commit_region", format!("{:?}", commit_region)));
         span.add_property(|| ("window", format!("{:?}", window)));
 
-        // first wait for all the outcomes to be loaded to make sure that their check
-        // models and error models are completely loaded
+        // Every gadget in the decoder window must have measured outcomes, but
+        // only gadgets selected for commit must have entered `decode()`. The
+        // outer buffer boundary can intentionally have an unconnected output:
+        // its syndrome is the required context, while its future-dependent
+        // error model belongs to a later window. Requiring `decode_ready` for
+        // that buffer-only gadget would deadlock this window against the CFG
+        // branch that creates its successor.
         let token = self.cancellation.read().await.clone();
+        let (required_outcomes, required_decode_ready) = required_window_readiness(window, commit_region);
         let mut handles: Vec<JoinHandle<bool>> = vec![];
         {
             let gadgets = self.gadgets.read().await;
-            for &window_gid in window {
-                let gadget = gadgets.get(&window_gid)?;
+            for gid in required_outcomes {
+                let gadget = gadgets.get(&gid)?;
                 if let Err(handle) = check_or_receiver(&gadget.outcomes, token.clone()) {
                     handles.push(handle);
                 }
-            }
-            // Also wait for outcomes of all commit_region gadgets
-            for &cgid in commit_region {
-                if !window.contains(&cgid)
-                    && let Some(gadget) = gadgets.get(&cgid)
-                    && let Err(handle) = check_or_receiver(&gadget.outcomes, token.clone())
+                if required_decode_ready.contains(&gid)
+                    && let Err(handle) = check_or_receiver(&gadget.decode_ready, token.clone())
                 {
                     handles.push(handle);
                 }
             }
         }
-        futures_util::future::join_all(handles).await;
-        if token.is_cancelled() {
+        let ready = futures_util::future::join_all(handles).await;
+        if token.is_cancelled() || ready.iter().any(|arrived| !matches!(arrived, Ok(true))) {
             return None;
         }
         span.add_event(Event::new("outcomes_ready"));
@@ -1343,8 +1743,54 @@ impl WindowCoordinator {
         span.add_event(Event::new("relative_program"));
         span.add_event(Event::new("committing"));
 
+        // From here on there is no further early return before the decode
+        // completes, so this is the one safe place to open the timing record
+        // and bump `decodes_in_flight` — every earlier `?` above would leak an
+        // increment placed at function entry (decode_and_commit has several
+        // cancellation early-returns between entry and here).
+        let decode_start_ns = crate::misc::util::timestamp_ns();
+        let concurrent = self.decodes_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        // Buffer = uncommitted gadgets still in the decoder window but outside
+        // the commit region. Already-Committed gadgets can remain in `window`
+        // as check-only context — they are neither commit nor buffer.
+        let buffer_region_gids = {
+            let gadgets = self.gadgets.read().await;
+            let mut gids: Vec<u64> = window
+                .iter()
+                .copied()
+                .filter(|gid| !commit_region.contains(gid))
+                .filter(|gid| match gadgets.get(gid) {
+                    Some(g) => !matches!(*g.state.borrow(), GadgetState::Committed),
+                    None => false,
+                })
+                .collect();
+            gids.sort();
+            gids
+        };
+        let mut timing = coordinator::WindowTiming {
+            explore_ns,
+            leader_arrived_ns,
+            mandatory_ready_ns,
+            decode_start_ns,
+            concurrent_decodes: concurrent,
+            num_committing: commit_region.len() as u32,
+            num_gadgets: window.len() as u32,
+            window_gids: {
+                let mut gids: Vec<u64> = window.iter().cloned().collect();
+                gids.sort();
+                gids
+            },
+            commit_region_gids: {
+                let mut gids: Vec<u64> = commit_region.iter().copied().collect();
+                gids.sort();
+                gids
+            },
+            buffer_region_gids,
+            ..Default::default()
+        };
+
         let (parity_factor, errors) = self
-            .decode_parity_factor(committing_cids, &relative_program, &mapping, &span)
+            .decode_parity_factor(center_gid, committing_cids, &relative_program, &mapping, &span, &mut timing)
             .await;
         span.add_event(Event::new("decoded"));
 
@@ -1352,6 +1798,17 @@ impl WindowCoordinator {
             leader_gid: center_gid,
         }))
         .await;
+        timing.decode_end_ns = crate::misc::util::timestamp_ns();
+        // Post-decode bookkeeping is the exact remainder of the handler span once
+        // every measured phase is subtracted (all share timestamp_ns()'s clock),
+        // so prep+build+merge+compact+load+decode+finalize == decode_end -
+        // decode_start with no unaccounted gap.
+        timing.finalize_ns = timing.decode_end_ns.saturating_sub(timing.decode_start_ns).saturating_sub(
+            timing.prep_ns + timing.build_ns + timing.merge_ns + timing.compact_ns + timing.load_ns + timing.decode_ns,
+        );
+        self.decodes_in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        timing.cache_size = self.loaded_decoders.read().await.len() as u32;
+        self.timing_log.push(timing);
         span.add_property(|| {
             let global_subgraph = Self::global_subgraph_of(&mapping, &errors, &parity_factor.subgraph);
             ("parity_factor", format!("{:?}", global_subgraph))
@@ -1519,12 +1976,15 @@ impl WindowCoordinator {
             .collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn decode_parity_factor(
         &self,
+        gid: u64,
         committing_cids: &HashSet<u64>,
         relative_program: &RelativeProgram,
         mapping: &RelativeMapping,
         span: &Span,
+        timing: &mut coordinator::WindowTiming,
     ) -> (blackbox_decoder::ParityFactor, Arc<Vec<ErrorIndex>>) {
         // calculate syndrome
         span.add_event(Event::new("calculate_syndrome"));
@@ -1548,9 +2008,27 @@ impl WindowCoordinator {
         span.add_event(Event::new("syndrome_calculated"));
         span.add_property(|| ("syndrome", format!("{:?}", syndrome)));
 
+        timing.syndrome_weight = syndrome.data.iter().map(|b| b.count_ones()).sum::<u32>();
+        timing.syndrome_bytes = syndrome.data.len() as u64;
+        timing.syndrome_ready_ns = {
+            let map = self.syndrome_ready_at.lock().unwrap();
+            mapping
+                .global_cid_of
+                .iter()
+                .filter_map(|cid| map.get(cid).copied())
+                .max()
+                .unwrap_or(0)
+        };
+
         let cache_key = if self.config.persistent_decoder {
-            let error_models = self.error_models.read().await;
+            // Lock order: error_model_types (field 4) BEFORE error_models
+            // (field 7). The reverse order deadlocked in a 3-cycle with
+            // execute(ErrorModel) (holds error_model_types.read, waits
+            // error_models.write) and load_library (write on
+            // error_model_types queued in between, blocking this task's
+            // error_model_types.read under the fair RwLock).
             let error_model_types = self.error_model_types.read().await;
+            let error_models = self.error_models.read().await;
             Some(DecoderCacheKey {
                 relative_program: relative_program.clone(),
                 error_model_fingerprints: build_modifier_fingerprints(mapping, &error_models, &error_model_types),
@@ -1572,6 +2050,13 @@ impl WindowCoordinator {
                 } else {
                     syndrome.clone()
                 };
+                timing.path = coordinator::DecodePath::CacheHit as i32;
+                timing.num_hyperedges = loaded.hyperedge_vertices.len() as u32;
+                timing.num_vertices = loaded.vertex_num as u32;
+                // Front of the handler: syndrome assembly + cache-key lookup up to
+                // here, anchored to the absolute decode_start stamp (same clock).
+                timing.prep_ns = crate::misc::util::timestamp_ns().saturating_sub(timing.decode_start_ns);
+                let decode_started = std::time::Instant::now();
                 let parity_factor = self
                     .black_box_decoder
                     .clone()
@@ -1581,25 +2066,56 @@ impl WindowCoordinator {
                     })
                     .await
                     .unwrap();
+                timing.decode_ns = decode_started.elapsed().as_nanos() as u64;
+                timing.decoder_compute_ns = parity_factor.compute_ns;
+                timing.correction_weight = parity_factor.subgraph.len() as u32;
+                timing.parity_factor_bytes = parity_factor.encoded_len() as u64;
                 if self.config.assert_parity_factor {
                     assert_parity_factor(loaded.decoding_hypergraph.as_ref().unwrap(), &parity_factor, &decode_syndrome);
                 }
+                self.record_dem_prediction(
+                    gid,
+                    &parity_factor,
+                    &loaded.errors,
+                    loaded.constituents.as_deref(),
+                    &loaded.hyperedge_vertices,
+                    loaded.committed.as_deref().map(|c| c.as_slice()),
+                    Some(committing_cids),
+                    mapping,
+                );
                 return (parity_factor, loaded.errors.clone());
             }
         }
 
         // when the decoder is not available, construct the decoding hypergraph for the window
         // and instantiate such a decoder
-        let (mut decoding_hypergraph, mut errors) =
+        // Front of the handler: syndrome assembly + cache-key fingerprint up to
+        // here (build begins next), anchored to the absolute decode_start stamp.
+        timing.prep_ns = crate::misc::util::timestamp_ns().saturating_sub(timing.decode_start_ns);
+        let build_started = std::time::Instant::now();
+        let (mut decoding_hypergraph, mut errors, mut committed) =
             self.decoding_hypergraph(committing_cids, relative_program, mapping).await;
+        timing.build_ns = build_started.elapsed().as_nanos() as u64;
+        let mut constituents = None;
 
         // merge the decoding hypergraph edges if their syndromes are the same
         if self.config.merge_hyperedges {
+            let merge_started = std::time::Instant::now();
+            let original_errors = errors.clone();
+            let original_committed = committed.clone();
             let mut original_to_merged = Vec::with_capacity(errors.len());
             let mut merged: HashMap<Vec<u64>, (usize, f64)> = HashMap::new();
             let mut merged_hyperedges: Vec<Hyperedge> = Vec::with_capacity(errors.len());
             let mut merged_errors = Vec::with_capacity(errors.len());
-            for (hyperedge, error_index) in decoding_hypergraph.hyperedges.iter().zip(errors.iter()) {
+            // committed flag of each merged edge follows its representative error
+            // (the one update_pauli_frame's committing_cids filter keys on)
+            let mut merged_committed: Vec<bool> = Vec::with_capacity(errors.len());
+            for ((hyperedge, error_index), &is_committed) in decoding_hypergraph
+                .hyperedges
+                .iter()
+                .zip(errors.iter())
+                .zip(original_committed.iter())
+            {
                 let mut syndrome = hyperedge.vertices.clone();
                 syndrome.sort();
                 debug_assert!({
@@ -1613,6 +2129,7 @@ impl WindowCoordinator {
                     if hyperedge.probability > *best_p_e {
                         *best_p_e = hyperedge.probability;
                         merged_errors[*ei] = error_index.clone();
+                        merged_committed[*ei] = is_committed;
                     }
                     original_to_merged.push(*ei);
                 } else {
@@ -1622,6 +2139,7 @@ impl WindowCoordinator {
                         vertices: syndrome.clone(),
                     });
                     merged_errors.push(error_index.clone());
+                    merged_committed.push(is_committed);
                     original_to_merged.push(ei);
                     merged.insert(syndrome, (ei, hyperedge.probability));
                 }
@@ -1630,19 +2148,40 @@ impl WindowCoordinator {
                 vertex_num: decoding_hypergraph.vertex_num,
                 hyperedges: merged_hyperedges,
             };
+            let mut constituent_vec: Vec<Vec<ErrorIndex>> = vec![Vec::new(); merged_errors.len()];
+            for (orig_idx, &mi) in original_to_merged.iter().enumerate() {
+                constituent_vec[mi].push(original_errors[orig_idx].clone());
+            }
+            constituents = Some(Arc::new(constituent_vec));
             errors = Arc::new(merged_errors);
+            committed = merged_committed;
+            timing.merge_ns = merge_started.elapsed().as_nanos() as u64;
         }
+        let committed = Arc::new(committed);
+
+        // PRE-compaction vertex lists per (merged) hyperedge: compaction
+        // renumbers vertices but not hyperedges, and the DEM flips need the
+        // original window-local indices to map back to global (cid, idx).
+        let hyperedge_vertices: Arc<Vec<Vec<u64>>> =
+            Arc::new(decoding_hypergraph.hyperedges.iter().map(|h| h.vertices.clone()).collect());
 
         // Strip isolated vertices (checks with no incident hyperedges) and
         // remap both the hypergraph and syndrome to a contiguous vertex space.
         // This is necessary because some decoders (e.g. MWPF) reject graphs
         // with isolated vertices.
+        let compact_started = std::time::Instant::now();
         let (decoding_hypergraph, syndrome, vertex_remap) = Self::compact_vertices(decoding_hypergraph, &syndrome);
+        timing.compact_ns = compact_started.elapsed().as_nanos() as u64;
 
         let decoding_hypergraph = Arc::new(decoding_hypergraph);
+        timing.num_hyperedges = decoding_hypergraph.hyperedges.len() as u32;
+        timing.num_vertices = decoding_hypergraph.vertex_num as u32;
+        timing.hypergraph_bytes = decoding_hypergraph.as_ref().encoded_len() as u64;
 
         let parity_factor = if let Some(cache_key) = cache_key {
+            timing.path = coordinator::DecodePath::BuiltLoaded as i32;
             span.add_event(Event::new("decoding").with_property(|| ("type", "loading")));
+            let load_started = std::time::Instant::now();
             let hid = self
                 .black_box_decoder
                 .clone()
@@ -1650,42 +2189,153 @@ impl WindowCoordinator {
                 .await
                 .unwrap()
                 .hid;
+            timing.load_ns = load_started.elapsed().as_nanos() as u64;
             let mut loaded_decoders = self.loaded_decoders.write().await;
             loaded_decoders.insert(
                 cache_key,
                 LoadedDecoder {
                     hid,
                     errors: errors.clone(),
+                    constituents: constituents.clone(),
                     decoding_hypergraph: self.config.assert_parity_factor.then_some(decoding_hypergraph.clone()),
                     vertex_remap: vertex_remap.clone(),
+                    hyperedge_vertices: hyperedge_vertices.clone(),
+                    committed: Some(committed.clone()),
+                    vertex_num: decoding_hypergraph.vertex_num,
                 },
             );
             drop(loaded_decoders);
-            self.black_box_decoder
+            let decode_started = std::time::Instant::now();
+            let parity_factor = self
+                .black_box_decoder
                 .clone()
                 .decode_loaded(blackbox_decoder::LoadedDecodingProblem {
                     hid,
                     syndrome: Some(syndrome.clone()),
                 })
                 .await
-                .unwrap()
+                .unwrap();
+            timing.decode_ns = decode_started.elapsed().as_nanos() as u64;
+            parity_factor
         } else {
+            timing.path = coordinator::DecodePath::Temporary as i32;
             span.add_event(Event::new("decoding").with_property(|| ("type", "temporary")));
-            self.black_box_decoder
+            let decode_started = std::time::Instant::now();
+            let parity_factor = self
+                .black_box_decoder
                 .clone()
                 .decode(blackbox_decoder::DecodingProblem {
                     hypergraph: Some(decoding_hypergraph.as_ref().clone()),
                     syndrome: Some(syndrome.clone()),
                 })
                 .await
-                .unwrap()
+                .unwrap();
+            timing.decode_ns = decode_started.elapsed().as_nanos() as u64;
+            parity_factor
         };
+        timing.decoder_compute_ns = parity_factor.compute_ns;
+        timing.correction_weight = parity_factor.subgraph.len() as u32;
+        timing.parity_factor_bytes = parity_factor.encoded_len() as u64;
 
         if self.config.assert_parity_factor {
             assert_parity_factor(&decoding_hypergraph, &parity_factor, &syndrome);
         }
 
+        self.record_dem_prediction(
+            gid,
+            &parity_factor,
+            &errors,
+            constituents.as_deref(),
+            &hyperedge_vertices,
+            Some(committed.as_slice()),
+            Some(committing_cids),
+            mapping,
+        );
         (parity_factor, errors)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_dem_prediction(
+        &self,
+        gid: u64,
+        parity_factor: &blackbox_decoder::ParityFactor,
+        errors: &[ErrorIndex],
+        constituents: Option<&Vec<Vec<ErrorIndex>>>,
+        hyperedge_vertices: &[Vec<u64>],
+        committed: Option<&[bool]>,
+        committing_cids: Option<&HashSet<u64>>,
+        mapping: &RelativeMapping,
+    ) {
+        // Zero-overhead contract for stats-only shots: skip all membership/flip
+        // computation when the DEM log is disabled (push_prediction would no-op).
+        if !self.dem_log.is_enabled() {
+            return;
+        }
+        // Split fired mechanisms into finalized (commit region → permanent) and
+        // tentative (buffer/lookahead → overwritten by the next window). A
+        // hyperedge is committed iff its owning gadget is in the commit region.
+        let mut fired = vec![];
+        let mut fired_buffer = vec![];
+        for &ei in parity_factor.subgraph.iter() {
+            let edge_committed = committed.is_none_or(|c| c[ei as usize]);
+            let sink = if edge_committed { &mut fired } else { &mut fired_buffer };
+            let mut push = |local: &ErrorIndex| {
+                sink.push((mapping.global_eid_of[local.eid as usize], local.error_index));
+            };
+            match constituents {
+                Some(cons) => cons[ei as usize].iter().for_each(&mut push),
+                None => push(&errors[ei as usize]),
+            }
+        }
+        // Full window membership, not just fired: every decoded mechanism, split by
+        // commit region, so the view can render "processed, no flip predicted"
+        // states. Same indexing discipline as the fired loop above — `ei` ranges
+        // over the decoded (merged) hyperedge list that constituents/errors/
+        // committed are parallel to.
+        let mut committed_edges = vec![];
+        let mut buffer_edges = vec![];
+        for ei in 0..hyperedge_vertices.len() {
+            let edge_committed = committed.is_none_or(|c| c[ei]);
+            let sink = if edge_committed {
+                &mut committed_edges
+            } else {
+                &mut buffer_edges
+            };
+            let mut push = |local: &ErrorIndex| {
+                sink.push((mapping.global_eid_of[local.eid as usize], local.error_index));
+            };
+            match constituents {
+                Some(cons) => cons[ei].iter().for_each(&mut push),
+                None => push(&errors[ei]),
+            }
+        }
+        let flips = coordinator::dem::prediction_flips(
+            &parity_factor.subgraph,
+            hyperedge_vertices,
+            committed,
+            committing_cids,
+            &mapping.start_indices,
+            &mapping.global_cid_of,
+        );
+        debug_assert!(
+            fired.iter().all(|e| committed_edges.contains(e)),
+            "fired must be a subset of committed_edges"
+        );
+        debug_assert!(
+            fired_buffer.iter().all(|e| buffer_edges.contains(e)),
+            "fired_buffer must be a subset of buffer_edges"
+        );
+        self.dem_log.push_prediction(coordinator::dem::DemPrediction {
+            gid,
+            // seq is assigned by push_prediction
+            window_gids: mapping.global_gid_of.clone(),
+            committed_edges,
+            buffer_edges,
+            fired,
+            fired_buffer,
+            flips,
+            ..Default::default()
+        });
     }
 
     async fn decoding_hypergraph(
@@ -1693,7 +2343,7 @@ impl WindowCoordinator {
         committing_cids: &HashSet<u64>,
         relative_program: &RelativeProgram,
         mapping: &RelativeMapping,
-    ) -> (DecodingHypergraph, Arc<Vec<ErrorIndex>>) {
+    ) -> (DecodingHypergraph, Arc<Vec<ErrorIndex>>, Vec<bool>) {
         #[cfg(feature = "cli")]
         log::info!("constructing decoding hypergraph for cids={committing_cids:?}");
         let error_model_types = self.error_model_types.read().await;
@@ -1701,6 +2351,10 @@ impl WindowCoordinator {
 
         let mut hyperedges: Vec<Hyperedge> = vec![];
         let mut error_reference: Vec<ErrorIndex> = vec![];
+        // Parallel to `hyperedges`: is this error's owning gadget in the commit
+        // region? Only committed errors are applied by `update_pauli_frame`, so
+        // the DEM flips/fired must count only these (see `prediction_flips`).
+        let mut committed: Vec<bool> = vec![];
 
         // Iterate over all gadgets' error models. Handles three configurations:
         //   - Normal gadgets (has check_model): local checks + remote checks
@@ -1791,6 +2445,7 @@ impl WindowCoordinator {
                         vertices,
                         probability: error.probability,
                     });
+                    committed.push(is_in_commit_region);
                 }
             }
         }
@@ -1798,7 +2453,7 @@ impl WindowCoordinator {
             vertex_num: relative_program.count_checks as u64,
             hyperedges,
         };
-        (hypergraph, Arc::new(error_reference))
+        (hypergraph, Arc::new(error_reference), committed)
     }
 
     /// Remove vertices that have no incident hyperedges and remap the
@@ -2225,12 +2880,14 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                     Gadget {
                         instance: gadget.clone(),
                         outcomes: watch::channel(None).0,
+                        decode_ready: watch::channel(None).0,
                         binding_cid: None,
                         // important: we should not use vec![;len] syntax because it will create clones
                         outputs: gadget_type.outputs.iter().map(|_| watch::channel(None).0).collect(),
                         pauli_frame: watch::channel(None).0,
                         is_free_hop,
                         state: watch::channel(GadgetState::Uncommitted).0,
+                        outcome_seq: Default::default(),
                     },
                 );
                 // Drain pending referrals for newly connected output ports.
@@ -2264,6 +2921,14 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                                     }
                                     let target_gid = resolved_gids[referral.ri].unwrap_or(u64::MAX);
                                     if target_gid == referral.owner_gid {
+                                        // Self-reference: no referring_eids entry, but the
+                                        // DEM slot resolves to the owner's binding check
+                                        // model (guaranteed bound — an error model can only
+                                        // attach to an existing check model).
+                                        if let Some(owner_cid) = gadgets.get(&referral.owner_gid).and_then(|g| g.binding_cid)
+                                        {
+                                            self.dem_log.on_remote_resolved(referral.eid, referral.ri, owner_cid);
+                                        }
                                         continue;
                                     }
                                     if target_gid == u64::MAX {
@@ -2281,8 +2946,13 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                                             if let Some(target_cm) = check_models.get_mut(&target_cid) {
                                                 target_cm.referring_eids.push(referral.eid);
                                             }
+                                            // DEM: this slot just resolved to a bound target.
+                                            self.dem_log.on_remote_resolved(referral.eid, referral.ri, target_cid);
                                         } else {
-                                            pending_by_gid.entry(target_gid).or_default().push(referral.eid);
+                                            pending_by_gid
+                                                .entry(target_gid)
+                                                .or_default()
+                                                .push((referral.eid, referral.ri));
                                         }
                                     }
                                 }
@@ -2325,12 +2995,23 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                 debug_assert!(check_model_type.gtype == WILDCARD || check_model_type.gtype == gadget.instance.gtype);
                 debug_assert!(gadget.binding_cid.is_none());
                 gadget.binding_cid.replace(cid);
-                // Drain any deferred referring_eids that were waiting for this
-                // gadget to get a check model binding.
-                let deferred_referring_eids = {
+                // Drain any deferred `(eid, ri)` referrals that were waiting for
+                // this gadget to get a check model binding.
+                let deferred_referring: Vec<(u64, usize)> = {
                     let mut pending_by_gid = self.pending_referring_by_gid.lock().await;
                     pending_by_gid.remove(&check_model.gid).unwrap_or_default()
                 };
+                // record the new detector group in the DEM increment log
+                // (record-only); announcing the cid may release pending DEM
+                // edges that reference it
+                self.dem_log
+                    .on_check_model(check_model.gid, cid, check_model_type.checks.len() as u64);
+                // DEM: each drained referral's remote slot just resolved to the
+                // new check model's cid
+                for &(eid, ri) in deferred_referring.iter() {
+                    self.dem_log.on_remote_resolved(eid, ri, cid);
+                }
+                let deferred_referring_eids: Vec<u64> = deferred_referring.iter().map(|&(eid, _)| eid).collect();
                 // apply the modifier reroutes
                 let mut modified_remote: Vec<_> = check_model_type.remote_gadgets.iter().cloned().map(Some).collect();
                 if let Some(modifier) = &check_model.modifier {
@@ -2354,6 +3035,7 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                         expanded_remote_gadgets: None,
                         syndrome: watch::channel(None).0,
                         referring_eids: deferred_referring_eids,
+                        finished_by: None,
                     },
                 );
                 self.record_event(trace::event::Event::ExecuteCheckModel(trace::ExecuteCheckModelEvent {
@@ -2371,6 +3053,7 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                 let check_model_gid = check_model.gid;
                 let trace_shot = self.trace_shot.clone();
                 let has_trace = self.config.trace_filepath.is_some();
+                let syndrome_ready_at = self.syndrome_ready_at.clone();
                 tokio::spawn(async move {
                     let _guard = _guard;
                     let expanded_remote_gadgets =
@@ -2425,14 +3108,39 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                         }
                         set_bit(&mut syndrome, check_index as u64, is_defect);
                     }
+                    // Which outcome arrival finished this check: the max
+                    // first-arrival seq among its constituent gadgets (all
+                    // present — join_all above waited for their outcomes).
+                    // Replay bookkeeping for decode_started_by.
+                    let finished_by = [check_model.gid]
+                        .into_iter()
+                        .chain(expanded_remote_gadgets.iter().filter_map(|x| *x))
+                        .map(|g| {
+                            let seq = gadgets
+                                .get(&g)
+                                .unwrap()
+                                .outcome_seq
+                                .load(std::sync::atomic::Ordering::SeqCst);
+                            (seq, g)
+                        })
+                        .max();
                     drop(gadgets);
                     drop(check_model_types);
                     // save the result into the check model object
                     let mut check_models = check_models.write().await;
                     let check_model = check_models.get_mut(&cid).unwrap();
                     check_model.expanded_remote_gadgets = Some(expanded_remote_gadgets);
+                    check_model.finished_by = finished_by;
                     check_model.syndrome.send_replace(Some(syndrome));
                     drop(check_models);
+                    // Always-on: record when this cid's syndrome became complete,
+                    // for WindowTiming.syndrome_ready_ns (decode_parity_factor takes
+                    // the max over the window's cids). Unconditional (not gated on
+                    // has_trace) — the timing log has no enable flag.
+                    syndrome_ready_at
+                        .lock()
+                        .unwrap()
+                        .insert(cid, crate::misc::util::timestamp_ns());
                     // Record syndrome-ready trace event
                     if has_trace {
                         trace_shot.lock().await.events.push(trace::Event {
@@ -2463,6 +3171,20 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                     }
                 }
                 let modified_remote = Arc::new(modified_remote);
+
+                // DEM: fold the probability modifiers into the etype's error
+                // list and precompute the required-slot metadata BEFORE taking
+                // the instance locks below — both the clone and the scan are
+                // O(errors) on the etype's whole list (~100 µs for
+                // surface-code etypes) and only need `error_model_types`,
+                // which is already held. Under the locks they serialized
+                // every concurrent registration/submit behind this arm.
+                let prepared_dem = self.dem_log.is_enabled().then(|| {
+                    coordinator::dem::PreparedErrorModel::new(
+                        coordinator::dem::effective_errors(error_model_type, &error_model),
+                        &modified_remote,
+                    )
+                });
 
                 // Acquire locks in ordering: gadgets(read) → check_models(write) →
                 // error_models(write).  All three are held throughout to ensure
@@ -2499,13 +3221,39 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                 debug_assert!(error_model_type.ctype == WILDCARD || error_model_type.ctype == check_model.instance.ctype);
                 check_model.attaching_eid_vec.push(eid);
 
+                // record the new error mechanisms in the DEM increment log
+                // (record-only, probability modifiers folded in — hoisted
+                // above the locks). Registered BEFORE the resolution loop
+                // below so its on_remote_resolved emissions land on a known
+                // eid.
+                if let Some(prepared) = prepared_dem {
+                    self.dem_log
+                        .on_error_model_prepared(check_model.instance.gid, eid, error_model.cid, prepared);
+                }
+
                 // Register referring_eids for resolved targets; defer unresolved ones.
                 {
                     let mut pending_by_gid = self.pending_referring_by_gid.lock().await;
                     let mut pending_by_port = self.pending_referring_by_port.lock().await;
                     for (ri, target_gid) in resolved_gids.iter().enumerate() {
                         let Some(&target_gid) = target_gid.as_ref() else { continue };
-                        if target_gid == owner_gid || modified_remote[ri].is_none() {
+                        if modified_remote[ri].is_none() {
+                            continue; // dead (rerouted-away) slot — never resolves
+                        }
+                        // DEM: absolute_cid slots (the JIT/playground shape) resolve
+                        // immediately. Checked BEFORE interpreting u64::MAX as
+                        // "blocked" — resolve_remote_check_model_gid short-circuits
+                        // absolute_cid slots to u64::MAX because they are not
+                        // port-based references, so no referral registration either.
+                        if let Some(absolute_cid) = modified_remote[ri].as_ref().and_then(|r| r.absolute_cid) {
+                            self.dem_log.on_remote_resolved(eid, ri, absolute_cid);
+                            continue;
+                        }
+                        if target_gid == owner_gid {
+                            // DEM: self-reference — resolves to the owner's binding
+                            // check model, which is exactly the cid this error model
+                            // attaches to. No referring_eids entry (as before).
+                            self.dem_log.on_remote_resolved(eid, ri, error_model.cid);
                             continue;
                         }
                         if target_gid == u64::MAX {
@@ -2526,9 +3274,11 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                                 if let Some(target_cm) = check_models.get_mut(&target_cid) {
                                     target_cm.referring_eids.push(eid);
                                 }
+                                // DEM: this slot resolved to a bound target.
+                                self.dem_log.on_remote_resolved(eid, ri, target_cid);
                             } else {
                                 // Target gadget exists but has no check model yet — defer.
-                                pending_by_gid.entry(target_gid).or_default().push(eid);
+                                pending_by_gid.entry(target_gid).or_default().push((eid, ri));
                             }
                         }
                     }
@@ -2558,6 +3308,10 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
         let outcomes = request.into_inner();
         let gid = outcomes.gid;
 
+        // Window-formation stamp: this window's leader gadget entered decode().
+        // Threaded into the WindowTiming record (like `explore_ns`).
+        let leader_arrived_ns = crate::misc::util::timestamp_ns();
+
         // Load outcomes
         let is_free_hop;
         {
@@ -2570,15 +3324,43 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
             let mut outcome_data = outcomes
                 .outcomes
                 .ok_or_else(|| Status::invalid_argument("missing outcomes"))?;
-            // Apply loss-random-imputation before storing the outcomes so
-            // every downstream consumer (syndrome calc, pauli-frame tracker,
-            // window decoder) reads a single consistent imputed value per
-            // measurement bit.
-            if let (Some(rng_lock), Some(loss_mask)) = (self.loss_imputation_rng.as_ref(), outcomes.loss_mask.as_ref()) {
-                let mut rng = rng_lock.lock().await;
-                coordinator::apply_loss_random_imputation(&mut outcome_data, loss_mask, &mut *rng);
+            // If outcomes were already published at measurement time (via
+            // `submit_outcomes`), those bits — already imputed once with this
+            // coordinator's RNG — win. A remote client sends the loss_mask on
+            // both the SubmitOutcomes and Decode requests, so if we imputed
+            // again here we would draw fresh random bits for the lost
+            // measurements: they would diverge from the submit-time draw already
+            // stored in the tracker (whose `load_raw` is idempotent) AND
+            // overwrite the watch channel, corrupting the syndrome. So only
+            // impute + publish when no prior submit exists (the naive /
+            // monolithic-style decode-without-submit path). This is the guard
+            // that protects the `outcomes` watch channel; `load_raw` protects
+            // the frame tracker.
+            let already_submitted = gadget.outcomes.borrow().is_some();
+            if !already_submitted {
+                // Apply loss-random-imputation before storing the outcomes so
+                // every downstream consumer (syndrome calc, pauli-frame tracker,
+                // window decoder) reads a single consistent imputed value per
+                // measurement bit.
+                if let (Some(rng_lock), Some(loss_mask)) = (self.loss_imputation_rng.as_ref(), outcomes.loss_mask.as_ref()) {
+                    let mut rng = rng_lock.lock().await;
+                    coordinator::apply_loss_random_imputation(&mut outcome_data, loss_mask, &mut *rng);
+                }
+                self.assign_outcome_seq(gadget);
+                gadget.outcomes.send_replace(Some(outcome_data));
+                // First-arrival stamp: this branch is the None→Some transition
+                // (guarded by `!already_submitted`); a prior `submit_outcomes`
+                // already stamped it otherwise.
+                self.outcome_arrivals.lock().unwrap().push(coordinator::OutcomeArrival {
+                    gid,
+                    received_ns: crate::misc::util::timestamp_ns(),
+                });
             }
-            gadget.outcomes.send_replace(Some(outcome_data));
+            // decode() has been entered: the caller's error model (if any) has
+            // finished loading, so this gadget is now safe to commit. This is the
+            // gate `decode_and_commit` waits on in addition to `outcomes`; a bare
+            // `submit_outcomes` (measurement time) deliberately does not set it.
+            gadget.decode_ready.send_replace(Some(()));
             let gadget_type = gadget_types.get(&gadget.instance.gtype).unwrap();
             let mut readouts = Vec::with_capacity(gadget_type.readouts.len());
             let data: BitVector = gadget.outcomes.borrow().as_ref().unwrap().clone();
@@ -2607,6 +3389,18 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
 
         // Hop-counted gadget: five-step window exploration then commit loop.
 
+        // Register this leader for the ordered hand-off (see the defer check
+        // in the commit loop's claim branch). Registered HERE — at decode()
+        // entry, before the mandatory-zone waits — not at commit-loop entry:
+        // decode() entries arrive in stream order, while step 1/2 wake-ups
+        // under load do not, and a later leader that reached the loop first
+        // used to claim (and commit) the tail ahead of an earlier leader
+        // still waiting on its mandatory syndrome. Deferring to a leader that
+        // is still in steps 1-2 cannot hang: those steps complete iff the
+        // program's gadgets keep arriving, which this decode()'s own return
+        // already depends on.
+        let _waiting = WaitingLeaderGuard::register(&self.waiting_leaders, gid);
+
         // Step 1: Explore mandatory zone (blocking BFS up to buffer_radius).
         let mut explored = self
             .explore_mandatory_zone(gid)
@@ -2618,19 +3412,69 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
         self.await_mandatory_zone_syndrome(&explored)
             .await
             .ok_or_else(|| Status::cancelled("decode cancelled by reset"))?;
+        // Window-formation stamp: mandatory-zone syndrome wait completed.
+        let mandatory_ready_ns = crate::misc::util::timestamp_ns();
 
-        // Step 3: Explore lookahead zone (non-blocking BFS, lookahead_radius more hops).
-        self.explore_lookahead_zone(&mut explored)
-            .await
-            .ok_or_else(|| Status::cancelled("decode cancelled by reset"))?;
+        // Replay bookkeeping: record which outcome arrival completed this
+        // center's mandatory buffer zone — the max first-arrival seq over the
+        // zone's check models. Surfaced by `decode_started_by` so a replay
+        // can anchor "decoding actually started" (readout release) at the
+        // virtual time the buffer became sufficient, not the center's own
+        // execution end. Every finished_by is set: step 2 awaited each zone
+        // syndrome, and finished_by lands in the same critical section.
+        {
+            let unblocker = {
+                let gadgets = self.gadgets.read().await;
+                let check_models = self.check_models.read().await;
+                explored
+                    .gadgets
+                    .iter()
+                    .filter_map(|zgid| gadgets.get(zgid).and_then(|g| g.binding_cid))
+                    .filter_map(|cid| check_models.get(&cid).and_then(|cm| cm.finished_by))
+                    .max()
+            };
+            if let Some((_, ugid)) = unblocker {
+                self.decode_started.lock().unwrap().insert(gid, ugid);
+            }
+        }
 
-        // Commit loop: check window for Decoding gadgets, run steps 3+4,
-        // mark entire window as Decoding, then proceed.
+        // Commit loop: run step 3, check window for Decoding gadgets, run
+        // steps 4+5, mark entire window as Decoding, then proceed.
+        //
+        // Step 3 (lookahead) runs at the TOP of every iteration, not once
+        // before the loop: a leader can sit blocked here for a long time —
+        // released from another window's buffer, or waiting out a neighbor's
+        // decode — and gadgets that registered and became syndrome-ready in
+        // the meantime were invisible to a frozen first-pass window.
+        // Committing from that stale window strands the skipped gadgets for
+        // an extra straggler window and lets a late tail leader commit ahead
+        // of an earlier one (out-of-order commits at the stream tail). The
+        // first iteration consumes step 1's frontier exactly as before;
+        // retries re-seed the frontier from the already-explored set so the
+        // non-blocking BFS can pick up newly available neighbors.
+        //
+        // Window-exploration compute (select_commit_region + shrink_window), for
+        // WindowTiming.explore_ns. Set inside the retry loop below (only the
+        // iteration that reaches the break actually runs steps 4-5); hoisted here
+        // so it's in scope at the decode_and_commit call site after the loop.
+        #[allow(unused_assignments)]
+        let mut explore_ns: u64 = 0;
+        let mut explore_pass: u32 = 0;
         loop {
             let token = self.cancellation.read().await.clone();
             if token.is_cancelled() {
                 return Err(Status::cancelled("decode cancelled by reset"));
             }
+
+            // Step 3: Explore lookahead zone (non-blocking BFS, lookahead_radius
+            // more hops). Re-seeded on retries (see the loop comment above).
+            if explore_pass > 0 {
+                Self::reseed_lookahead_frontier(&mut explored);
+            }
+            explore_pass += 1;
+            self.explore_lookahead_zone(&mut explored)
+                .await
+                .ok_or_else(|| Status::cancelled("decode cancelled by reset"))?;
 
             let blocking_gids: Vec<u64>;
             {
@@ -2702,11 +3546,53 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                 }
 
                 if blocked.is_empty() {
+                    // Ordered hand-off: an EARLIER leader (smaller center gid;
+                    // gid order is topological — a Create::Gadget's connectors
+                    // may only reference already-registered gadgets) is still
+                    // blocked in this same loop and its center sits in OUR
+                    // window. Claiming now would grab that center as buffer
+                    // and commit this window's region ahead of it — the
+                    // out-of-order tail commit (a late leader wins the wake
+                    // race after a buffer release and commits {tail} while an
+                    // earlier round is left for a straggler window). Defer:
+                    // wait for that leader's center to leave Uncommitted (it
+                    // claims, or another window commits it), then retry. The
+                    // smallest-gid waiting leader never defers, so the
+                    // hand-off chain cannot cycle.
+                    let earlier_waiting = {
+                        let waiting = self.waiting_leaders.lock().unwrap();
+                        waiting.iter().copied().find(|w| {
+                            *w < gid
+                                && explored.gadgets.contains(w)
+                                && gadgets
+                                    .get(w)
+                                    .is_some_and(|g| matches!(*g.state.borrow(), GadgetState::Uncommitted))
+                        })
+                    };
+                    if let Some(w) = earlier_waiting {
+                        let mut rx = gadgets
+                            .get(&w)
+                            .expect("waiting leader's gadget exists in the map")
+                            .state
+                            .subscribe();
+                        let token_c = token.clone();
+                        drop(gadgets);
+                        tokio::select! {
+                            result = rx.wait_for(|s| !matches!(s, GadgetState::Uncommitted)) => {
+                                let _ = result;
+                            }
+                            _ = token_c.cancelled() => {}
+                        }
+                        continue;
+                    }
+
+                    let explore_started = std::time::Instant::now();
                     // Step 4: Select commit region.
                     self.select_commit_region(&mut explored, &gadgets);
 
                     // Step 5: Shrink window to minimal decoder window.
                     self.shrink_window(&mut explored, &gadgets);
+                    explore_ns = explore_started.elapsed().as_nanos() as u64;
 
                     // Emit WindowExploreEvent trace.
                     let mandatory_zone_gids: Vec<u64> = explored
@@ -2781,6 +3667,9 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
             &explored.commit_region,
             &explored.committing_cids,
             &explored.decoder_window,
+            explore_ns,
+            leader_arrived_ns,
+            mandatory_ready_ns,
         )
         .await
         .ok_or_else(|| Status::cancelled("decode cancelled by reset"))?;
@@ -2813,8 +3702,21 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
         self.gadgets.write().await.clear();
         self.check_models.write().await.clear();
         self.error_models.write().await.clear();
+        self.decode_progress.write().await.clear();
+        self.decode_dependencies.write().await.clear();
         self.pending_referring_by_gid.lock().await.clear();
         self.pending_referring_by_port.lock().await.clear();
+        self.dem_log.reset();
+        self.timing_log.reset();
+        self.syndrome_ready_at.lock().unwrap().clear();
+        self.outcome_arrivals.lock().unwrap().clear();
+        self.decode_started.lock().unwrap().clear();
+        self.outcome_seq
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        // Defensive: in-flight decode() tasks were cancelled above and their
+        // RAII guards unregister on drop; clear anyway so a stale entry can
+        // never make a next-shot leader defer to a dead one.
+        self.waiting_leaders.lock().unwrap().clear();
         *self.next_gid.lock().await = 1;
         *self.next_cid.lock().await = 1;
         *self.next_eid.lock().await = 1;
@@ -2843,6 +3745,81 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
             }
         }
         Ok(().into())
+    }
+
+    async fn submit_outcomes(&self, request: Request<coordinator::Outcomes>) -> Result<Response<()>, Status> {
+        let outcomes = request.into_inner();
+        let gid = outcomes.gid;
+        let mut data = outcomes
+            .outcomes
+            .ok_or_else(|| Status::invalid_argument("missing outcomes"))?;
+        // Impute lost measurements on arrival, once, using this coordinator's
+        // RNG — the same source the decode path uses. A remote client passes the
+        // loss_mask over the wire (its RNG lives here, on the server) rather than
+        // imputing client-side, so this is where a masked submission is resolved.
+        // The internal `submit_outcomes` publishes these imputed bits to the
+        // watch channel and the frame tracker; `decode` then keeps them via its
+        // idempotent guards (channel `already_submitted` check + tracker
+        // `load_raw` early-return), so it never re-draws over these bits.
+        if let (Some(rng_lock), Some(loss_mask)) = (self.loss_imputation_rng.as_ref(), outcomes.loss_mask.as_ref()) {
+            let mut rng = rng_lock.lock().await;
+            coordinator::apply_loss_random_imputation(&mut data, loss_mask, &mut *rng);
+        }
+        self.submit_outcomes(gid, data).await?;
+        Ok(Response::new(()))
+    }
+
+    async fn wait_for_detectors(
+        &self,
+        request: Request<coordinator::DetectorRequest>,
+    ) -> Result<Response<coordinator::Readouts>, Status> {
+        let gid = request.into_inner().gid;
+        let detectors = self.wait_for_detectors(gid).await?;
+        Ok(Response::new(coordinator::Readouts {
+            gid,
+            detectors: Some(detectors),
+            ..Default::default()
+        }))
+    }
+
+    // ─── DEM gRPC surface (Task 8) ───────────────────────────────────────
+    // Non-blocking drain: the `DrainDem` request carries no `final_flush`
+    // flag (google.protobuf.Empty), so the handler never waits on the task
+    // counter — draining over the wire is safe to interleave with in-flight
+    // decodes. Remote callers that need a settled final flush await their
+    // decodes before draining (the Task 9 integration flow does this).
+
+    async fn drain_dem(&self, _request: Request<()>) -> Result<Response<coordinator::DemDrainResponse>, Status> {
+        Ok(Response::new(self.drain_dem(false).await.into()))
+    }
+
+    async fn drain_dem_predictions(
+        &self,
+        request: Request<coordinator::DemPredictionsRequest>,
+    ) -> Result<Response<coordinator::DemPredictionsResponse>, Status> {
+        let predictions = match request.into_inner().gid {
+            Some(gid) => self.drain_dem_predictions_for(gid),
+            None => self.drain_dem_predictions(),
+        };
+        Ok(Response::new(coordinator::DemPredictionsResponse {
+            predictions: predictions.into_iter().map(Into::into).collect(),
+        }))
+    }
+
+    async fn set_dem_enabled(&self, request: Request<coordinator::DemEnabledRequest>) -> Result<Response<()>, Status> {
+        self.set_dem_enabled(request.into_inner().enabled);
+        Ok(Response::new(()))
+    }
+
+    async fn drain_window_timings(
+        &self,
+        _request: Request<()>,
+    ) -> Result<Response<coordinator::WindowTimingsResponse>, Status> {
+        Ok(Response::new(coordinator::WindowTimingsResponse {
+            timings: self.timing_log.drain(),
+            drained_at_ns: crate::misc::util::timestamp_ns(),
+            outcome_arrivals: std::mem::take(&mut self.outcome_arrivals.lock().unwrap()),
+        }))
     }
 }
 
@@ -3074,5 +4051,1343 @@ mod tests {
             committing_local_cids: committing_local_cids_sorted(&[10, 20].into_iter().collect(), &mapping),
         };
         assert_ne!(k_all, k_partial);
+    }
+
+    // ─── get_gadget_detectors ────────────────────────────────────────────
+
+    /// Build a `CheckModelType` whose checks are pure local-measurement parities.
+    fn local_check_model_type(ctype: u64, checks: &[&[u64]]) -> bin::CheckModelType {
+        use bin::check_model_type::{Check, RemoteMeasurement};
+        bin::CheckModelType {
+            ctype,
+            checks: checks
+                .iter()
+                .map(|measurement_indices| Check {
+                    measurements: measurement_indices
+                        .iter()
+                        .map(|&measurement_index| RemoteMeasurement {
+                            remote_gadget: None,
+                            measurement_index,
+                        })
+                        .collect(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Construct a window `Gadget` carrying the given outcome bits.
+    fn gadget_with_outcomes(gid: u64, gtype: u64, binding_cid: Option<u64>, outcomes: Option<BitVector>) -> Gadget {
+        Gadget {
+            instance: bin::Gadget {
+                gid,
+                gtype,
+                ..Default::default()
+            },
+            outcomes: watch::channel(outcomes).0,
+            decode_ready: watch::channel(None).0,
+            binding_cid,
+            outputs: vec![],
+            pauli_frame: watch::channel(None).0,
+            is_free_hop: false,
+            state: watch::channel(GadgetState::Uncommitted).0,
+            outcome_seq: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_progress_waits_until_resolved_dependencies_are_visible() {
+        let coordinator = Arc::new(WindowCoordinator::new(
+            serde_json::json!({ "buffer_radius": 1 }),
+            BlackBoxDecoderClient::from_mock(Arc::new(crate::decoder::MockDecoder::new())),
+        ));
+        let (output, _) = watch::channel(None);
+        let mut center = gadget_with_outcomes(1, 0, None, None);
+        center.outputs.push(output.clone());
+        coordinator
+            .gadgets
+            .write()
+            .await
+            .extend([(1, center), (2, gadget_with_outcomes(2, 0, None, None))]);
+
+        let mut progress = coordinator.progress_sender(1).await.subscribe();
+        let worker = {
+            let coordinator = Arc::clone(&coordinator);
+            tokio::spawn(async move { coordinator.explore_mandatory_zone(1).await })
+        };
+        progress.changed().await.expect("NeedsGraph progress");
+        assert!(matches!(
+            progress.borrow().state,
+            coordinator::DecodeProgressState::NeedsGraph(_)
+        ));
+
+        let dependency_guard = coordinator.decode_dependencies.write().await;
+        output.send_replace(Some(bin::gadget::Connector { gid: 2, port: 0 }));
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(
+            !progress.has_changed().expect("progress channel"),
+            "Pending became visible before the newly resolved dependency"
+        );
+
+        drop(dependency_guard);
+        progress.changed().await.expect("Pending progress");
+        assert_eq!(progress.borrow().state, coordinator::DecodeProgressState::Pending);
+        let mut dependencies = coordinator.decode_dependencies(1).await;
+        dependencies.sort_unstable();
+        assert_eq!(dependencies, vec![1, 2]);
+        worker.await.expect("exploration task").expect("explored window");
+    }
+
+    /// Construct a window `CheckModel` bound to `gid`/`ctype` with no remotes.
+    fn local_check_model(cid: u64, ctype: u64, gid: u64) -> CheckModel {
+        CheckModel {
+            instance: bin::CheckModel {
+                cid,
+                ctype,
+                gid,
+                ..Default::default()
+            },
+            attaching_eid_vec: vec![],
+            modified_remote_gadgets: Arc::new(vec![]),
+            expanded_remote_gadgets: Some(vec![]),
+            syndrome: watch::channel(None).0,
+            referring_eids: vec![],
+            finished_by: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn gadget_detectors_match_syndrome_slice() {
+        // ctype=10: two finished checks over local measurements [0,1] and [1,2].
+        let ctype = 10;
+        let coordinator = WindowCoordinator::new(
+            serde_json::json!({ "buffer_radius": 0 }),
+            BlackBoxDecoderClient::from_mock(Arc::new(crate::decoder::MockDecoder::new())),
+        );
+        coordinator
+            .check_model_types
+            .write()
+            .await
+            .insert(ctype, Arc::new(local_check_model_type(ctype, &[&[0, 1], &[1, 2]])));
+
+        // outcomes = 0b110 (bit0=0, bit1=1, bit2=1): m0^m1 = 1, m1^m2 = 0.
+        let gid = 1;
+        let cid = 1;
+        let outcomes = bit_vector::from_sparse_indices(3, &[1, 2]);
+        let mut gadgets: HashMap<u64, Gadget> = HashMap::new();
+        gadgets.insert(gid, gadget_with_outcomes(gid, /* gtype */ 0, Some(cid), Some(outcomes)));
+        let mut check_models: HashMap<u64, CheckModel> = HashMap::new();
+        check_models.insert(cid, local_check_model(cid, ctype, gid));
+
+        let check_model_types = coordinator.check_model_types.read().await;
+        let detectors = WindowCoordinator::get_gadget_detectors(gid, &check_model_types, &gadgets, &check_models);
+        assert_eq!(detectors.size, 2);
+        assert_eq!(bit_vector::to_sparse_indices(&detectors), vec![0]);
+    }
+
+    #[tokio::test]
+    async fn gadget_detectors_empty_when_no_binding() {
+        // A gadget with no bound check model yields a zero-length detector vector.
+        let coordinator = WindowCoordinator::new(
+            serde_json::json!({ "buffer_radius": 0 }),
+            BlackBoxDecoderClient::from_mock(Arc::new(crate::decoder::MockDecoder::new())),
+        );
+        let gid = 1;
+        let mut gadgets: HashMap<u64, Gadget> = HashMap::new();
+        gadgets.insert(
+            gid,
+            gadget_with_outcomes(
+                gid,
+                /* gtype */ 0,
+                /* binding_cid */ None,
+                Some(bit_vector::from_sparse_indices(2, &[0])),
+            ),
+        );
+        let check_models: HashMap<u64, CheckModel> = HashMap::new();
+
+        let check_model_types = coordinator.check_model_types.read().await;
+        let detectors = WindowCoordinator::get_gadget_detectors(gid, &check_model_types, &gadgets, &check_models);
+        assert_eq!(detectors.size, 0);
+    }
+
+    // ─── wait_for_detectors ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn wait_for_detectors_resolves_from_syndrome_without_decode() {
+        // Detectors come from the check-model syndrome, NOT the pauli frame. Publish
+        // the syndrome but leave `pauli_frame` UNSET (decode not done) and confirm
+        // wait_for_detectors still returns the detector bits — proving it does not
+        // wait for the BP decode.
+        let coordinator = WindowCoordinator::new(
+            serde_json::json!({ "buffer_radius": 0 }),
+            BlackBoxDecoderClient::from_mock(Arc::new(crate::decoder::MockDecoder::new())),
+        );
+        let gid = 1;
+        let cid = 1;
+        coordinator.gadgets.write().await.insert(
+            gid,
+            gadget_with_outcomes(
+                gid,
+                /* gtype */ 0,
+                Some(cid),
+                Some(bit_vector::from_sparse_indices(3, &[1, 2])),
+            ),
+        );
+        let cm = local_check_model(cid, /* ctype */ 0, gid);
+        cm.syndrome.send_replace(Some(bit_vector::from_sparse_indices(2, &[0])));
+        coordinator.check_models.write().await.insert(cid, cm);
+
+        let detectors = coordinator.wait_for_detectors(gid).await.expect("detectors");
+        assert_eq!(detectors.size, 2);
+        assert_eq!(bit_vector::to_sparse_indices(&detectors), vec![0]);
+        // The pauli frame was never set, so this proves decode-independence.
+        assert!(
+            coordinator
+                .gadgets
+                .read()
+                .await
+                .get(&gid)
+                .unwrap()
+                .pauli_frame
+                .borrow()
+                .is_none(),
+            "detectors resolved without any decode / pauli-frame",
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_detectors_empty_when_no_binding() {
+        // A gadget with no bound check model has no detectors (empty bus), no hang.
+        let coordinator = WindowCoordinator::new(
+            serde_json::json!({ "buffer_radius": 0 }),
+            BlackBoxDecoderClient::from_mock(Arc::new(crate::decoder::MockDecoder::new())),
+        );
+        let gid = 1;
+        coordinator
+            .gadgets
+            .write()
+            .await
+            .insert(gid, gadget_with_outcomes(gid, /* gtype */ 0, /* binding_cid */ None, None));
+        let detectors = coordinator.wait_for_detectors(gid).await.expect("detectors");
+        assert_eq!(detectors.size, 0);
+    }
+
+    // ─── submit_outcomes ─────────────────────────────────────────────────
+
+    // ─── DEM increment log (ported from fork DEM family; note the deliberate
+    // deviation: the coordinator starts DEM DISABLED, so each test enables it) ──
+    use crate::coordinator::coordinator_server::Coordinator as _;
+    use crate::coordinator::dem::{DemDetectorGroup, DemEdge};
+
+    /// A DEM-recording window coordinator: MockDecoder-backed and, unlike the
+    /// fork, explicitly enabled (the server default is disabled).
+    fn dem_window(config: serde_json::Value) -> WindowCoordinator {
+        let coordinator = WindowCoordinator::new(
+            config,
+            BlackBoxDecoderClient::from_mock(Arc::new(crate::decoder::MockDecoder::new())),
+        );
+        coordinator.set_dem_enabled(true);
+        coordinator
+    }
+
+    fn dem_port_type() -> bin::PortType {
+        bin::PortType {
+            ptype: 1,
+            observables: vec![bin::port_type::Observable::default()],
+            ..Default::default()
+        }
+    }
+
+    fn dem_source_gadget_type() -> bin::GadgetType {
+        use crate::misc::bit_matrix::zeros;
+        bin::GadgetType {
+            gtype: 100,
+            outputs: vec![bin::gadget_type::Port {
+                ptype: 1,
+                ..Default::default()
+            }],
+            correction_propagation: Some(zeros(1, 1)),
+            readout_propagation: Some(zeros(0, 1)),
+            logical_correction: Some(zeros(1, 0)),
+            physical_correction: Some(zeros(1, 0)),
+            ..Default::default()
+        }
+    }
+
+    fn dem_sink_gadget_type() -> bin::GadgetType {
+        use crate::misc::bit_matrix::zeros;
+        bin::GadgetType {
+            gtype: 101,
+            inputs: vec![bin::gadget_type::Port {
+                ptype: 1,
+                ..Default::default()
+            }],
+            correction_propagation: Some(zeros(0, 2)),
+            readout_propagation: Some(zeros(0, 2)),
+            logical_correction: Some(zeros(0, 0)),
+            physical_correction: Some(zeros(0, 0)),
+            ..Default::default()
+        }
+    }
+
+    fn dem_check_model_type() -> bin::CheckModelType {
+        bin::CheckModelType {
+            ctype: 10,
+            gtype: WILDCARD,
+            checks: vec![
+                bin::check_model_type::Check::default(),
+                bin::check_model_type::Check::default(),
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn dem_absolute_library(absolute_cid: u64, errors: Vec<Error>) -> bin::Library {
+        bin::Library {
+            port_types: vec![dem_port_type()],
+            gadget_types: vec![dem_source_gadget_type(), dem_sink_gadget_type()],
+            check_model_types: vec![dem_check_model_type()],
+            error_model_types: vec![bin::ErrorModelType {
+                etype: 20,
+                ctype: 10,
+                remote_check_models: vec![RemoteCheckModel {
+                    absolute_cid: Some(absolute_cid),
+                    ..Default::default()
+                }],
+                errors,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn dem_execute_library() -> bin::Library {
+        dem_absolute_library(
+            1,
+            vec![
+                Error {
+                    probability: 0.01,
+                    checks: vec![bin::error_model_type::RemoteCheck {
+                        remote_check_model: None,
+                        check_index: 0,
+                    }],
+                    ..Default::default()
+                },
+                Error {
+                    probability: 0.02,
+                    checks: vec![bin::error_model_type::RemoteCheck {
+                        remote_check_model: Some(0),
+                        check_index: 1,
+                    }],
+                    ..Default::default()
+                },
+            ],
+        )
+    }
+
+    fn dem_port_referral_library() -> bin::Library {
+        bin::Library {
+            port_types: vec![dem_port_type()],
+            gadget_types: vec![dem_source_gadget_type(), dem_sink_gadget_type()],
+            check_model_types: vec![dem_check_model_type()],
+            error_model_types: vec![bin::ErrorModelType {
+                etype: 20,
+                ctype: 10,
+                remote_check_models: vec![make_remote_check(1)],
+                errors: vec![Error {
+                    probability: 0.02,
+                    checks: vec![bin::error_model_type::RemoteCheck {
+                        remote_check_model: Some(0),
+                        check_index: 0,
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    async fn execute_create(coordinator: &WindowCoordinator, create: bin::instruction::Create) -> u64 {
+        coordinator
+            .execute(Request::new(bin::Instruction { create: Some(create) }))
+            .await
+            .unwrap()
+            .into_inner()
+            .id
+    }
+
+    // ─── decode-time prediction recording ────────────────────────────────
+    // As with the monolithic tests, the fork drives these with a real BP
+    // `LocalDecoder`; here the MockDecoder's returned subgraph is pinned via
+    // `set_response` for the fixture's 1-bit syndrome so the window's
+    // commit-region-aware `record_dem_prediction` is exercised.
+    use crate::misc::fastrace::{Span, SpanContext};
+
+    fn local_prediction_relative_program_with_ids(gid: u64, cid: u64, eid: u64) -> (RelativeProgram, RelativeMapping) {
+        let expanded = vec![relative_program::ExpandedGadget {
+            gid,
+            gtype: 0,
+            inputs: vec![],
+            outputs: vec![],
+            check_model: Some(relative_program::ExpandedCheckModel {
+                cid,
+                ctype: 401,
+                remote_gadgets: vec![],
+                count_checks: 1,
+            }),
+            error_models: vec![relative_program::ExpandedErrorModel {
+                eid,
+                etype: 501,
+                remote_check_models: vec![],
+            }],
+        }];
+        RelativeProgram::new(&expanded)
+    }
+
+    fn local_prediction_relative_program() -> (RelativeProgram, RelativeMapping) {
+        local_prediction_relative_program_with_ids(101, 201, 301)
+    }
+
+    /// DEM-enabled window coordinator whose MockDecoder returns subgraph `[0]`
+    /// for the fixture's 1-bit syndrome, with check/error model state preset.
+    async fn coordinator_for_prediction_fixture(
+        config: serde_json::Value,
+        error_probabilities: Vec<f64>,
+    ) -> WindowCoordinator {
+        let mock = Arc::new(crate::decoder::MockDecoder::new());
+        mock.set_response(bit_vector::from_sparse_indices(1, &[0]).data, vec![0])
+            .await;
+        let coordinator = WindowCoordinator::new(config, BlackBoxDecoderClient::from_mock(mock));
+        coordinator.set_dem_enabled(true);
+        coordinator.error_model_types.write().await.insert(
+            501,
+            Arc::new(bin::ErrorModelType {
+                etype: 501,
+                ctype: 401,
+                errors: error_probabilities.into_iter().map(make_error).collect(),
+                ..Default::default()
+            }),
+        );
+        let mut cm = local_check_model(201, 401, 101);
+        cm.attaching_eid_vec.push(301);
+        cm.syndrome.send_replace(Some(bit_vector::from_sparse_indices(1, &[0])));
+        coordinator.check_models.write().await.insert(201, cm);
+        coordinator.error_models.write().await.insert(
+            301,
+            ErrorModel {
+                instance: bin::ErrorModel {
+                    eid: 301,
+                    etype: 501,
+                    cid: 201,
+                    ..Default::default()
+                },
+                modified_remote_check_models: Arc::new(vec![]),
+            },
+        );
+        coordinator
+    }
+
+    #[tokio::test]
+    async fn decode_pushes_global_fired_prediction() {
+        let coordinator = coordinator_for_prediction_fixture(
+            serde_json::json!({ "buffer_radius": 0, "persistent_decoder": false, "merge_hyperedges": false }),
+            vec![0.1],
+        )
+        .await;
+        let (relative_program, mapping) = local_prediction_relative_program();
+        let committing_cids: HashSet<u64> = [201].into_iter().collect();
+        let span = Span::root("test", SpanContext::random());
+
+        let mut timing = coordinator::WindowTiming::default();
+        let (_parity_factor, _errors) = coordinator
+            .decode_parity_factor(101, &committing_cids, &relative_program, &mapping, &span, &mut timing)
+            .await;
+
+        assert_eq!(
+            coordinator.dem_log.drain_predictions(),
+            vec![coordinator::dem::DemPrediction {
+                gid: 101,
+                window_gids: vec![101],
+                committed_edges: vec![(301, 0)],
+                buffer_edges: vec![],
+                fired: vec![(301, 0)],
+                fired_buffer: vec![],
+                flips: vec![(201, 0)],
+                ..Default::default()
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn decode_expands_merged_hyperedge_prediction_constituents() {
+        let coordinator = coordinator_for_prediction_fixture(
+            serde_json::json!({ "buffer_radius": 0, "persistent_decoder": false }),
+            vec![0.1, 0.09],
+        )
+        .await;
+        let (relative_program, mapping) = local_prediction_relative_program();
+        let committing_cids: HashSet<u64> = [201].into_iter().collect();
+        let span = Span::root("test", SpanContext::random());
+
+        let mut timing = coordinator::WindowTiming::default();
+        let (_parity_factor, _errors) = coordinator
+            .decode_parity_factor(101, &committing_cids, &relative_program, &mapping, &span, &mut timing)
+            .await;
+
+        assert_eq!(
+            coordinator.dem_log.drain_predictions(),
+            vec![coordinator::dem::DemPrediction {
+                gid: 101,
+                window_gids: vec![101],
+                committed_edges: vec![(301, 0), (301, 1)],
+                buffer_edges: vec![],
+                fired: vec![(301, 0), (301, 1)],
+                fired_buffer: vec![],
+                flips: vec![(201, 0)],
+                ..Default::default()
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn decode_cache_hit_pushes_global_fired_prediction() {
+        let coordinator = coordinator_for_prediction_fixture(serde_json::json!({ "buffer_radius": 0 }), vec![0.1]).await;
+        let (relative_program, mapping) = local_prediction_relative_program();
+        let committing_cids: HashSet<u64> = [201].into_iter().collect();
+        let (cached_relative_program, cached_mapping) = local_prediction_relative_program_with_ids(102, 202, 301);
+        let cached_committing_cids: HashSet<u64> = [202].into_iter().collect();
+        let span = Span::root("test", SpanContext::random());
+
+        let mut timing = coordinator::WindowTiming::default();
+        let (_parity_factor, _errors) = coordinator
+            .decode_parity_factor(101, &committing_cids, &relative_program, &mapping, &span, &mut timing)
+            .await;
+        let _ = coordinator.dem_log.drain_predictions();
+        let mut cached_cm = local_check_model(202, 401, 102);
+        cached_cm.attaching_eid_vec.push(301);
+        cached_cm
+            .syndrome
+            .send_replace(Some(bit_vector::from_sparse_indices(1, &[0])));
+        coordinator.check_models.write().await.insert(202, cached_cm);
+        let mut cached_timing = coordinator::WindowTiming::default();
+        let (_parity_factor, _errors) = coordinator
+            .decode_parity_factor(
+                102,
+                &cached_committing_cids,
+                &cached_relative_program,
+                &cached_mapping,
+                &span,
+                &mut cached_timing,
+            )
+            .await;
+
+        assert_eq!(
+            coordinator.dem_log.drain_predictions(),
+            vec![coordinator::dem::DemPrediction {
+                gid: 102,
+                seq: 1,
+                window_gids: vec![102],
+                committed_edges: vec![(301, 0)],
+                buffer_edges: vec![],
+                fired: vec![(301, 0)],
+                fired_buffer: vec![],
+                flips: vec![(202, 0)],
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn dem_log_matches_execute_increments() {
+        let coordinator = dem_window(serde_json::json!({ "buffer_radius": 0 }));
+        coordinator.load_library(Request::new(dem_execute_library())).await.unwrap();
+
+        let g1 = execute_create(
+            &coordinator,
+            bin::instruction::Create::Gadget(bin::Gadget {
+                gtype: 100,
+                ..Default::default()
+            }),
+        )
+        .await;
+        let c1 = execute_create(
+            &coordinator,
+            bin::instruction::Create::CheckModel(bin::CheckModel {
+                ctype: 10,
+                gid: g1,
+                ..Default::default()
+            }),
+        )
+        .await;
+        let g2 = execute_create(
+            &coordinator,
+            bin::instruction::Create::Gadget(bin::Gadget {
+                gtype: 101,
+                connectors: vec![bin::gadget::Connector { gid: g1, port: 0 }],
+                ..Default::default()
+            }),
+        )
+        .await;
+        let c2 = execute_create(
+            &coordinator,
+            bin::instruction::Create::CheckModel(bin::CheckModel {
+                ctype: 10,
+                gid: g2,
+                ..Default::default()
+            }),
+        )
+        .await;
+        let e = execute_create(
+            &coordinator,
+            bin::instruction::Create::ErrorModel(bin::ErrorModel {
+                etype: 20,
+                cid: c2,
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!((g1, c1, g2, c2, e), (1, 1, 2, 2, 1));
+
+        let drain = coordinator.drain_dem(false).await;
+        assert_eq!(
+            drain.detector_groups,
+            vec![
+                DemDetectorGroup {
+                    gid: g1,
+                    cid: c1,
+                    count: 2
+                },
+                DemDetectorGroup {
+                    gid: g2,
+                    cid: c2,
+                    count: 2
+                },
+            ]
+        );
+        let mut dets: Vec<Vec<(u64, u64)>> = drain.edges.iter().map(|edge| edge.detectors.clone()).collect();
+        dets.sort();
+        assert_eq!(dets, vec![vec![(c1, 1)], vec![(c2, 0)]]);
+        assert!(drain.edges.iter().all(|edge| edge.eid == e));
+        let mut probabilities: Vec<f64> = drain.edges.iter().map(|edge| edge.probability).collect();
+        probabilities.sort_by(f64::total_cmp);
+        assert_eq!(probabilities, vec![0.01, 0.02]);
+        assert_eq!(coordinator.drain_dem(false).await, Default::default());
+    }
+
+    #[tokio::test]
+    async fn commit_region_waits_for_neighbor_decode_readiness() {
+        use crate::misc::bit_matrix::zeros;
+        let coordinator = Arc::new(dem_window(
+            serde_json::json!({ "buffer_radius": 1, "persistent_decoder": false }),
+        ));
+        let mut library = dem_execute_library();
+        for gt in library.gadget_types.iter_mut() {
+            gt.measurements = vec![Default::default()];
+            let rows = gt.physical_correction.as_ref().unwrap().rows as usize;
+            gt.physical_correction = Some(zeros(rows, 1));
+        }
+        coordinator.load_library(Request::new(library)).await.unwrap();
+
+        let g1 = execute_create(
+            &coordinator,
+            bin::instruction::Create::Gadget(bin::Gadget {
+                gtype: 100,
+                ..Default::default()
+            }),
+        )
+        .await;
+        execute_create(
+            &coordinator,
+            bin::instruction::Create::CheckModel(bin::CheckModel {
+                ctype: 10,
+                gid: g1,
+                ..Default::default()
+            }),
+        )
+        .await;
+        let g2 = execute_create(
+            &coordinator,
+            bin::instruction::Create::Gadget(bin::Gadget {
+                gtype: 101,
+                connectors: vec![bin::gadget::Connector { gid: g1, port: 0 }],
+                ..Default::default()
+            }),
+        )
+        .await;
+        let c2 = execute_create(
+            &coordinator,
+            bin::instruction::Create::CheckModel(bin::CheckModel {
+                ctype: 10,
+                gid: g2,
+                ..Default::default()
+            }),
+        )
+        .await;
+        let one_bit = bit_vector::from_sparse_indices(1, &[]);
+        coordinator.submit_outcomes(g2, one_bit.clone()).await.unwrap();
+
+        let leader_coordinator = Arc::clone(&coordinator);
+        let leader_bits = one_bit.clone();
+        let leader = tokio::spawn(async move {
+            leader_coordinator
+                .decode(Request::new(coordinator::Outcomes {
+                    gid: g1,
+                    outcomes: Some(leader_bits),
+                    ..Default::default()
+                }))
+                .await
+        });
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+            if leader.is_finished() {
+                break;
+            }
+        }
+        assert!(
+            !leader.is_finished(),
+            "submit_outcomes alone must not let a neighboring gadget commit",
+        );
+
+        let eid = execute_create(
+            &coordinator,
+            bin::instruction::Create::ErrorModel(bin::ErrorModel {
+                etype: 20,
+                cid: c2,
+                ..Default::default()
+            }),
+        )
+        .await;
+        let follower_coordinator = Arc::clone(&coordinator);
+        let follower = tokio::spawn(async move {
+            follower_coordinator
+                .decode(Request::new(coordinator::Outcomes {
+                    gid: g2,
+                    outcomes: Some(one_bit),
+                    ..Default::default()
+                }))
+                .await
+        });
+
+        let leader_readouts = leader.await.unwrap().unwrap().into_inner();
+        let follower_readouts = follower.await.unwrap().unwrap().into_inner();
+        assert_eq!(leader_readouts.gid, g1);
+        assert_eq!(follower_readouts.gid, g2);
+
+        let predictions = coordinator.drain_dem_predictions();
+        for mechanism in [(eid, 0), (eid, 1)] {
+            let commits = predictions
+                .iter()
+                .flat_map(|prediction| prediction.committed_edges.iter())
+                .filter(|&&edge| edge == mechanism)
+                .count();
+            assert_eq!(commits, 1, "late mechanism {mechanism:?} commits exactly once");
+        }
+    }
+
+    #[test]
+    fn buffer_only_gadgets_do_not_gate_decode_readiness() {
+        let window = HashSet::from([1, 2, 3]);
+        let commit_region = HashSet::from([1, 2]);
+        let (outcomes, decode_ready) = required_window_readiness(&window, &commit_region);
+
+        assert_eq!(outcomes, HashSet::from([1, 2, 3]));
+        assert_eq!(decode_ready, HashSet::from([1, 2]));
+    }
+
+    /// End-to-end DEM gRPC surface (Task 8): a window coordinator hosted over a
+    /// real gRPC channel via `LocalServer::bind_grpc`, driven entirely through a
+    /// `Remote` `CoordinatorClient`. Exercises `SetDemEnabled` (recording starts
+    /// DISABLED on the server) and `DrainDemPredictions`, and asserts a decode's
+    /// prediction — `seq`/`gid`/`flips` included — survives the round trip.
+    #[cfg(feature = "cli")]
+    #[tokio::test]
+    async fn dem_predictions_round_trip_over_grpc_channel() {
+        use crate::coordinator::CoordinatorClient;
+        use crate::decoder::DynDecoder;
+        use crate::misc::bit_matrix::zeros;
+        use crate::server::ServerConfigs;
+        use clap::Parser;
+        use tonic::transport::Endpoint;
+
+        // In-process window coordinator + mock decoder, exposed over gRPC.
+        let server = ServerConfigs::parse_from([
+            "test",
+            "--coordinator",
+            "window",
+            "--coordinator-config",
+            r#"{"buffer_radius":1,"persistent_decoder":false}"#,
+            "--decoder",
+            "mock",
+        ])
+        .build_local()
+        .await;
+
+        // Make the mock fire hyperedge 0 for the fixture's all-zero window
+        // syndrome (every measurement is 0 → the syndrome bytes are all-zero),
+        // so the recorded prediction carries non-empty fired/flips to prove
+        // those fields survive the wire. Cover 1- and 2-byte all-zero keys.
+        let DynDecoder::Mock(mock) = server.decoder() else {
+            panic!("expected the mock decoder");
+        };
+        for key in [Vec::<u8>::new(), vec![0u8], vec![0u8, 0u8]] {
+            mock.set_response(key, vec![0]).await;
+        }
+
+        let url = server.bind_grpc("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let remote = CoordinatorClient::from_endpoint(Endpoint::from_shared(url).unwrap()).await;
+
+        // Recording starts DISABLED on the server; enable it over the channel.
+        remote.set_dem_enabled(true).await;
+        if let CoordinatorClient::Local(coordinator::DynCoordinator::Window(wc)) = server.coordinator_client() {
+            assert!(
+                wc.dem_log.is_enabled(),
+                "SetDemEnabled(true) RPC must enable recording server-side"
+            );
+        } else {
+            panic!("expected a local window coordinator handle");
+        }
+
+        // Load the Task 7 commit-region fixture library and drive the whole
+        // two-gadget decode over the gRPC channel.
+        let mut library = dem_execute_library();
+        for gt in library.gadget_types.iter_mut() {
+            gt.measurements = vec![Default::default()];
+            let rows = gt.physical_correction.as_ref().unwrap().rows as usize;
+            gt.physical_correction = Some(zeros(rows, 1));
+        }
+        remote.load_library(library).await.unwrap();
+
+        let execute = |create: bin::instruction::Create| {
+            let remote = remote.clone();
+            async move { remote.execute(bin::Instruction { create: Some(create) }).await.unwrap().id }
+        };
+        let g1 = execute(bin::instruction::Create::Gadget(bin::Gadget {
+            gtype: 100,
+            ..Default::default()
+        }))
+        .await;
+        execute(bin::instruction::Create::CheckModel(bin::CheckModel {
+            ctype: 10,
+            gid: g1,
+            ..Default::default()
+        }))
+        .await;
+        let g2 = execute(bin::instruction::Create::Gadget(bin::Gadget {
+            gtype: 101,
+            connectors: vec![bin::gadget::Connector { gid: g1, port: 0 }],
+            ..Default::default()
+        }))
+        .await;
+        let c2 = execute(bin::instruction::Create::CheckModel(bin::CheckModel {
+            ctype: 10,
+            gid: g2,
+            ..Default::default()
+        }))
+        .await;
+
+        let one_bit = bit_vector::from_sparse_indices(1, &[]);
+        remote
+            .submit_outcomes(coordinator::Outcomes {
+                gid: g2,
+                outcomes: Some(one_bit.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Leader decode blocks until the neighbor becomes decode-ready.
+        let leader_remote = remote.clone();
+        let leader_bits = one_bit.clone();
+        let leader = tokio::spawn(async move {
+            leader_remote
+                .decode(coordinator::Outcomes {
+                    gid: g1,
+                    outcomes: Some(leader_bits),
+                    ..Default::default()
+                })
+                .await
+        });
+
+        let eid = execute(bin::instruction::Create::ErrorModel(bin::ErrorModel {
+            etype: 20,
+            cid: c2,
+            ..Default::default()
+        }))
+        .await;
+
+        let follower_remote = remote.clone();
+        let follower = tokio::spawn(async move {
+            follower_remote
+                .decode(coordinator::Outcomes {
+                    gid: g2,
+                    outcomes: Some(one_bit),
+                    ..Default::default()
+                })
+                .await
+        });
+        leader.await.unwrap().unwrap();
+        follower.await.unwrap().unwrap();
+        let _ = eid;
+
+        // Drain predictions over the channel and assert the round trip.
+        let predictions = remote.drain_dem_predictions().await;
+        assert!(!predictions.is_empty(), "the decode recorded predictions, drained over gRPC");
+        assert!(
+            predictions.iter().all(|p| p.gid == g1 || p.gid == g2),
+            "gid survives the round trip",
+        );
+        let mut seqs: Vec<u64> = predictions.iter().map(|p| p.seq).collect();
+        seqs.sort_unstable();
+        assert_eq!(
+            seqs,
+            (0..predictions.len() as u64).collect::<Vec<_>>(),
+            "monotone seq survives the round trip",
+        );
+        assert!(
+            predictions.iter().any(|p| !p.flips.is_empty()),
+            "a fired decode's flips survive the gRPC round trip",
+        );
+        // A second drain is empty — the predictions were moved out over the wire.
+        assert!(remote.drain_dem_predictions().await.is_empty());
+
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dem_log_absolute_cid_forward_reference_waits_for_check_model() {
+        let coordinator = dem_window(serde_json::json!({ "buffer_radius": 0 }));
+        coordinator
+            .load_library(Request::new(dem_absolute_library(
+                2,
+                vec![Error {
+                    probability: 0.02,
+                    checks: vec![bin::error_model_type::RemoteCheck {
+                        remote_check_model: Some(0),
+                        check_index: 1,
+                    }],
+                    ..Default::default()
+                }],
+            )))
+            .await
+            .unwrap();
+
+        let g1 = execute_create(
+            &coordinator,
+            bin::instruction::Create::Gadget(bin::Gadget {
+                gtype: 100,
+                ..Default::default()
+            }),
+        )
+        .await;
+        let c1 = execute_create(
+            &coordinator,
+            bin::instruction::Create::CheckModel(bin::CheckModel {
+                ctype: 10,
+                gid: g1,
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(coordinator.drain_dem(false).await.detector_groups.len(), 1);
+
+        let e = execute_create(
+            &coordinator,
+            bin::instruction::Create::ErrorModel(bin::ErrorModel {
+                etype: 20,
+                cid: c1,
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(e, 1);
+        let pending = coordinator.drain_dem(false).await;
+        assert!(pending.detector_groups.is_empty());
+        assert!(pending.edges.is_empty(), "edge waits for absolute cid=2 to be announced");
+        assert!(coordinator.dem_log.has_pending());
+
+        let g2 = execute_create(
+            &coordinator,
+            bin::instruction::Create::Gadget(bin::Gadget {
+                gtype: 101,
+                connectors: vec![bin::gadget::Connector { gid: g1, port: 0 }],
+                ..Default::default()
+            }),
+        )
+        .await;
+        let c2 = execute_create(
+            &coordinator,
+            bin::instruction::Create::CheckModel(bin::CheckModel {
+                ctype: 10,
+                gid: g2,
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!((g2, c2), (2, 2));
+
+        let drain = coordinator.drain_dem(false).await;
+        assert_eq!(
+            drain.detector_groups,
+            vec![DemDetectorGroup {
+                gid: g2,
+                cid: c2,
+                count: 2
+            }]
+        );
+        assert_eq!(
+            drain.edges,
+            vec![DemEdge {
+                gid: g1,
+                eid: e,
+                error_index: 0,
+                detectors: vec![(c2, 1)],
+                probability: 0.02
+            }]
+        );
+        assert!(!coordinator.dem_log.has_pending());
+    }
+
+    #[tokio::test]
+    async fn dem_log_port_referral_waits_for_target_check_model() {
+        let coordinator = dem_window(serde_json::json!({ "buffer_radius": 0 }));
+        coordinator
+            .load_library(Request::new(dem_port_referral_library()))
+            .await
+            .unwrap();
+
+        let g1 = execute_create(
+            &coordinator,
+            bin::instruction::Create::Gadget(bin::Gadget {
+                gtype: 100,
+                ..Default::default()
+            }),
+        )
+        .await;
+        let c1 = execute_create(
+            &coordinator,
+            bin::instruction::Create::CheckModel(bin::CheckModel {
+                ctype: 10,
+                gid: g1,
+                ..Default::default()
+            }),
+        )
+        .await;
+        let initial = coordinator.drain_dem(false).await;
+        assert_eq!(
+            initial.detector_groups,
+            vec![DemDetectorGroup {
+                gid: g1,
+                cid: c1,
+                count: 2
+            }]
+        );
+        assert!(initial.edges.is_empty());
+
+        let e = execute_create(
+            &coordinator,
+            bin::instruction::Create::ErrorModel(bin::ErrorModel {
+                etype: 20,
+                cid: c1,
+                ..Default::default()
+            }),
+        )
+        .await;
+        let blocked_on_port = coordinator.drain_dem(false).await;
+        assert!(blocked_on_port.detector_groups.is_empty());
+        assert!(
+            blocked_on_port.edges.is_empty(),
+            "edge waits while the source output port is unconnected"
+        );
+        assert!(coordinator.dem_log.has_pending());
+
+        let g2 = execute_create(
+            &coordinator,
+            bin::instruction::Create::Gadget(bin::Gadget {
+                gtype: 101,
+                connectors: vec![bin::gadget::Connector { gid: g1, port: 0 }],
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(g2, 2);
+        let blocked_on_gid = coordinator.drain_dem(false).await;
+        assert!(blocked_on_gid.detector_groups.is_empty());
+        assert!(
+            blocked_on_gid.edges.is_empty(),
+            "edge waits after port resolution until target gid has a check model"
+        );
+        assert!(coordinator.dem_log.has_pending());
+
+        let c2 = execute_create(
+            &coordinator,
+            bin::instruction::Create::CheckModel(bin::CheckModel {
+                ctype: 10,
+                gid: g2,
+                ..Default::default()
+            }),
+        )
+        .await;
+        assert_eq!(c2, 2);
+
+        let drain = coordinator.drain_dem(false).await;
+        assert_eq!(
+            drain.detector_groups,
+            vec![DemDetectorGroup {
+                gid: g2,
+                cid: c2,
+                count: 2
+            }]
+        );
+        assert_eq!(
+            drain.edges,
+            vec![DemEdge {
+                gid: g1,
+                eid: e,
+                error_index: 0,
+                detectors: vec![(c2, 1)],
+                probability: 0.02
+            }]
+        );
+        assert!(!coordinator.dem_log.has_pending());
+    }
+
+    /// Register a submit-outcomes fixture gadget: a 3-measurement, 0-readout
+    /// gadget type known to both the coordinator and the Pauli frame tracker, so
+    /// that `submit_outcomes`' `load_raw` call has a tracker entry to write into.
+    async fn register_submit_fixture(coordinator: &WindowCoordinator, gid: u64) {
+        use crate::misc::bit_matrix::zeros;
+        let gadget_type = bin::GadgetType {
+            gtype: 0,
+            measurements: vec![Default::default(); 3],
+            correction_propagation: Some(zeros(0, 1)),
+            readout_propagation: Some(zeros(0, 1)),
+            logical_correction: Some(zeros(0, 0)),
+            physical_correction: Some(zeros(0, 3)),
+            ..Default::default()
+        };
+        coordinator
+            .pauli_frame_tracker
+            .lock()
+            .await
+            .add_gadget(gid, &gadget_type, None, &HashMap::new(), &[]);
+        coordinator.gadget_types.write().await.insert(0, Arc::new(gadget_type));
+    }
+
+    #[tokio::test]
+    async fn submit_outcomes_publishes_to_the_gadget_channel() {
+        // submit_outcomes feeds the gadget's `outcomes` watch channel (what the
+        // per-check-model syndrome task waits on) without running any decode. This
+        // is what lets a detector resolve at measurement time, ahead of the
+        // error-model-gated decode.
+        let coordinator = WindowCoordinator::new(
+            serde_json::json!({ "buffer_radius": 0 }),
+            BlackBoxDecoderClient::from_mock(Arc::new(crate::decoder::MockDecoder::new())),
+        );
+        let gid = 1;
+        // submit_outcomes also loads the raw outcomes into the Pauli frame
+        // tracker (see its doc), so the fixture must mirror execute()'s
+        // invariants: the gadget type is registered and the tracker knows the
+        // gadget. 3 measurements to match the submitted bit vector.
+        register_submit_fixture(&coordinator, gid).await;
+        coordinator
+            .gadgets
+            .write()
+            .await
+            .insert(gid, gadget_with_outcomes(gid, /* gtype */ 0, /* binding_cid */ None, None));
+        assert!(
+            coordinator
+                .gadgets
+                .read()
+                .await
+                .get(&gid)
+                .unwrap()
+                .outcomes
+                .borrow()
+                .is_none(),
+            "no outcomes before submit",
+        );
+
+        let bits = bit_vector::from_sparse_indices(3, &[1, 2]);
+        coordinator.submit_outcomes(gid, bits.clone()).await.expect("submit");
+        assert_eq!(
+            coordinator.gadgets.read().await.get(&gid).unwrap().outcomes.borrow().clone(),
+            Some(bits),
+            "outcomes are published to the channel",
+        );
+
+        // Unknown gid is a not-found error, not a panic/hang.
+        assert!(
+            coordinator
+                .submit_outcomes(999, bit_vector::from_sparse_indices(0, &[]))
+                .await
+                .is_err(),
+            "submit_outcomes for an unloaded gid errors",
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_outcomes_does_not_mark_decode_ready() {
+        // The crux of decode-readiness gating: publishing outcomes at measurement
+        // time must NOT set `decode_ready`, so a neighbor cannot commit this
+        // gadget before its own error-model-gated `decode()` fires. Only `decode`
+        // sets `decode_ready`.
+        let coordinator = WindowCoordinator::new(
+            serde_json::json!({ "buffer_radius": 0 }),
+            BlackBoxDecoderClient::from_mock(Arc::new(crate::decoder::MockDecoder::new())),
+        );
+        let gid = 1;
+        register_submit_fixture(&coordinator, gid).await;
+        coordinator
+            .gadgets
+            .write()
+            .await
+            .insert(gid, gadget_with_outcomes(gid, /* gtype */ 0, /* binding_cid */ None, None));
+
+        coordinator
+            .submit_outcomes(gid, bit_vector::from_sparse_indices(3, &[1, 2]))
+            .await
+            .expect("submit");
+        assert!(
+            coordinator
+                .gadgets
+                .read()
+                .await
+                .get(&gid)
+                .unwrap()
+                .decode_ready
+                .borrow()
+                .is_none(),
+            "submit_outcomes alone must not mark the gadget decode-ready",
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_outcomes_imputes_on_arrival_and_decode_does_not_redraw() {
+        // Remote clients pass the loss_mask over the wire on BOTH SubmitOutcomes
+        // and Decode; the server imputes on arrival in submit_outcomes and must
+        // NOT re-draw when the same masked outcomes come back through decode.
+        use crate::coordinator::coordinator_server::Coordinator as CoordinatorTrait;
+        use crate::simulator::DeterministicRng;
+        use rand::SeedableRng;
+
+        let seed = 7u64;
+        // buffer_radius=1 so a free-hop gadget takes decode()'s early
+        // `wait_for_pauli_frame` return (which we pre-satisfy) instead of the
+        // full window-exploration path — this keeps the test focused on the
+        // impute/channel-overwrite block at the top of decode().
+        let coordinator = WindowCoordinator::new(
+            serde_json::json!({ "buffer_radius": 1, "loss_random_imputation_seed": seed }),
+            BlackBoxDecoderClient::from_mock(Arc::new(crate::decoder::MockDecoder::new())),
+        );
+        let gid = 1;
+        register_submit_fixture(&coordinator, gid).await;
+        // Free-hop gadget with pauli_frame pre-set so decode()'s free-hop branch
+        // returns immediately.
+        let gadget = Gadget {
+            instance: bin::Gadget {
+                gid,
+                gtype: 0,
+                ..Default::default()
+            },
+            outcomes: watch::channel(None).0,
+            decode_ready: watch::channel(None).0,
+            binding_cid: None,
+            outputs: vec![],
+            pauli_frame: watch::channel(Some(bit_vector::from_sparse_indices(0, &[]))).0,
+            is_free_hop: true,
+            state: watch::channel(GadgetState::Uncommitted).0,
+            outcome_seq: Default::default(),
+        };
+        coordinator.gadgets.write().await.insert(gid, gadget);
+
+        // Raw (all-zero) outcomes + a mask marking all 3 measurements as lost.
+        let raw = bit_vector::from_sparse_indices(3, &[]);
+        let mask = bit_vector::from_sparse_indices(3, &[0, 1, 2]);
+
+        CoordinatorTrait::submit_outcomes(
+            &coordinator,
+            Request::new(coordinator::Outcomes {
+                gid,
+                outcomes: Some(raw.clone()),
+                loss_mask: Some(mask.clone()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("submit_outcomes");
+
+        // The stored/published outcomes must be imputed: exactly the first draw
+        // of a DeterministicRng seeded identically to the coordinator's.
+        let mut expected = raw.clone();
+        let mut rng = DeterministicRng::seed_from_u64(seed);
+        coordinator::apply_loss_random_imputation(&mut expected, &mask, &mut rng);
+        let stored = coordinator
+            .gadgets
+            .read()
+            .await
+            .get(&gid)
+            .unwrap()
+            .outcomes
+            .borrow()
+            .clone()
+            .unwrap();
+        assert_eq!(
+            stored, expected,
+            "submit_outcomes must impute lost bits on arrival (mask consumed)"
+        );
+
+        // Decode with the SAME masked outcomes: the submit-time bits win, so a
+        // second RNG draw (which would differ) must NOT happen.
+        CoordinatorTrait::decode(
+            &coordinator,
+            Request::new(coordinator::Outcomes {
+                gid,
+                outcomes: Some(raw.clone()),
+                loss_mask: Some(mask.clone()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("decode");
+        let after_decode = coordinator
+            .gadgets
+            .read()
+            .await
+            .get(&gid)
+            .unwrap()
+            .outcomes
+            .borrow()
+            .clone()
+            .unwrap();
+        assert_eq!(
+            after_decode, stored,
+            "decode must not re-impute over the submit-time outcomes (no second RNG draw)",
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_outcomes_is_idempotent_with_decode_reload() {
+        // decode() re-sends the same outcomes after submit_outcomes already loaded
+        // them into the tracker; the second load_raw must be a no-op, not a panic
+        // (this is the BB-Star `unreachable` trap the idempotency guard prevents).
+        let coordinator = WindowCoordinator::new(
+            serde_json::json!({ "buffer_radius": 0 }),
+            BlackBoxDecoderClient::from_mock(Arc::new(crate::decoder::MockDecoder::new())),
+        );
+        let gid = 1;
+        register_submit_fixture(&coordinator, gid).await;
+        coordinator
+            .gadgets
+            .write()
+            .await
+            .insert(gid, gadget_with_outcomes(gid, /* gtype */ 0, /* binding_cid */ None, None));
+
+        let bits = bit_vector::from_sparse_indices(3, &[1, 2]);
+        coordinator.submit_outcomes(gid, bits.clone()).await.expect("submit");
+        // Re-loading the same raw outcomes (as decode() does) is a no-op.
+        let readouts: Vec<bool> = vec![];
+        coordinator.pauli_frame_tracker.lock().await.load_raw(gid, &readouts, &bits);
     }
 }

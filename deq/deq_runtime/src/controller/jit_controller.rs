@@ -1,5 +1,5 @@
 use crate::bin::{self, check_model, check_model_type, error_model, error_model_type};
-use crate::coordinator::CoordinatorClient;
+use crate::coordinator::{self, CoordinatorClient};
 use crate::jit::{self, jit_compiler::JitCompiler};
 use crate::misc::sync::TaskCounter;
 use hashbrown::{HashMap, HashSet};
@@ -9,8 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "cli")]
 use structdoc::StructDoc;
-use tokio::sync::RwLock;
-use tokio::sync::oneshot;
+use tokio::sync::{RwLock, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 include!("../proto/deq.controller.jit_controller.rs");
@@ -47,11 +46,42 @@ pub struct JitController {
     /// Track when error models are loaded for each gid.
     /// Decode must wait for the error model before forwarding to coordinator.
     /// Stores the receiver; the sender is passed to the spawned error model task.
-    error_model_loaded: RwLock<HashMap<u64, oneshot::Receiver<()>>>,
+    error_model_loaded: RwLock<HashMap<u64, oneshot::Receiver<Result<(), tonic::Status>>>>,
+    decode_progress: RwLock<HashMap<u64, watch::Sender<coordinator::DecodeProgress>>>,
+    decode_progress_relays: RwLock<HashSet<u64>>,
     /// Cancelled on reset()/drop to abort pending error-model and batch tasks.
     cancellation: RwLock<CancellationToken>,
     /// Tracks active spawned tasks; reset() waits for all to finish.
     task_counter: Arc<TaskCounter>,
+}
+
+/// Phase durations of one [`JitController::decode_single_timed`] call. All ns;
+/// each span is measured with a dedicated `Instant` pair, taken outside any
+/// other span so no measured phase contains tracking cost. See `decode_single`
+/// for the full protocol these phases decompose.
+///
+/// Interface consumed by the playground's full-timing-accounting walk.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DecodeSingleTiming {
+    /// `submit_outcomes` RPC duration (0 when outcomes are absent).
+    pub submit_ns: u64,
+    /// error-model oneshot wait (non-RPC, local await).
+    pub local_wait_ns: u64,
+    /// `decode` RPC duration.
+    pub decode_ns: u64,
+}
+
+fn newly_reportable_progress(
+    state: coordinator::DecodeProgressState,
+    reported_blockers: &mut HashSet<(u64, u64)>,
+) -> Option<coordinator::DecodeProgressState> {
+    let coordinator::DecodeProgressState::NeedsGraph(mut blockers) = state else {
+        return Some(state);
+    };
+    blockers.sort_unstable();
+    blockers.dedup();
+    blockers.retain(|blocker| reported_blockers.insert(*blocker));
+    (!blockers.is_empty()).then_some(coordinator::DecodeProgressState::NeedsGraph(blockers))
 }
 
 impl JitController {
@@ -73,6 +103,8 @@ impl JitController {
             next_etype: AtomicU64::new(1),
             library,
             error_model_loaded: RwLock::new(HashMap::new()),
+            decode_progress: RwLock::new(HashMap::new()),
+            decode_progress_relays: RwLock::new(HashSet::new()),
             cancellation: RwLock::new(CancellationToken::new()),
             task_counter: TaskCounter::new(),
         })
@@ -93,6 +125,8 @@ impl JitController {
             next_etype: AtomicU64::new(1),
             library,
             error_model_loaded: RwLock::new(HashMap::new()),
+            decode_progress: RwLock::new(HashMap::new()),
+            decode_progress_relays: RwLock::new(HashSet::new()),
             cancellation: RwLock::new(CancellationToken::new()),
             task_counter: TaskCounter::new(),
         })
@@ -269,7 +303,7 @@ impl JitController {
             let etype = this.get_or_load_etype(&mut error_model_type, coordinator).await;
 
             let error_model_modifier = build_error_model_modifier(&error_model_type, &error_model);
-            let _ = coordinator
+            let result = coordinator
                 .execute(bin::Instruction {
                     create: Some(bin::instruction::Create::ErrorModel(bin::ErrorModel {
                         etype,
@@ -279,10 +313,14 @@ impl JitController {
                         eid: error_model.eid,
                     })),
                 })
-                .await;
+                .await
+                .map(|_| ());
 
+            if result.is_ok() {
+                this.compiler.mark_error_model_ready(gid).await;
+            }
             // Notify that the error model has been loaded
-            let _ = error_model_tx.send(());
+            let _ = error_model_tx.send(result);
         });
 
         gid
@@ -443,11 +481,45 @@ impl JitController {
         Ok(results)
     }
 
+    /// KEEP IN SYNC with `decode_single_timed` below — deliberately duplicated
+    /// (not delegated) so untimed callers pay zero instrumentation overhead.
+    /// The ordering is deadlock-sensitive (impute before submit; submit before
+    /// the error-model wait); any change here must be mirrored there.
     pub async fn decode_single(
         self: &Arc<Self>,
-        outcomes: crate::coordinator::Outcomes,
+        mut outcomes: crate::coordinator::Outcomes,
     ) -> Result<crate::coordinator::Readouts, tonic::Status> {
         let gid = outcomes.gid;
+
+        // Impute lost measurement bits ONCE, before anything observes them: the
+        // early submit below and the final `decode` must publish bit-identical
+        // outcomes (decode "re-submits the same outcomes idempotently"), so the
+        // random imputation cannot be left to the coordinator's decode path.
+        // Takes `loss_mask` so the coordinator won't re-impute.
+        if outcomes.loss_mask.is_some() {
+            let coordinator_guard = self.coordinator.read().await;
+            let coordinator = coordinator_guard
+                .as_ref()
+                .ok_or_else(|| tonic::Status::failed_precondition("coordinator not connected"))?;
+            coordinator.impute_loss_outcomes(&mut outcomes).await;
+        }
+
+        // Publish the raw outcomes to the coordinator BEFORE waiting on the error
+        // model. The gadget's finished-detector syndrome is a pure function of these
+        // outcomes, so this lets a detector-conditioned branch resolve at measurement
+        // time. The error-model load below can depend on a *future* gadget's gid (its
+        // output-port connection); if that gadget is gated behind the branch, waiting
+        // for the error model before submitting outcomes deadlocks the detector against
+        // the branch. `decode` re-submits the same outcomes idempotently.
+        if outcomes.outcomes.is_some() {
+            self.coordinator
+                .read()
+                .await
+                .as_ref()
+                .ok_or_else(|| tonic::Status::failed_precondition("coordinator not connected"))?
+                .submit_outcomes(outcomes.clone())
+                .await?;
+        }
 
         let rx = self.error_model_loaded.write().await.remove(&gid).ok_or_else(|| {
             tonic::Status::invalid_argument(format!("decode called for unknown or already-decoded gid: {gid}"))
@@ -461,7 +533,10 @@ impl JitController {
         // promptly rather than blocking forever.
         let token = self.cancellation.read().await.clone();
         tokio::select! {
-            _ = rx => {}
+            result = rx => {
+                result
+                    .map_err(|_| tonic::Status::cancelled(format!("error-model load task ended for gid {gid}")))??;
+            }
             _ = token.cancelled() => {
                 return Err(tonic::Status::cancelled(format!(
                     "decode for gid={gid} cancelled by runtime shutdown or reset"
@@ -474,6 +549,266 @@ impl JitController {
             .as_ref()
             .ok_or_else(|| tonic::Status::failed_precondition("coordinator not connected"))?;
         coordinator.decode(outcomes).await
+    }
+
+    /// Phase-timed variant of [`decode_single`](Self::decode_single): identical
+    /// protocol and outcomes, but returns per-phase wall-clock durations
+    /// (submit / local wait / decode) alongside the readouts. `decode_single`
+    /// stays for callers that do not need the breakdown; this is duplicated
+    /// rather than delegating so those callers pay no timing overhead.
+    pub async fn decode_single_timed(
+        self: &Arc<Self>,
+        mut outcomes: crate::coordinator::Outcomes,
+    ) -> Result<(crate::coordinator::Readouts, DecodeSingleTiming), tonic::Status> {
+        let gid = outcomes.gid;
+
+        // Impute lost measurement bits ONCE (see `decode_single` for why this
+        // must happen before the early submit). Not attributed to any phase.
+        if outcomes.loss_mask.is_some() {
+            let coordinator_guard = self.coordinator.read().await;
+            let coordinator = coordinator_guard
+                .as_ref()
+                .ok_or_else(|| tonic::Status::failed_precondition("coordinator not connected"))?;
+            coordinator.impute_loss_outcomes(&mut outcomes).await;
+        }
+
+        // Phase 1: publish the raw outcomes (submit_outcomes RPC).
+        let mut submit_ns = 0u64;
+        if outcomes.outcomes.is_some() {
+            let submit_started = std::time::Instant::now();
+            self.coordinator
+                .read()
+                .await
+                .as_ref()
+                .ok_or_else(|| tonic::Status::failed_precondition("coordinator not connected"))?
+                .submit_outcomes(outcomes.clone())
+                .await?;
+            submit_ns = submit_started.elapsed().as_nanos() as u64;
+        }
+
+        let rx = self.error_model_loaded.write().await.remove(&gid).ok_or_else(|| {
+            tonic::Status::invalid_argument(format!("decode called for unknown or already-decoded gid: {gid}"))
+        })?;
+
+        // Phase 2: wait for the background error-model load (local oneshot).
+        let token = self.cancellation.read().await.clone();
+        let wait_started = std::time::Instant::now();
+        tokio::select! {
+            result = rx => {
+                result
+                    .map_err(|_| tonic::Status::cancelled(format!("error-model load task ended for gid {gid}")))??;
+            }
+            _ = token.cancelled() => {
+                return Err(tonic::Status::cancelled(format!(
+                    "decode for gid={gid} cancelled by runtime shutdown or reset"
+                )));
+            }
+        }
+        let local_wait_ns = wait_started.elapsed().as_nanos() as u64;
+
+        // Phase 3: decode (decode RPC).
+        let coordinator_guard = self.coordinator.read().await;
+        let coordinator = coordinator_guard
+            .as_ref()
+            .ok_or_else(|| tonic::Status::failed_precondition("coordinator not connected"))?;
+        let decode_started = std::time::Instant::now();
+        let readouts = coordinator.decode(outcomes).await?;
+        let decode_ns = decode_started.elapsed().as_nanos() as u64;
+
+        Ok((
+            readouts,
+            DecodeSingleTiming {
+                submit_ns,
+                local_wait_ns,
+                decode_ns,
+            },
+        ))
+    }
+
+    /// Finished-detector bits for a gadget, resolved as soon as its checks are
+    /// finished — WITHOUT waiting for the BP decode (unlike `decode_single`).
+    /// Detectors are a pure function of the submitted measurement outcomes, so this
+    /// does not consume the error-model oneshot (the error model gates the decode,
+    /// not the syndrome). The outcomes must have been submitted (via `decode_single`
+    /// for this gid) for the syndrome to become available.
+    pub async fn detectors_single(self: &Arc<Self>, gid: u64) -> Result<crate::util::BitVector, tonic::Status> {
+        let coordinator_guard = self.coordinator.read().await;
+        let coordinator = coordinator_guard
+            .as_ref()
+            .ok_or_else(|| tonic::Status::failed_precondition("coordinator not connected"))?;
+        coordinator.wait_for_detectors(gid).await
+    }
+
+    /// Replay-only: the gid whose outcome arrival completed `gid`'s mandatory
+    /// buffer zone (see `CoordinatorClient::decode_started_by`). Meaningful
+    /// only after the decode for `gid` has returned.
+    pub async fn decode_started_by(&self, gid: u64) -> Option<u64> {
+        let coordinator_guard = self.coordinator.read().await;
+        coordinator_guard
+            .as_ref()
+            .and_then(|coordinator| coordinator.decode_started_by(gid))
+    }
+
+    async fn progress_sender(&self, gid: u64) -> watch::Sender<coordinator::DecodeProgress> {
+        self.decode_progress
+            .write()
+            .await
+            .entry(gid)
+            .or_insert_with(|| watch::channel(coordinator::DecodeProgress::default()).0)
+            .clone()
+    }
+
+    async fn ensure_progress_relay(self: &Arc<Self>, gid: u64) {
+        if !self.decode_progress_relays.write().await.insert(gid) {
+            return;
+        }
+        let sender = self.progress_sender(gid).await;
+        let this = Arc::clone(self);
+        let token = self.cancellation.read().await.clone();
+        let _guard = self.task_counter.guard();
+        tokio::spawn(async move {
+            let _guard = _guard;
+            let mut compiler_progress = this.compiler.subscribe_progress();
+            let mut reported_blockers = HashSet::new();
+            loop {
+                let state = this.compiler.decode_progress_state(gid).await;
+                if state == coordinator::DecodeProgressState::Ready {
+                    break;
+                }
+                if let Some(state) = newly_reportable_progress(state, &mut reported_blockers) {
+                    coordinator::publish_decode_progress(&sender, state);
+                }
+                tokio::select! {
+                    changed = compiler_progress.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                    _ = token.cancelled() => return,
+                }
+            }
+
+            let coordinator_client = {
+                let coordinator = this.coordinator.read().await;
+                let Some(coordinator) = coordinator.as_ref() else {
+                    return;
+                };
+                coordinator.clone()
+            };
+            let Ok(mut window_progress) = coordinator_client.wait_decode_progress(gid, None).await else {
+                return;
+            };
+            loop {
+                let roots = coordinator_client.decode_dependencies(gid).await;
+                let compiler_state = this.compiler.decode_progress_state_for_roots(&roots).await;
+                let state = match (compiler_state, window_progress.state.clone()) {
+                    (
+                        coordinator::DecodeProgressState::NeedsGraph(mut left),
+                        coordinator::DecodeProgressState::NeedsGraph(right),
+                    ) => {
+                        left.extend(right);
+                        left.sort_unstable();
+                        left.dedup();
+                        coordinator::DecodeProgressState::NeedsGraph(left)
+                    }
+                    (coordinator::DecodeProgressState::NeedsGraph(blockers), _)
+                    | (_, coordinator::DecodeProgressState::NeedsGraph(blockers)) => {
+                        coordinator::DecodeProgressState::NeedsGraph(blockers)
+                    }
+                    (coordinator::DecodeProgressState::Ready, coordinator::DecodeProgressState::Ready) => {
+                        coordinator::DecodeProgressState::Ready
+                    }
+                    _ => coordinator::DecodeProgressState::Pending,
+                };
+                let ready = state == coordinator::DecodeProgressState::Ready;
+                if let Some(state) = newly_reportable_progress(state, &mut reported_blockers) {
+                    coordinator::publish_decode_progress(&sender, state);
+                }
+                if ready {
+                    return;
+                }
+                tokio::select! {
+                    progress = coordinator_client.wait_decode_progress(
+                        gid,
+                        Some(window_progress.revision),
+                    ) => {
+                        let Ok(progress) = progress else {
+                            return;
+                        };
+                        window_progress = progress;
+                    }
+                    changed = compiler_progress.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                    _ = token.cancelled() => return,
+                }
+            }
+        });
+    }
+
+    pub async fn wait_decode_progress(
+        self: &Arc<Self>,
+        gid: u64,
+        after_revision: Option<u64>,
+    ) -> Result<crate::coordinator::DecodeProgress, tonic::Status> {
+        self.ensure_progress_relay(gid).await;
+        let sender = self.progress_sender(gid).await;
+        let mut receiver = sender.subscribe();
+        let current = receiver.borrow().clone();
+        if after_revision.is_none_or(|revision| current.revision > revision) {
+            return Ok(current);
+        }
+        let token = self.cancellation.read().await.clone();
+        loop {
+            tokio::select! {
+                changed = receiver.changed() => {
+                    changed.map_err(|_| tonic::Status::cancelled("decode progress reset"))?;
+                    let current = receiver.borrow().clone();
+                    if current.revision > after_revision.unwrap() {
+                        return Ok(current);
+                    }
+                }
+                _ = token.cancelled() => {
+                    return Err(tonic::Status::cancelled("decode progress cancelled by reset"));
+                }
+            }
+        }
+    }
+
+    pub async fn drain_dem(&self) -> crate::coordinator::dem::DemDrain {
+        let coordinator_guard = self.coordinator.read().await;
+        match coordinator_guard.as_ref() {
+            Some(coordinator) => coordinator.drain_dem(false).await,
+            None => Default::default(),
+        }
+    }
+
+    pub async fn drain_dem_predictions(&self) -> Vec<crate::coordinator::dem::DemPrediction> {
+        let coordinator_guard = self.coordinator.read().await;
+        match coordinator_guard.as_ref() {
+            Some(coordinator) => coordinator.drain_dem_predictions().await,
+            None => vec![],
+        }
+    }
+
+    pub async fn drain_dem_predictions_for(&self, gid: u64) -> Vec<crate::coordinator::dem::DemPrediction> {
+        let coordinator_guard = self.coordinator.read().await;
+        match coordinator_guard.as_ref() {
+            Some(coordinator) => coordinator.drain_dem_predictions_for(gid).await,
+            None => vec![],
+        }
+    }
+
+    /// Final DEM drain. Only call after the walk and all decodes have completed.
+    pub async fn dem_flush(&self) -> crate::coordinator::dem::DemDrain {
+        self.task_counter.wait_for_zero().await;
+        let coordinator_guard = self.coordinator.read().await;
+        match coordinator_guard.as_ref() {
+            Some(coordinator) => coordinator.drain_dem(true).await,
+            None => Default::default(),
+        }
     }
 
     /// Fire the cancellation token to abort any pending error-model loads and
@@ -509,6 +844,8 @@ impl JitController {
             self.clear_cache().await;
         }
         self.error_model_loaded.write().await.clear();
+        self.decode_progress.write().await.clear();
+        self.decode_progress_relays.write().await.clear();
         let coordinator_guard = self.coordinator.read().await;
         if let Some(coordinator) = coordinator_guard.as_ref() {
             coordinator.reset(flags).await?;
@@ -865,5 +1202,95 @@ impl TypeCache {
     pub fn clear(&mut self) {
         self.check_model_types.clear();
         self.error_model_types.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coordinator;
+
+    #[test]
+    fn progress_relay_reports_each_graph_blocker_once() {
+        let mut reported = HashSet::new();
+        let observed = [
+            coordinator::DecodeProgressState::NeedsGraph(vec![(6, 0)]),
+            coordinator::DecodeProgressState::NeedsGraph(vec![(6, 0), (9, 0)]),
+            coordinator::DecodeProgressState::NeedsGraph(vec![(9, 0)]),
+            coordinator::DecodeProgressState::Pending,
+            coordinator::DecodeProgressState::NeedsGraph(vec![(10, 0)]),
+        ]
+        .into_iter()
+        .filter_map(|state| newly_reportable_progress(state, &mut reported))
+        .collect::<Vec<_>>();
+
+        assert_eq!(
+            observed,
+            vec![
+                coordinator::DecodeProgressState::NeedsGraph(vec![(6, 0)]),
+                coordinator::DecodeProgressState::NeedsGraph(vec![(9, 0)]),
+                coordinator::DecodeProgressState::Pending,
+                coordinator::DecodeProgressState::NeedsGraph(vec![(10, 0)]),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn decode_single_rejects_a_dropped_error_model_loader() {
+        let controller = JitController::new_from_library(Default::default(), true);
+        let (tx, rx) = oneshot::channel();
+        controller.error_model_loaded.write().await.insert(7, rx);
+        drop(tx);
+
+        let error = controller
+            .decode_single(coordinator::Outcomes {
+                gid: 7,
+                ..Default::default()
+            })
+            .await
+            .expect_err("dropped model loader must stop decode");
+        assert_eq!(error.message(), "error-model load task ended for gid 7");
+    }
+
+    #[tokio::test]
+    async fn decode_single_timed_matches_decode_single_and_reports_phases() {
+        use crate::coordinator::{CoordinatorClient, MockCoordinator};
+
+        let controller = JitController::new_from_library(Default::default(), true);
+        controller.start(CoordinatorClient::from_mock(MockCoordinator::new())).await;
+
+        // A resolved error-model oneshot so the decode reaches the coordinator.
+        let (tx, rx) = oneshot::channel();
+        tx.send(Ok(())).unwrap();
+        controller.error_model_loaded.write().await.insert(7, rx);
+
+        let outcomes = coordinator::Outcomes {
+            gid: 7,
+            ..Default::default()
+        };
+        let wall = std::time::Instant::now();
+        let (timed_readouts, timing) = controller
+            .decode_single_timed(outcomes.clone())
+            .await
+            .expect("timed decode must succeed");
+        let elapsed = wall.elapsed().as_nanos() as u64;
+
+        // Re-arm for the plain call; same gid → identical mock readouts.
+        let (tx2, rx2) = oneshot::channel();
+        tx2.send(Ok(())).unwrap();
+        controller.error_model_loaded.write().await.insert(7, rx2);
+        let plain_readouts = controller.decode_single(outcomes).await.expect("plain decode must succeed");
+
+        assert_eq!(
+            timed_readouts, plain_readouts,
+            "timed variant must return the same readouts as decode_single"
+        );
+        assert!(
+            timing.submit_ns + timing.local_wait_ns + timing.decode_ns <= elapsed,
+            "phase durations ({} + {} + {}) must sum within the measured wall ({elapsed})",
+            timing.submit_ns,
+            timing.local_wait_ns,
+            timing.decode_ns
+        );
     }
 }
