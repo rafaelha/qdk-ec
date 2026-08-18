@@ -474,6 +474,18 @@ impl CoordinatorClient {
             .unwrap_or_default()
     }
 
+    /// Replay-only: the gid whose outcome arrival completed `gid`'s mandatory
+    /// buffer zone (see `WindowCoordinator::decode_started_by`). Only the
+    /// local window coordinator records this; every other arm — including
+    /// `Remote`, deliberately, so the wire protocol stays untouched — returns
+    /// `None`.
+    pub fn decode_started_by(&self, gid: u64) -> Option<u64> {
+        match self {
+            CoordinatorClient::Local(DynCoordinator::Window(c)) => c.decode_started_by(gid),
+            _ => None,
+        }
+    }
+
     /// Drain every queued per-window/per-subgraph decode timing record. Both
     /// `WindowCoordinator` and `MonolithicCoordinator` record these (Tasks 3-4);
     /// the other Local arms have no timing log to drain. Follows the exact

@@ -266,6 +266,15 @@ pub struct WindowCoordinator {
     /// sliding-window order (see the commit loop in `decode()`). std Mutex:
     /// held only for sync membership ops, never across an await.
     waiting_leaders: std::sync::Mutex<std::collections::BTreeSet<u64>>,
+    /// Monotone counter assigning each gadget's FIRST outcome arrival (via
+    /// `submit_outcomes` or `decode`) a coordinator-wide sequence number,
+    /// starting at 1. Replay bookkeeping only — never read by decoding.
+    outcome_seq: std::sync::atomic::AtomicU64,
+    /// Replay-only record of which gadget's outcome arrival completed each
+    /// center's mandatory buffer zone: center gid -> unblocking gid. Written
+    /// in `decode()` after step 2, queried by [`Self::decode_started_by`].
+    /// Cleared on reset. std Mutex: held only for sync map ops.
+    decode_started: std::sync::Mutex<std::collections::HashMap<u64, u64>>,
 }
 
 /// RAII registration in `WindowCoordinator::waiting_leaders`: created when a
@@ -334,6 +343,9 @@ pub struct Gadget {
     /// Gadget lifecycle state: Uncommitted → Decoding → Committed.
     /// Other decode tasks watch this to detect when blocking gadgets finish.
     pub state: watch::Sender<GadgetState>,
+    /// Arrival sequence of this gadget's FIRST outcome load (see
+    /// `WindowCoordinator::outcome_seq`); 0 until outcomes arrive.
+    pub outcome_seq: std::sync::atomic::AtomicU64,
 }
 
 pub struct CheckModel {
@@ -351,6 +363,11 @@ pub struct CheckModel {
     /// a committed gadget is a safe terminal only if all referring_eids' gadgets
     /// are also committed.
     pub referring_eids: Vec<u64>,
+    /// `(outcome_seq, gid)` of the constituent gadget whose outcome arrival
+    /// completed this check's syndrome (the max first-arrival seq among the
+    /// owning + remote gadgets). Set together with `syndrome` by the spawned
+    /// syndrome task; feedback re-publications don't touch it. Replay only.
+    pub finished_by: Option<(u64, u64)>,
 }
 
 pub struct ErrorModel {
@@ -498,6 +515,22 @@ impl WindowCoordinator {
             decodes_in_flight: Default::default(),
             outcome_arrivals: Default::default(),
             waiting_leaders: Default::default(),
+            outcome_seq: std::sync::atomic::AtomicU64::new(1),
+            decode_started: Default::default(),
+        }
+    }
+
+    /// Stamp a gadget's FIRST outcome arrival with the next coordinator-wide
+    /// sequence number. Call BEFORE `outcomes.send_replace`, so any observer
+    /// that sees the outcomes also sees the seq. Idempotent re-loads (the
+    /// `decode()` call re-sending what `submit_outcomes` delivered) keep the
+    /// original, causally meaningful seq.
+    fn assign_outcome_seq(&self, gadget: &Gadget) {
+        use std::sync::atomic::Ordering;
+        if gadget.outcomes.borrow().is_none() {
+            gadget
+                .outcome_seq
+                .store(self.outcome_seq.fetch_add(1, Ordering::SeqCst), Ordering::SeqCst);
         }
     }
 
@@ -692,6 +725,17 @@ impl WindowCoordinator {
         detectors
     }
 
+    /// Replay-only query: the gid whose outcome arrival completed `gid`'s
+    /// mandatory buffer zone, recorded in `decode()` right after step 2. The
+    /// caller maps it to the virtual time at which decoding could really
+    /// start (readouts be released). `None` for free-hop centers (they skip
+    /// exploration), gids that never decoded, and zones with no finished
+    /// check models. Deliberately NOT part of the decode protocol — a real
+    /// deployment never needs it.
+    pub fn decode_started_by(&self, gid: u64) -> Option<u64> {
+        self.decode_started.lock().unwrap().get(&gid).copied()
+    }
+
     /// Return a gadget's finished-detector bits (its check-model syndrome) as soon
     /// as they are computable — i.e. once the gadget's checks are FINISHED (all
     /// constituent measurement outcomes submitted) — WITHOUT waiting for the BP
@@ -761,6 +805,7 @@ impl WindowCoordinator {
         // gadget's outcomes are set). `decode`'s later re-submit is idempotent and
         // must not re-stamp.
         let was_none = gadget.outcomes.borrow().is_none();
+        self.assign_outcome_seq(gadget);
         gadget.outcomes.send_replace(Some(outcomes));
         if was_none {
             self.outcome_arrivals.lock().unwrap().push(coordinator::OutcomeArrival {
@@ -2842,6 +2887,7 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                         pauli_frame: watch::channel(None).0,
                         is_free_hop,
                         state: watch::channel(GadgetState::Uncommitted).0,
+                        outcome_seq: Default::default(),
                     },
                 );
                 // Drain pending referrals for newly connected output ports.
@@ -2989,6 +3035,7 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                         expanded_remote_gadgets: None,
                         syndrome: watch::channel(None).0,
                         referring_eids: deferred_referring_eids,
+                        finished_by: None,
                     },
                 );
                 self.record_event(trace::event::Event::ExecuteCheckModel(trace::ExecuteCheckModelEvent {
@@ -3061,12 +3108,29 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                         }
                         set_bit(&mut syndrome, check_index as u64, is_defect);
                     }
+                    // Which outcome arrival finished this check: the max
+                    // first-arrival seq among its constituent gadgets (all
+                    // present — join_all above waited for their outcomes).
+                    // Replay bookkeeping for decode_started_by.
+                    let finished_by = [check_model.gid]
+                        .into_iter()
+                        .chain(expanded_remote_gadgets.iter().filter_map(|x| *x))
+                        .map(|g| {
+                            let seq = gadgets
+                                .get(&g)
+                                .unwrap()
+                                .outcome_seq
+                                .load(std::sync::atomic::Ordering::SeqCst);
+                            (seq, g)
+                        })
+                        .max();
                     drop(gadgets);
                     drop(check_model_types);
                     // save the result into the check model object
                     let mut check_models = check_models.write().await;
                     let check_model = check_models.get_mut(&cid).unwrap();
                     check_model.expanded_remote_gadgets = Some(expanded_remote_gadgets);
+                    check_model.finished_by = finished_by;
                     check_model.syndrome.send_replace(Some(syndrome));
                     drop(check_models);
                     // Always-on: record when this cid's syndrome became complete,
@@ -3282,6 +3346,7 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                     let mut rng = rng_lock.lock().await;
                     coordinator::apply_loss_random_imputation(&mut outcome_data, loss_mask, &mut *rng);
                 }
+                self.assign_outcome_seq(gadget);
                 gadget.outcomes.send_replace(Some(outcome_data));
                 // First-arrival stamp: this branch is the None→Some transition
                 // (guarded by `!already_submitted`); a prior `submit_outcomes`
@@ -3349,6 +3414,29 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
             .ok_or_else(|| Status::cancelled("decode cancelled by reset"))?;
         // Window-formation stamp: mandatory-zone syndrome wait completed.
         let mandatory_ready_ns = crate::misc::util::timestamp_ns();
+
+        // Replay bookkeeping: record which outcome arrival completed this
+        // center's mandatory buffer zone — the max first-arrival seq over the
+        // zone's check models. Surfaced by `decode_started_by` so a replay
+        // can anchor "decoding actually started" (readout release) at the
+        // virtual time the buffer became sufficient, not the center's own
+        // execution end. Every finished_by is set: step 2 awaited each zone
+        // syndrome, and finished_by lands in the same critical section.
+        {
+            let unblocker = {
+                let gadgets = self.gadgets.read().await;
+                let check_models = self.check_models.read().await;
+                explored
+                    .gadgets
+                    .iter()
+                    .filter_map(|zgid| gadgets.get(zgid).and_then(|g| g.binding_cid))
+                    .filter_map(|cid| check_models.get(&cid).and_then(|cm| cm.finished_by))
+                    .max()
+            };
+            if let Some((_, ugid)) = unblocker {
+                self.decode_started.lock().unwrap().insert(gid, ugid);
+            }
+        }
 
         // Commit loop: run step 3, check window for Decoding gadgets, run
         // steps 4+5, mark entire window as Decoding, then proceed.
@@ -3622,6 +3710,9 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
         self.timing_log.reset();
         self.syndrome_ready_at.lock().unwrap().clear();
         self.outcome_arrivals.lock().unwrap().clear();
+        self.decode_started.lock().unwrap().clear();
+        self.outcome_seq
+            .store(1, std::sync::atomic::Ordering::SeqCst);
         // Defensive: in-flight decode() tasks were cancelled above and their
         // RAII guards unregister on drop; clear anyway so a stale entry can
         // never make a next-shot leader defer to a dead one.
@@ -4001,6 +4092,7 @@ mod tests {
             pauli_frame: watch::channel(None).0,
             is_free_hop: false,
             state: watch::channel(GadgetState::Uncommitted).0,
+            outcome_seq: Default::default(),
         }
     }
 
@@ -4062,6 +4154,7 @@ mod tests {
             expanded_remote_gadgets: Some(vec![]),
             syndrome: watch::channel(None).0,
             referring_eids: vec![],
+            finished_by: None,
         }
     }
 
@@ -5205,6 +5298,7 @@ mod tests {
             pauli_frame: watch::channel(Some(bit_vector::from_sparse_indices(0, &[]))).0,
             is_free_hop: true,
             state: watch::channel(GadgetState::Uncommitted).0,
+            outcome_seq: Default::default(),
         };
         coordinator.gadgets.write().await.insert(gid, gadget);
 

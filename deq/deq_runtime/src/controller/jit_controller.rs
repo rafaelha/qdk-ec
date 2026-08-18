@@ -639,6 +639,16 @@ impl JitController {
         coordinator.wait_for_detectors(gid).await
     }
 
+    /// Replay-only: the gid whose outcome arrival completed `gid`'s mandatory
+    /// buffer zone (see `CoordinatorClient::decode_started_by`). Meaningful
+    /// only after the decode for `gid` has returned.
+    pub async fn decode_started_by(&self, gid: u64) -> Option<u64> {
+        let coordinator_guard = self.coordinator.read().await;
+        coordinator_guard
+            .as_ref()
+            .and_then(|coordinator| coordinator.decode_started_by(gid))
+    }
+
     async fn progress_sender(&self, gid: u64) -> watch::Sender<coordinator::DecodeProgress> {
         self.decode_progress
             .write()
