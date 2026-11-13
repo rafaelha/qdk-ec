@@ -149,6 +149,12 @@ impl JitController {
     pub async fn load_library(self: &Arc<Self>, library: jit::JitLibrary) -> Result<(), tonic::Status> {
         let port_types: Vec<_> = library.port_types.iter().filter_map(|pt| pt.base.clone()).collect();
         let gadget_types: Vec<_> = library.gadget_types.iter().filter_map(|gt| gt.base.clone()).collect();
+        let check_free: Vec<u64> = library
+            .port_types
+            .iter()
+            .filter(|pt| pt.stabilizers.is_empty())
+            .filter_map(|pt| pt.base.as_ref().map(|b| b.ptype))
+            .collect();
 
         self.compiler.load_library(library).await;
 
@@ -165,7 +171,9 @@ impl JitController {
                 gadget_types,
                 ..Default::default()
             })
-            .await
+            .await?;
+        coordinator.mark_check_free_port_types(check_free).await;
+        Ok(())
     }
 
     pub fn next_ctype(&self) -> u64 {
