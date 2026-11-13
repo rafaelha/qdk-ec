@@ -188,6 +188,10 @@ pub struct WindowCoordinator {
     pub config: WindowCoordinatorConfig,
     /// library data
     pub port_types: RwLock<HashMap<u64, Arc<bin::PortType>>>,
+    /// Port types with no stabilizers. No check crosses such a port into the
+    /// next gadget, so no decode window needs that gadget as its buffer. The
+    /// JIT controller fills this: `bin::PortType` does not carry stabilizers.
+    pub check_free_port_types: RwLock<HashSet<u64>>,
     pub gadget_types: RwLock<HashMap<u64, Arc<bin::GadgetType>>>,
     pub check_model_types: Arc<RwLock<HashMap<u64, Arc<bin::CheckModelType>>>>,
     pub error_model_types: RwLock<HashMap<u64, Arc<bin::ErrorModelType>>>,
@@ -340,6 +344,10 @@ pub struct Gadget {
     /// They may still have check models and error models with physical
     /// errors that need to be corrected.
     pub is_free_hop: bool,
+    /// Per output port: whether its port type carries no stabilizers (see
+    /// `WindowCoordinator::check_free_port_types`). Exploration never waits
+    /// for such a port to be connected.
+    pub check_free_outputs: Vec<bool>,
     /// Gadget lifecycle state: Uncommitted → Decoding → Committed.
     /// Other decode tasks watch this to detect when blocking gadgets finish.
     pub state: watch::Sender<GadgetState>,
@@ -469,7 +477,21 @@ fn required_window_readiness(window: &HashSet<u64>, commit_region: &HashSet<u64>
     (window.iter().chain(commit_region).copied().collect(), commit_region.clone())
 }
 
+/// Whether output `port` of gadget `gid` has a port type without stabilizers.
+fn check_free_output(gadgets: &HashMap<u64, Gadget>, gid: u64, port: u64) -> bool {
+    gadgets
+        .get(&gid)
+        .and_then(|g| g.check_free_outputs.get(port as usize))
+        .copied()
+        .unwrap_or(false)
+}
+
 impl WindowCoordinator {
+    /// Record port types without stabilizers (see `check_free_port_types`).
+    pub async fn mark_check_free_port_types(&self, ptypes: impl IntoIterator<Item = u64>) {
+        self.check_free_port_types.write().await.extend(ptypes);
+    }
+
     pub fn new(config: serde_json::Value, black_box_decoder: BlackBoxDecoderClient) -> Self {
         let config: WindowCoordinatorConfig = serde_json::from_value(config).unwrap();
         let loss_imputation_rng = if config.loss_random_imputation {
@@ -488,6 +510,7 @@ impl WindowCoordinator {
         Self {
             config,
             port_types: Default::default(),
+            check_free_port_types: Default::default(),
             gadget_types: Default::default(),
             check_model_types: Default::default(),
             error_model_types: Default::default(),
@@ -929,6 +952,12 @@ impl WindowCoordinator {
                 // The gadget at exactly `buffer_radius + 1` is included as that
                 // boundary, but its own outputs are not awaited.
                 for (port, sender) in gadget.outputs.iter().enumerate() {
+                    // No check crosses a port without stabilizers, so the
+                    // gadget behind it adds no buffer. Waiting for it could
+                    // deadlock: it may be gated behind a branch on this decode.
+                    if gadget.check_free_outputs.get(port) == Some(&true) && sender.borrow().is_none() {
+                        continue;
+                    }
                     match get_or_receiver(sender, token.clone()) {
                         Ok(connector) => {
                             if explored.gadgets.contains(&connector.gid) {
@@ -1261,9 +1290,11 @@ impl WindowCoordinator {
             let gadget = &gadgets[&gid];
             let mut has_open_boundary = false;
 
-            // Check inputs: any connector from outside the window is boundary.
+            // Check inputs: any connector from outside the window is boundary,
+            // unless it arrives through a port without stabilizers: no check
+            // crosses such a port, so nothing outside constrains this decode.
             for connector in &gadget.instance.connectors {
-                if !explored.gadgets.contains(&connector.gid) {
+                if !explored.gadgets.contains(&connector.gid) && !check_free_output(gadgets, connector.gid, connector.port) {
                     has_open_boundary = true;
                     break;
                 }
@@ -1271,7 +1302,11 @@ impl WindowCoordinator {
 
             // Check outputs: any output going outside window or unconnected.
             if !has_open_boundary {
-                for sender in &gadget.outputs {
+                for (port, sender) in gadget.outputs.iter().enumerate() {
+                    // A port without stabilizers is no boundary either way.
+                    if gadget.check_free_outputs.get(port) == Some(&true) {
+                        continue;
+                    }
                     match sender.borrow().as_ref() {
                         Some(conn) => {
                             if !explored.gadgets.contains(&conn.gid) {
@@ -2843,6 +2878,7 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
         let id = match create {
             bin::instruction::Create::Gadget(gadget) => {
                 let port_types = self.port_types.read().await;
+                let check_free_port_types = self.check_free_port_types.read().await;
                 let gadget_types = self.gadget_types.read().await;
                 let mut gadgets = self.gadgets.write().await;
                 let gid = if gadget.gid == 0 {
@@ -2886,6 +2922,11 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                         outputs: gadget_type.outputs.iter().map(|_| watch::channel(None).0).collect(),
                         pauli_frame: watch::channel(None).0,
                         is_free_hop,
+                        check_free_outputs: gadget_type
+                            .outputs
+                            .iter()
+                            .map(|p| check_free_port_types.contains(&p.ptype))
+                            .collect(),
                         state: watch::channel(GadgetState::Uncommitted).0,
                         outcome_seq: Default::default(),
                     },
@@ -3695,6 +3736,7 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
         }
         if flags.reset_library {
             self.port_types.write().await.clear();
+            self.check_free_port_types.write().await.clear();
             self.gadget_types.write().await.clear();
             self.check_model_types.write().await.clear();
             self.error_model_types.write().await.clear();
@@ -4091,6 +4133,7 @@ mod tests {
             outputs: vec![],
             pauli_frame: watch::channel(None).0,
             is_free_hop: false,
+            check_free_outputs: vec![],
             state: watch::channel(GadgetState::Uncommitted).0,
             outcome_seq: Default::default(),
         }
@@ -5297,6 +5340,7 @@ mod tests {
             outputs: vec![],
             pauli_frame: watch::channel(Some(bit_vector::from_sparse_indices(0, &[]))).0,
             is_free_hop: true,
+            check_free_outputs: vec![],
             state: watch::channel(GadgetState::Uncommitted).0,
             outcome_seq: Default::default(),
         };

@@ -315,8 +315,12 @@ impl JitCompiler {
         // Build the output_checks for this gadget - each port has a list of expanded measurement sets
         let mut output_checks = vec![];
         let mut output_check_index = 0;
+        // A port type with no stabilizers carries no checks into the next
+        // gadget, so its unfinished checks resolve without that gadget.
+        let mut output_port_has_checks = vec![];
         for port in gadget_type.outputs.iter() {
             let port_type = jit_port_types.get(&port.ptype).unwrap();
+            output_port_has_checks.push(!port_type.stabilizers.is_empty());
             let mut port_checks = vec![];
             for _ in 0..port_type.stabilizers.len() {
                 let check = &jit_gadget_type.unfinished_checks[output_check_index];
@@ -355,7 +359,14 @@ impl JitCompiler {
             // resolve its first-stage check state
             let mut output_virtual_checks = Vec::with_capacity(jit_gadget_type.unfinished_checks.len());
             let mut cancelled = false;
-            for port_index in 0..jit_gadget_type.base.as_ref().unwrap().outputs.len() {
+            for (port_index, &has_checks) in output_port_has_checks.iter().enumerate() {
+                // Nothing to resolve through a port without checks. Waiting for
+                // its connection anyway would block this error model on the
+                // next gadget, which may be gated behind a branch that waits
+                // for this very decode.
+                if !has_checks {
+                    continue;
+                }
                 // wait for the output port to be connected; otherwise we won't be able to resolve the checks
                 let connector = this.get_output_connector(gid, port_index, token.clone()).await;
                 let Some(connector) = connector else {
