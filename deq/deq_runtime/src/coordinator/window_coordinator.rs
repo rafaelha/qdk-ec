@@ -119,6 +119,7 @@ mod collection;
 mod decoding;
 mod error_metadata;
 mod exploration;
+mod progress;
 mod scoring;
 mod service;
 
@@ -334,6 +335,10 @@ pub struct WindowCoordinator {
     pub trace_shot: Arc<Mutex<trace::Shot>>,
     /// accumulated trace across all shots
     pub trace: Mutex<trace::WindowCoordinatorTrace>,
+    /// What each hop-counted decode waits for and reads; see [`progress::DecodeWait`]. Cleared on reset.
+    decode_waits: std::sync::Mutex<HashMap<u64, progress::DecodeWait>>,
+    /// Bumped whenever an entry of `decode_waits` changes.
+    decode_revision: watch::Sender<u64>,
 }
 
 /// Commitment and exclusive window ownership, published together.
@@ -534,6 +539,8 @@ impl WindowCoordinator {
             use_loaded_reweights,
             trace_shot: Arc::new(Mutex::new(trace::Shot::default())),
             trace: Mutex::new(trace::WindowCoordinatorTrace::default()),
+            decode_waits: std::sync::Mutex::default(),
+            decode_revision: watch::channel(0).0,
         }
     }
 

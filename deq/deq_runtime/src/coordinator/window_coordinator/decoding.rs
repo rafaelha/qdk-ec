@@ -338,7 +338,7 @@ impl WindowCoordinator {
         // when a hyperedge connects to some remote check models outside the window, we simply
         // connect the hyperedge to a virtual vertex.
 
-        let terminal_gids = self.await_error_models(window).await?;
+        let terminal_gids = self.await_error_models(center_gid, window).await?;
         span.timed_event("inputs_ready");
         // Bound graph construction only after every circuit dependency is ready.
         // Ready work includes graph preparation, but never input-dependent waits.

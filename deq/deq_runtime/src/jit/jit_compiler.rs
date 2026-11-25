@@ -60,6 +60,8 @@ pub struct JitCompiler {
     collection_candidates: std::sync::Mutex<Vec<u64>>,
     cache_limit_ratio: usize,
     error_templates: tokio::sync::Mutex<Option<lru::LruCache<ErrorTemplateKey, Arc<ErrorTemplate>>>>,
+    /// Bumped whenever an output connects, virtual checks publish, or an error model becomes ready.
+    graph_revision: watch::Sender<u64>,
 }
 
 pub struct JitGadgetState {
@@ -209,6 +211,7 @@ impl JitCompiler {
             cache_limit_ratio: ratio,
             error_templates: tokio::sync::Mutex::new(None),
             current_gid: AtomicU64::new(1),
+            graph_revision: watch::channel(0).0,
         })
     }
 
@@ -243,6 +246,8 @@ impl JitCompiler {
         gadgets.clear();
         self.collection_candidates.lock().unwrap().clear();
         self.collected_gids.write().await.clear();
+        drop(gadgets);
+        self.bump_graph_revision();
     }
 
     /// Clear registered types and compiled gadgets after all ongoing operations have stopped.
@@ -323,6 +328,50 @@ impl JitCompiler {
             gadget.error_model_ready = true;
             Self::release_reference(&mut gadgets, gid, &mut self.collection_candidates.lock().unwrap());
         }
+        drop(gadgets);
+        self.bump_graph_revision();
+    }
+
+    fn bump_graph_revision(&self) {
+        self.graph_revision.send_modify(|revision| *revision += 1);
+    }
+
+    /// Changes whenever [`Self::graph_blockers`] may have changed.
+    pub(crate) fn subscribe_graph_revision(&self) -> watch::Receiver<u64> {
+        self.graph_revision.subscribe()
+    }
+
+    /// The unconnected `(gid, output_port)` pairs that keep the error models of `roots` from resolving.
+    ///
+    /// A gadget's error model waits for every output port, and for the virtual checks of
+    /// each peer whose input checks are unfinished, so this follows those peers too.
+    pub(crate) async fn graph_blockers(&self, roots: &[u64]) -> Vec<(u64, u64)> {
+        let gadgets = self.gadgets.read().await;
+        let mut blockers = vec![];
+        let mut visited = HashSet::new();
+        let mut pending = roots.to_vec();
+        while let Some(gid) = pending.pop() {
+            // Collected gadgets and published virtual checks wait for nothing more.
+            let Some(gadget) = gadgets.get(&gid) else { continue };
+            if !visited.insert(gid) || gadget.output_virtual_checks.borrow().is_some() {
+                continue;
+            }
+            for (port, output) in gadget.outputs.iter().enumerate() {
+                let Some(connector) = *output.borrow() else {
+                    blockers.push((gid, port as u64));
+                    continue;
+                };
+                if gadgets.get(&connector.gid).is_some_and(|peer| {
+                    peer.input_virtual_check_map[usize::try_from(connector.port).unwrap()]
+                        .iter()
+                        .any(|check| !check.unfinished_checks.is_empty())
+                }) {
+                    pending.push(connector.gid);
+                }
+            }
+        }
+        blockers.sort_unstable();
+        blockers
     }
 
     #[cfg(debug_assertions)]
@@ -424,6 +473,8 @@ impl JitCompiler {
             Self::retain_reference(&mut gadgets, target);
         }
         gadgets[&gid].output_virtual_checks.send_replace(Some(checks));
+        drop(gadgets);
+        self.bump_graph_revision();
     }
 
     pub async fn load_library(&self, library: jit::JitLibrary) {
@@ -693,6 +744,7 @@ impl JitCompiler {
                 }
             }
         }
+        self.bump_graph_revision();
         let this = Arc::clone(self);
         (gadget, check_model_type, check_model, async move {
             // to avoid infinite dependency chain to the final measurement gadget, we need to achieve this property:

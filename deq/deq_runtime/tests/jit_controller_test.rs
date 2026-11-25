@@ -351,6 +351,122 @@ async fn native_window_decodes_open_jit_frontier_without_future_gadget() {
     }
 }
 
+/// `basic_jit_library` plus gtype 3, `prepare_pair`: no inputs and two outputs.
+fn pair_jit_library() -> jit::JitLibrary {
+    let mut library = basic_jit_library();
+    let mut pair = library.gadget_types[0].clone();
+    let base = pair.base.as_mut().unwrap();
+    base.gtype = 3;
+    base.name = "prepare_pair".to_string();
+    base.outputs = vec![base.outputs[0].clone(); 2];
+    let matrix = |rows, cols| deq_runtime::util::BitMatrix {
+        rows,
+        cols,
+        ..Default::default()
+    };
+    base.correction_propagation = Some(matrix(4, 1));
+    base.logical_correction = Some(matrix(4, 0));
+    base.physical_correction = Some(matrix(4, 2));
+    let unfinished = pair.unfinished_checks.clone();
+    pair.unfinished_checks.extend(unfinished);
+    library.gadget_types.push(pair);
+    library
+}
+
+/// Follow `gid`'s progress until it reaches `expected`.
+async fn progress_reaches(
+    controller: &JitController,
+    gid: u64,
+    expected: deq_runtime::coordinator::DecodeProgressState,
+) -> deq_runtime::coordinator::DecodeProgress {
+    timeout(Duration::from_secs(5), async {
+        let mut progress = controller.wait_decode_progress(gid, None).await.unwrap();
+        while progress.state != expected {
+            progress = controller.wait_decode_progress(gid, Some(progress.revision)).await.unwrap();
+        }
+        progress
+    })
+    .await
+    .unwrap_or_else(|_| panic!("gid {gid} never reached {expected:?}"))
+}
+
+#[tokio::test]
+async fn window_decode_progress_names_the_ports_decodes_wait_on() {
+    use deq_runtime::coordinator::{DecodeProgressState, DynCoordinator, Outcomes, window_coordinator::WindowCoordinator};
+    use deq_runtime::decoder::{DynDecoder, MockDecoder};
+    let window = Arc::new(WindowCoordinator::new(
+        serde_json::json!({"buffer_radius": 1, "lookahead_radius": 0}),
+        DynDecoder::Mock(Arc::new(MockDecoder::new())),
+    ));
+    let controller = JitController::new_from_library(pair_jit_library());
+    controller
+        .start(CoordinatorClient::Local(DynCoordinator::Window(window.clone())))
+        .await;
+    let decode = |gid: u64, size: u64| {
+        let controller = Arc::clone(&controller);
+        tokio::spawn(async move {
+            controller
+                .decode_single(Outcomes {
+                    gid,
+                    outcomes: Some(deq_runtime::util::BitVector { size, data: vec![0] }),
+                    ..Default::default()
+                })
+                .await
+        })
+    };
+
+    // gid 1 feeds gid 2 on port 0; port 1 stays open.
+    controller.execute(make_jit_instruction(3, 1, vec![])).await;
+    controller
+        .execute(make_jit_instruction(2, 2, vec![bin::gadget::Connector { gid: 1, port: 0 }]))
+        .await;
+    let decodes = [decode(1, 2), decode(2, 3)];
+
+    // gid 1's mandatory zone waits on its own open port.
+    let open = DecodeProgressState::NeedsGraph(vec![(1, 1)]);
+    let progress = progress_reaches(&controller, 1, open.clone()).await;
+    assert_eq!(window.decode_dependencies(1).await, vec![1, 2]);
+    // gid 2 waits on gid 1's error model, which waits on the same port.
+    progress_reaches(&controller, 2, open).await;
+    assert!(
+        timeout(
+            Duration::from_millis(200),
+            controller.wait_decode_progress(1, Some(progress.revision))
+        )
+        .await
+        .is_err(),
+        "progress must not change while the port stays open"
+    );
+
+    controller
+        .execute(make_jit_instruction(2, 3, vec![bin::gadget::Connector { gid: 1, port: 1 }]))
+        .await;
+    let decodes = decodes.into_iter().chain([decode(3, 3)]);
+    let results = timeout(Duration::from_secs(5), futures_util::future::join_all(decodes))
+        .await
+        .expect("decodes finish once every port is connected");
+    for result in results {
+        result.unwrap().unwrap();
+    }
+    // Each finished decode still names its mandatory zone, until reset.
+    for (gid, zone) in [(1, vec![1, 2, 3]), (2, vec![1, 2]), (3, vec![1, 3])] {
+        progress_reaches(&controller, gid, DecodeProgressState::Ready).await;
+        assert_eq!(window.decode_dependencies(gid).await, zone);
+    }
+    controller.reset(ResetRequest::default()).await.unwrap();
+    assert_eq!(window.decode_dependencies(1).await, vec![1]);
+}
+
+#[tokio::test]
+async fn decode_progress_needs_the_window_coordinator() {
+    let (controller, _mock) = setup_controller(basic_jit_library()).await;
+    controller.execute(make_jit_instruction(1, 1, vec![])).await;
+    assert_eq!(
+        controller.wait_decode_progress(1, None).await.unwrap_err().code(),
+        tonic::Code::Unimplemented
+    );
+}
+
 #[tokio::test]
 async fn native_monolithic_decode_wait_is_cancellable() {
     use deq_runtime::coordinator::{DynCoordinator, Outcomes, monolithic_coordinator::MonolithicCoordinator};

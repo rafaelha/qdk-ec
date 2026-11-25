@@ -790,6 +790,63 @@ impl JitController {
         .await
     }
 
+    /// Report what `gid`'s decode is waiting for.
+    ///
+    /// With `after_revision`, wait until the progress differs from what was observed at that
+    /// revision. Graph blockers are the output ports the window's mandatory zone waits on, and
+    /// those keeping the error models it waits on from resolving.
+    ///
+    /// # Errors
+    /// Returns `UNIMPLEMENTED` unless the coordinator is a local window coordinator, and the
+    /// cancellation status on reset or shutdown.
+    pub async fn wait_decode_progress(
+        &self,
+        gid: u64,
+        after_revision: Option<u64>,
+    ) -> Result<crate::coordinator::DecodeProgress, tonic::Status> {
+        use crate::coordinator::{DecodeProgress, DecodeProgressState, DynCoordinator};
+        let token = self.cancellation.read().await.clone();
+        let window = match self.coordinator.read().await.as_ref() {
+            Some(CoordinatorClient::Local(DynCoordinator::Window(window))) => Arc::clone(window),
+            _ => {
+                return Err(tonic::Status::unimplemented(
+                    "decode progress needs a local window coordinator",
+                ));
+            }
+        };
+        let mut graph = self.compiler.subscribe_graph_revision();
+        let mut waits = window.subscribe_decode_progress();
+        let mut unchanged = None;
+        loop {
+            let revision = *graph.borrow_and_update() + *waits.borrow_and_update();
+            let state = match window.decode_wait(gid).await {
+                None => DecodeProgressState::Ready,
+                Some(wait) => {
+                    let mut blockers = wait.ports;
+                    blockers.extend(self.compiler.graph_blockers(&wait.error_models).await);
+                    blockers.sort_unstable();
+                    blockers.dedup();
+                    if blockers.is_empty() {
+                        DecodeProgressState::Pending
+                    } else {
+                        DecodeProgressState::NeedsGraph(blockers)
+                    }
+                }
+            };
+            match after_revision {
+                // Nothing changed since the caller looked, so this is what it saw.
+                Some(after) if revision <= after => unchanged = Some(state),
+                _ if unchanged.as_ref() == Some(&state) => {}
+                _ => return Ok(DecodeProgress { revision, state }),
+            }
+            tokio::select! {
+                changed = graph.changed() => changed.map_err(|_| self.cancellation_error())?,
+                changed = waits.changed() => changed.map_err(|_| self.cancellation_error())?,
+                () = token.cancelled() => return Err(self.cancellation_error()),
+            }
+        }
+    }
+
     /// Fire the cancellation token to abort any pending error-model loads and
     /// in-flight decodes. Used by [`crate::server::LocalServer::shutdown`] to
     /// propagate runtime shutdown into the service layer. Unlike [`Self::reset`],

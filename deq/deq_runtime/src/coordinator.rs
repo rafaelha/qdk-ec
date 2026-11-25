@@ -19,6 +19,26 @@ include!("proto/deq.coordinator.rs");
 #[cfg(feature = "cli")]
 use coordinator_server::CoordinatorServer;
 
+/// What an in-flight decode is waiting for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DecodeProgressState {
+    /// Blocked until these `(gid, output_port)` pairs are connected.
+    NeedsGraph(Vec<(u64, u64)>),
+    /// Not finished, and not blocked on the graph.
+    Pending,
+    /// The gadget's readouts are final.
+    Ready,
+}
+
+/// A [`DecodeProgressState`] observed at `revision`.
+///
+/// Revisions only grow; pass one back to wait for the next change.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecodeProgress {
+    pub revision: u64,
+    pub state: DecodeProgressState,
+}
+
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Debug)]
 #[cfg_attr(feature = "cli", derive(ValueEnum))]
 pub enum CoordinatorType {

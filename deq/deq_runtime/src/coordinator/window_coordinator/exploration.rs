@@ -242,7 +242,7 @@ impl WindowCoordinator {
                 // strengthen the buffer, so we skip blocking for unconnected
                 // ports.  This is critical for buffer_radius = 0 (single-shot
                 // QEC): each gadget decodes independently with no waits.
-                for sender in &gadget.outputs {
+                for (port, sender) in gadget.outputs.iter().enumerate() {
                     match get_or_future(sender, token.clone()) {
                         Ok(connector) => {
                             if explored.gadgets.contains(&connector.gid) {
@@ -259,7 +259,7 @@ impl WindowCoordinator {
                         }
                         Err(handle) => {
                             if my_dist < buffer_radius {
-                                async_handles.push(handle);
+                                async_handles.push(((fgid, port as u64), handle));
                             }
                         }
                     }
@@ -272,8 +272,15 @@ impl WindowCoordinator {
                 explored.enqueue_interior(gid, buffer_radius, is_free_hop);
             }
 
-            // Await async output handles.
-            for handle in async_handles {
+            // Await async output handles, publishing them as this decode's graph blockers.
+            if !async_handles.is_empty() {
+                let ports = async_handles.iter().map(|(port, _)| *port).collect();
+                self.update_decode_wait(center_gid, |wait| {
+                    wait.ports = ports;
+                    wait.dependencies = Self::sorted(&explored.gadgets);
+                });
+            }
+            for (_, handle) in async_handles {
                 if let Some(connector) = handle.await {
                     if explored.gadgets.contains(&connector.gid) {
                         continue;
@@ -291,6 +298,11 @@ impl WindowCoordinator {
                 }
             }
         }
+
+        self.update_decode_wait(center_gid, |wait| {
+            wait.ports.clear();
+            wait.dependencies = Self::sorted(&explored.gadgets);
+        });
 
         // Rebuild frontier for step 3: all mandatory-zone gadgets at max distance.
         // These are the gadgets whose neighbors were NOT explored because
@@ -788,9 +800,11 @@ impl WindowCoordinator {
         dependencies
     }
 
-    pub(super) async fn await_error_models(&self, window: &HashSet<u64>) -> Result<HashSet<u64>, Status> {
+    /// Wait for the error models of `window`'s gadgets, recording them as `center_gid`'s decode waits.
+    pub(super) async fn await_error_models(&self, center_gid: u64, window: &HashSet<u64>) -> Result<HashSet<u64>, Status> {
         let token = self.cancellation.read().await.clone();
         let mut readiness = vec![];
+        let mut awaited = vec![];
         let mut terminal_gids = HashSet::new();
         {
             let gadgets = self.gadgets.read().await;
@@ -814,10 +828,16 @@ impl WindowCoordinator {
                     terminal_gids.insert(*gid);
                 } else if let Err(handle) = check_or_future(&check.error_model_ready, token.clone()) {
                     readiness.push(handle);
+                    awaited.push(*gid);
                 }
             }
         }
-        join_all(readiness).await;
+        if !awaited.is_empty() {
+            awaited.sort_unstable();
+            self.update_decode_wait(center_gid, |wait| wait.error_models = awaited);
+            join_all(readiness).await;
+            self.update_decode_wait(center_gid, |wait| wait.error_models.clear());
+        }
         if token.is_cancelled() {
             return Err(Status::cancelled("error model readiness wait cancelled"));
         }

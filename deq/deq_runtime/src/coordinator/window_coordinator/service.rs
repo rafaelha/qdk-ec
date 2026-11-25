@@ -193,6 +193,10 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                     gadgets.get_mut(&connector.gid).unwrap().outputs[output]
                         .send_replace(Some(bin::gadget::Connector { gid, port: port as u64 }));
                 }
+                if !gadget.connectors.is_empty() {
+                    // A decode may report one of these ports as a graph blocker.
+                    self.decode_revision.send_modify(|revision| *revision += 1);
+                }
                 let is_free_hop = gadget_type.is_free_hop.unwrap_or(gadget_type.measurements.is_empty());
                 let mut gadget = gadget;
                 gadget.gid = gid;
@@ -746,6 +750,7 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
         }
 
         // Hop-counted gadget: five-step window exploration then commit loop.
+        let _waits = self.track_decode(gid);
 
         // Step 1: Explore mandatory zone (blocking BFS up to buffer_radius).
         let mut explored = self
@@ -759,7 +764,7 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
             .await
             .ok_or_else(|| Status::cancelled("decode cancelled"))?;
 
-        self.await_error_models(&explored.gadgets).await?;
+        self.await_error_models(gid, &explored.gadgets).await?;
         self.wait_for_history_commitment(gid).await?;
 
         // Step 3: Explore lookahead zone (non-blocking BFS, lookahead_radius more hops).
@@ -775,7 +780,7 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                 return Err(Status::cancelled("decode cancelled"));
             }
 
-            self.await_error_models(&explored.gadgets).await?;
+            self.await_error_models(gid, &explored.gadgets).await?;
             let remote_check_owners = if self.config.buffer_radius == 0 {
                 HashMap::new()
             } else {
@@ -975,6 +980,7 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
         self.check_models.write().await.clear();
         self.error_models.write().await.clear();
         self.completed_readouts.lock().await.clear();
+        self.decode_waits.lock().unwrap().clear();
         self.collected_gids.lock().await.clear();
         self.collected_cids.lock().await.clear();
         self.collected_eids.lock().await.clear();
@@ -1187,7 +1193,7 @@ impl WindowCoordinator {
         if modifiers.is_empty() {
             return Ok(vec![]);
         }
-        self.await_error_models(&HashSet::from([gid])).await?;
+        self.await_error_models(gid, &HashSet::from([gid])).await?;
         let cid = self
             .gadgets
             .read()
