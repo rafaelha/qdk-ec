@@ -3178,3 +3178,132 @@ async fn decoded_subgraphs_are_kept_until_reset() {
     let decoded = coordinator.decoded.lock().unwrap();
     assert!(decoded.check_models.is_empty() && decoded.error_models.is_empty() && decoded.decodes.is_empty());
 }
+
+/// A gadget whose frame correction reads another subgraph's readout can be in
+/// a subgraph decoded first: its reply, and those of gadgets whose frames
+/// follow from it, wait for the decode that produces the readout.
+#[tokio::test]
+async fn frames_conditioned_on_a_later_subgraph_resolve_when_it_decodes() {
+    use deq_runtime::decoder::NaiveDecoder;
+    use deq_runtime::misc::bit_matrix::zeros;
+    let coordinator = Arc::new(MonolithicCoordinator::new(
+        serde_json::json!({"persistent_decoder": false}),
+        DynDecoder::BlackBoxNaive(Arc::new(NaiveDecoder::new(serde_json::json!({})))),
+    ));
+    let port = bin::gadget_type::Port {
+        ptype: 1,
+        ..Default::default()
+    };
+    let mut terminal_propagation = zeros(1, 3);
+    terminal_propagation.i.push(0);
+    terminal_propagation.j.push(0);
+    let mut conditioned = zeros(2, 1);
+    conditioned.i.push(0);
+    conditioned.j.push(0);
+    Coordinator::load_library(
+        coordinator.as_ref(),
+        Request::new(bin::Library {
+            port_types: vec![bin::PortType {
+                ptype: 1,
+                observables: vec![bin::port_type::Observable::default(); 2],
+                ..Default::default()
+            }],
+            gadget_types: vec![
+                // source: one measurement, read out
+                bin::GadgetType {
+                    gtype: 1,
+                    measurements: vec![bin::gadget_type::Measurement::default()],
+                    readouts: vec![bin::gadget_type::Readout {
+                        measurement_indices: vec![0],
+                        ..Default::default()
+                    }],
+                    correction_propagation: Some(zeros(0, 1)),
+                    readout_propagation: Some(zeros(1, 1)),
+                    logical_correction: Some(zeros(0, 1)),
+                    physical_correction: Some(zeros(0, 1)),
+                    ..Default::default()
+                },
+                // consumer: prepares a port whose frame is conditioned remotely
+                bin::GadgetType {
+                    gtype: 2,
+                    outputs: vec![port.clone()],
+                    correction_propagation: Some(zeros(2, 1)),
+                    readout_propagation: Some(zeros(0, 1)),
+                    logical_correction: Some(zeros(2, 0)),
+                    physical_correction: Some(zeros(2, 0)),
+                    ..Default::default()
+                },
+                // terminal: reads the port's first observable out
+                bin::GadgetType {
+                    gtype: 3,
+                    inputs: vec![port],
+                    readouts: vec![bin::gadget_type::Readout::default()],
+                    correction_propagation: Some(zeros(0, 3)),
+                    readout_propagation: Some(terminal_propagation),
+                    logical_correction: Some(zeros(0, 1)),
+                    physical_correction: Some(zeros(0, 0)),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let consumer = bin::Gadget {
+        gid: 2,
+        gtype: 2,
+        modifier: Some(bin::GadgetModifier {
+            remote_conditional_correction: Some(bin::RemoteConditionalCorrection {
+                remote_readouts: vec![bin::remote_conditional_correction::RemoteReadout {
+                    gid: 1,
+                    readout_index: 0,
+                }],
+                correction: Some(conditioned),
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    for gadget in [make_gadget(1, 1, vec![]), consumer, make_gadget(3, 3, vec![(2, 0)])] {
+        Coordinator::execute(
+            coordinator.as_ref(),
+            Request::new(bin::Instruction {
+                create: Some(instruction::Create::Gadget(gadget)),
+            }),
+        )
+        .await
+        .unwrap();
+    }
+    let decode = |gid: u64, measured: bool| {
+        let coordinator = Arc::clone(&coordinator);
+        tokio::spawn(async move {
+            Coordinator::decode(
+                coordinator.as_ref(),
+                Request::new(deq_runtime::coordinator::Outcomes {
+                    gid,
+                    outcomes: Some(if measured {
+                        BitVector {
+                            size: 1,
+                            data: vec![0x80],
+                        }
+                    } else {
+                        BitVector::default()
+                    }),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map(|response| response.into_inner().readouts.unwrap().data)
+        })
+    };
+    // The consumer's subgraph decodes first; its frames wait for the source.
+    let consumer = decode(2, false);
+    let terminal = decode(3, false);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(!consumer.is_finished() && !terminal.is_finished());
+    // The source reads 1, which flips the terminal's observable.
+    assert_eq!(decode(1, true).await.unwrap().unwrap(), vec![0x80]);
+    assert_eq!(terminal.await.unwrap().unwrap(), vec![0x80]);
+    assert_eq!(consumer.await.unwrap().unwrap(), Vec::<u8>::new());
+}

@@ -245,7 +245,12 @@ pub struct MonolithicCoordinator {
     pub use_loaded_reweights: bool,
     /// Decoded subgraphs, recorded when `config.keep_decoded` is set.
     pub decoded: std::sync::Mutex<DecodedSubgraphs>,
+    /// Replies of decoded gadgets whose frame awaits readouts of a subgraph
+    /// not decoded yet, by gid: sent by the decode that resolves the frame.
+    deferred_replies: std::sync::Mutex<HashMap<u64, DeferredReply>>,
 }
+
+type DeferredReply = (oneshot::Sender<Result<coordinator::Readouts, Status>>, coordinator::Readouts);
 
 /// Per-coordinator [`FingerprintSource`] adapter for the monolithic
 /// `ErrorModel` wrapper.  See [`crate::coordinator::build_modifier_fingerprints`].
@@ -363,6 +368,7 @@ impl MonolithicCoordinator {
             loss_handler,
             use_loaded_reweights,
             decoded: Default::default(),
+            deferred_replies: Default::default(),
         }
     }
 
@@ -679,30 +685,60 @@ impl MonolithicCoordinator {
         };
 
         drop(decoding_slot);
-        let updates = self
+        // `None`: a reset raced this decode; dropping the replies ends their decodes.
+        let Some(mut resolved) = self
             .update_pauli_frame(&parity_factor, &errors, &relative_program, &mapping, &error_models)
-            .await;
+            .await
+        else {
+            return;
+        };
 
+        let gadget_types = self.gadget_types.read().await;
         let mut probability_offset = 0;
-        for (gid, readouts) in updates {
-            let probability_end = probability_offset + usize::try_from(readouts.size).unwrap();
+        for &gid in &mapping.global_gid_of {
+            let gadget = gadgets.remove(&gid).unwrap();
+            let probability_end = probability_offset + gadget_types[&gadget.instance.gtype].readouts.len();
             let readout_probabilities = if probabilities.is_empty() {
                 vec![]
             } else {
                 probabilities[probability_offset..probability_end].to_vec()
             };
             probability_offset = probability_end;
-            let gadget = gadgets.remove(&gid).unwrap();
             let (correction_count, correction_weight) = correction_statistics.remove(&gid).unwrap_or_default();
-            let _ = gadget.tx.send(Ok(coordinator::Readouts {
+            let reply = coordinator::Readouts {
                 gid,
-                readouts: Some(readouts),
+                readouts: None,
                 probabilities: readout_probabilities,
                 syndrome_count: syndrome_counts.get(&gid).copied().unwrap_or(0),
                 correction_count,
                 correction_weight,
                 frame_probabilities: vec![],
-            }));
+            };
+            match resolved.remove(&gid) {
+                Some(frame) => {
+                    let _ = gadget.tx.send(Ok(coordinator::Readouts {
+                        readouts: Some(frame),
+                        ..reply
+                    }));
+                }
+                // Its frame reads readouts of a subgraph not decoded yet;
+                // that decode resolves it and sends this reply.
+                None => {
+                    self.deferred_replies.lock().unwrap().insert(gid, (gadget.tx, reply));
+                }
+            }
+        }
+        drop(gadget_types);
+        // Frames of earlier-decoded gadgets that were waiting on this
+        // subgraph's readouts.
+        let mut deferred = self.deferred_replies.lock().unwrap();
+        for (gid, frame) in resolved {
+            if let Some((tx, reply)) = deferred.remove(&gid) {
+                let _ = tx.send(Ok(coordinator::Readouts {
+                    readouts: Some(frame),
+                    ..reply
+                }));
+            }
         }
     }
 
@@ -713,7 +749,7 @@ impl MonolithicCoordinator {
         relative_program: &RelativeProgram,
         mapping: &RelativeMapping,
         error_models: &HashMap<u64, ErrorModel>,
-    ) -> Vec<(u64, BitVector)> {
+    ) -> Option<HashMap<u64, BitVector>> {
         let error_model_types = self.error_model_types.read().await;
         let mut tracker = self.pauli_frame_tracker.lock().await;
 
@@ -723,7 +759,7 @@ impl MonolithicCoordinator {
         for &gid in mapping.global_gid_of.iter() {
             let Some(gadget) = tracker.gadgets.get(&gid) else {
                 // Tracker was reset while decode was in flight — bail out
-                return vec![];
+                return None;
             };
             residual_vec.push(BitVec::zeros(gadget.num_output_observables()));
             readout_flips_vec.push(BitVec::zeros(gadget.num_readouts()));
@@ -750,15 +786,15 @@ impl MonolithicCoordinator {
             }
         }
 
-        // update the pauli frame tracker to get responses
-        // we're expecting one return value per update because the gadgets are in order
-        let mut updates = vec![];
+        // Update the pauli frame tracker. Loading a gadget's correction resolves
+        // its frame once the readouts it is conditioned on are known, together
+        // with any frames waiting on its own readouts: frames resolve in
+        // dependency order, which can reach outside this subgraph both ways.
+        let mut resolved = HashMap::new();
         for ((&gid, residual), readout_flips) in mapping.global_gid_of.iter().zip(residual_vec).zip(readout_flips_vec) {
-            let mut single_update = tracker.load_correction(gid, residual, readout_flips);
-            debug_assert_eq!(single_update.keys().cloned().collect::<Vec<_>>(), vec![gid]);
-            updates.push((gid, single_update.remove(&gid).unwrap()));
+            resolved.extend(tracker.load_correction(gid, residual, readout_flips));
         }
-        updates
+        Some(resolved)
     }
 
     async fn decode_parity_factor(
@@ -1941,6 +1977,9 @@ impl coordinator::coordinator_server::Coordinator for MonolithicCoordinator {
         self.check_models.write().await.clear();
         self.error_models.write().await.clear();
         *self.decoded.lock().unwrap() = DecodedSubgraphs::default();
+        // Dropping a waiting reply ends its decode with an error, as reset does
+        // to every pending decode.
+        self.deferred_replies.lock().unwrap().clear();
         *self.next_gid.lock().await = 1;
         *self.next_cid.lock().await = 1;
         *self.next_eid.lock().await = 1;
