@@ -33,7 +33,7 @@ use tonic::{Response, Status};
 struct WindowSpan {
     span: Span,
     #[cfg(feature = "cli")]
-    started: std::time::Instant,
+    started: web_time::Instant,
     #[cfg(feature = "cli")]
     timings: std::sync::Mutex<Vec<(&'static str, u128)>>,
 }
@@ -42,7 +42,7 @@ impl WindowSpan {
     fn new(center_gid: u64, commit_region: &HashSet<u64>, window: &HashSet<u64>) -> Self {
         let span = Span::root("decode_window", SpanContext::random());
         #[cfg(feature = "cli")]
-        let started = std::time::Instant::now();
+        let started = web_time::Instant::now();
         #[cfg(feature = "cli")]
         let span = span.with_properties(|| {
             [

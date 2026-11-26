@@ -56,8 +56,8 @@ pub fn probability_of_weight(weight: f64) -> f64 {
 /// avoids the cross-core wall-clock skew that can make `SystemTime::now()`
 /// non-monotonic on some platforms (notably aarch64 / virtualised CI).
 pub fn timestamp_ns() -> u64 {
-    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    let origin = ORIGIN.get_or_init(std::time::Instant::now);
+    static ORIGIN: std::sync::OnceLock<web_time::Instant> = std::sync::OnceLock::new();
+    let origin = ORIGIN.get_or_init(web_time::Instant::now);
     origin.elapsed().as_nanos() as u64
 }
 

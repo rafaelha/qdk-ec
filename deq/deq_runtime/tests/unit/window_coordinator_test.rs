@@ -214,6 +214,8 @@ async fn local_decode_entry_points_queue_only_when_a_caller_slot_is_available() 
     thread.join().unwrap();
 }
 
+// Occupies the pool's only worker with a blocking job: needs worker threads.
+#[cfg(not(feature = "single-threaded"))]
 #[cfg(feature = "relay-bp")]
 #[tokio::test]
 async fn reset_waits_for_admitted_work_that_has_not_been_polled() {

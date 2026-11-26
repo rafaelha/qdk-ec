@@ -70,6 +70,10 @@ python_all = [
 # stable C ABI (deq-decoder-abi). Default-off; the .so path comes from trusted
 # local config only.
 dylib = ["dep:deq-decoder-abi"]
+# Run decoder work inline and pool-scheduled tasks on the calling Tokio runtime,
+# without starting worker threads. Implied on wasm32; lets native tests exercise
+# the same single-threaded path.
+single-threaded = []
 
 [dependencies]
 bitflags = "2.13.0"
@@ -95,14 +99,11 @@ clap = { version = "4.5.30", features = ["cargo", "derive"], optional = true }
 rand = "0.10"
 rand_xoshiro = "0.8.0"
 chacha20 = { version = "0.10", features = ["rng"] }
-tonic = { version = "0.14.2", default-features = false, features = [
-    "codegen",
-    "server",
-] }
+tonic = { version = "0.14.2", default-features = false, features = ["codegen"] }
 prost = "0.14.1"
 prost-types = "0.14.1"
 tonic-prost = { version = "0.14.2", default-features = false }
-tokio = { version = "1.48.0", features = ["rt-multi-thread", "time", "macros"] }
+tokio = { version = "1.48.0", features = ["rt", "time", "macros"] }
 tokio-util = "0.7"
 tokio-stream = { version = "0.1.17", optional = true }
 rayon = "1.11.0"
@@ -126,7 +127,16 @@ deq-decoder-abi = { version = "0.3.0", path = "../deq_decoder_abi", features = [
 fusion-blossom = { version = "0.2.12", features = ["disable_visualizer"], optional = true }
 mwpf = { version = "0.2.16", default-features = false, features = ["f64_weight"], optional = true }
 rangemap = "1.7.1"
+# `std::time::Instant` on native; `performance.now()` on wasm32, where std's clock panics.
+web-time = "1.1"
 lru = "0.16"
+
+# The gRPC server and the multi-thread runtime need OS threads and sockets.
+# A wasm32 build keeps the in-process coordinator and decoders only, driven by a
+# current-thread Tokio runtime.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tonic = { version = "0.14.2", default-features = false, features = ["server"] }
+tokio = { version = "1.48.0", features = ["rt-multi-thread"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14.2"
