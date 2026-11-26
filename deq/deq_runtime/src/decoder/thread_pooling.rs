@@ -277,7 +277,10 @@ impl<T: DecoderInstance + Send + 'static> ThreadPoolingDecoder<T> {
     }
 
     fn schedule_work(&self, work: impl FnOnce() + Send + 'static) {
-        if self.thread_pool.current_thread_index().is_some() && crate::misc::pool_executor::inline_cpu_allowed() {
+        // Without threads (wasm32, `single-threaded`) the pool has no workers, so the caller solves inline.
+        if cfg!(any(target_family = "wasm", feature = "single-threaded")) {
+            crate::misc::pool_executor::execute_cpu(work);
+        } else if self.thread_pool.current_thread_index().is_some() && crate::misc::pool_executor::inline_cpu_allowed() {
             crate::misc::pool_executor::flush_local(&self.thread_pool);
             work();
         } else {
@@ -327,6 +330,10 @@ impl<T: DecoderInstance + Send + 'static> ThreadPoolingDecoder<T> {
             if config.parallel != 0 {
                 thread_pool_builder = thread_pool_builder.num_threads(config.parallel);
             }
+            // wasm32 cannot spawn threads (and `single-threaded` must not): build a one-slot pool whose worker never starts.
+            // Work runs inline (`schedule_work`) or on Tokio (`pool_executor::enqueue`).
+            #[cfg(any(target_family = "wasm", feature = "single-threaded"))]
+            let thread_pool_builder = thread_pool_builder.num_threads(1).spawn_handler(|_| Ok(()));
             Arc::new(
                 thread_pool_builder
                     .panic_handler(|error| {

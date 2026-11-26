@@ -139,6 +139,14 @@ impl Drop for PollScope {
     }
 }
 
+/// Without threads (wasm32, `single-threaded`) the pool has no workers: the spawning Tokio runtime polls the task.
+#[cfg(any(target_family = "wasm", feature = "single-threaded"))]
+fn enqueue(_pool: &Arc<rayon::ThreadPool>, scheduled: Scheduled) {
+    let runtime = scheduled.runtime.clone();
+    drop(runtime.spawn(async move { scheduled.run() }));
+}
+
+#[cfg(not(any(target_family = "wasm", feature = "single-threaded")))]
 fn enqueue(pool: &Arc<rayon::ThreadPool>, mut scheduled: Scheduled) {
     let owner = Arc::clone(pool);
     pool.spawn_fifo(move || {
@@ -264,6 +272,7 @@ where
     task
 }
 
-#[cfg(test)]
+// These tests drive the threaded scheduler itself.
+#[cfg(all(test, not(feature = "single-threaded")))]
 #[path = "../../tests/unit/pool_executor_test.rs"]
 mod tests;

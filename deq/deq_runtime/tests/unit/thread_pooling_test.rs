@@ -90,6 +90,8 @@ async fn execution_capacity_defers_construction_and_pooled_instance_checkout() {
     assert_eq!(*decoder.decoding.borrow(), 0);
 }
 
+// Occupies the pool's only worker with a blocking job: needs worker threads.
+#[cfg(not(feature = "single-threaded"))]
 #[cfg(feature = "relay-bp")]
 #[tokio::test]
 async fn unloading_a_graph_preserves_admitted_work_without_restoring_its_pool() {
@@ -146,6 +148,8 @@ async fn unloading_a_graph_preserves_admitted_work_without_restoring_its_pool() 
     );
 }
 
+// Occupies the pool's only worker with a blocking job: needs worker threads.
+#[cfg(not(feature = "single-threaded"))]
 #[tokio::test]
 async fn same_pool_work_executes_inline_but_foreign_pool_work_does_not() {
     struct Instance;
@@ -277,6 +281,8 @@ fn shared_graph_rejects_a_different_backend_or_configuration() {
     }
 }
 
+// Occupies the pool's only worker with a blocking job: needs worker threads.
+#[cfg(not(feature = "single-threaded"))]
 #[cfg(feature = "relay-bp")]
 #[tokio::test]
 async fn cancelled_shared_request_retains_its_graph_until_the_worker_finishes() {

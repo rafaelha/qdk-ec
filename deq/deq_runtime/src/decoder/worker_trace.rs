@@ -11,7 +11,7 @@ pub(super) struct WorkerTrace {
 #[cfg(feature = "cli")]
 struct ActiveWorkerTrace {
     span: Span,
-    started: std::time::Instant,
+    started: web_time::Instant,
     // Keep properties on the root record: separate fastrace property records can be dropped under load.
     properties: Vec<(String, String)>,
 }
@@ -27,7 +27,7 @@ impl WorkerTrace {
                 // A worker can outlive cancellation of its request.
                 .map(|parent| ActiveWorkerTrace {
                     span: Span::root(name, parent),
-                    started: std::time::Instant::now(),
+                    started: web_time::Instant::now(),
                     properties: Vec::new(),
                 });
             Self { active }
