@@ -138,6 +138,7 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
         let id = match create {
             bin::instruction::Create::Gadget(gadget) => {
                 let port_types = self.port_types.read().await;
+                let check_free_port_types = self.check_free_port_types.read().await;
                 let gadget_types = self.gadget_types.read().await;
                 let mut gadgets = self.gadgets.write().await;
                 if gadget.gid != 0
@@ -209,6 +210,11 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                         correction_count: 0,
                         correction_weight: 0.0,
                         is_free_hop,
+                        check_free_outputs: gadget_type
+                            .outputs
+                            .iter()
+                            .map(|p| check_free_port_types.contains(&p.ptype))
+                            .collect(),
                         state: watch::channel(GadgetState::default()).0,
                         loss_mask: None,
                         decoder_seed: None,
@@ -966,6 +972,7 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
         }
         if flags.reset_library {
             self.port_types.write().await.clear();
+            self.check_free_port_types.write().await.clear();
             self.gadget_types.write().await.clear();
             self.check_model_types.write().await.clear();
             self.error_model_types.write().await.clear();

@@ -1535,6 +1535,7 @@ async fn history_commitment_wait_is_cancelled_without_reserving_gadgets() {
                     correction_count: 0,
                     correction_weight: 0.0,
                     is_free_hop: false,
+                    check_free_outputs: vec![],
                     state: watch::channel(GadgetState::default()).0,
                 },
             );
@@ -1902,6 +1903,7 @@ fn history_gadget(gid: u64, state: GadgetState, next_gid: Option<u64>) -> Gadget
         correction_count: 0,
         correction_weight: 0.0,
         is_free_hop: false,
+        check_free_outputs: vec![false],
         state: watch::channel(state).0,
     }
 }

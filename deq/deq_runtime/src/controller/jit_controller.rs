@@ -205,6 +205,7 @@ impl JitController {
         self.run_with_cancellation(&token, async {
             let port_types: Vec<_> = library.port_types.iter().filter_map(|pt| pt.base.clone()).collect();
             let gadget_types: Vec<_> = library.gadget_types.iter().filter_map(|gt| gt.base.clone()).collect();
+            let check_free = check_free_port_types(&library);
 
             self.compiler.load_library(library).await;
 
@@ -223,7 +224,9 @@ impl JitController {
                     error_model_types,
                     ..Default::default()
                 })
-                .await
+                .await?;
+            coordinator.mark_check_free_port_types(check_free).await;
+            Ok(())
         })
         .await
     }
@@ -848,6 +851,9 @@ impl JitController {
                         ..Default::default()
                     })
                     .await?;
+                coordinator
+                    .mark_check_free_port_types(check_free_port_types(&self.library))
+                    .await;
             }
         }
         *self.generated_types.lock().await = crate::coordinator::UnloadLibrary::default();
@@ -1048,6 +1054,16 @@ fn build_error_model_modifier(
             reroute_remote_check_models: reroutes,
         })
     }
+}
+
+/// The port types of `library` without stabilizers: no check crosses them.
+fn check_free_port_types(library: &jit::JitLibrary) -> Vec<u64> {
+    library
+        .port_types
+        .iter()
+        .filter(|pt| pt.stabilizers.is_empty())
+        .filter_map(|pt| pt.base.as_ref().map(|base| base.ptype))
+        .collect()
 }
 
 /// Wrapper for CheckModelType that implements Hash/Eq based on structural semantics only.

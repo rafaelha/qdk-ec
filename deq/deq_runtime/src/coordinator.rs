@@ -287,6 +287,14 @@ impl CoordinatorClient {
         .map(|v| v.into_inner())
     }
 
+    /// Tell the coordinator which port types carry no stabilizers. Only the
+    /// in-process window coordinator explores across ports; the rest ignore it.
+    pub async fn mark_check_free_port_types(&self, ptypes: Vec<u64>) {
+        if let CoordinatorClient::Local(DynCoordinator::Window(coordinator)) = self {
+            coordinator.mark_check_free_port_types(ptypes).await;
+        }
+    }
+
     /// Request deferred unloading of library types.
     ///
     /// # Errors

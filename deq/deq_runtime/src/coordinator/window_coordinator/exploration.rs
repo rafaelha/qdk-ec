@@ -14,6 +14,15 @@ use tonic::Status;
 /// Cooperative scheduling heuristic; correctness does not depend on the exact positive value.
 const COOPERATIVE_MAX_HISTORY_BATCH_SIZE: usize = 64;
 
+/// Whether output `port` of gadget `gid` has a port type without stabilizers.
+fn check_free_output(gadgets: &HashMap<u64, Gadget>, gid: u64, port: u64) -> bool {
+    gadgets
+        .get(&gid)
+        .and_then(|g| g.check_free_outputs.get(usize::try_from(port).ok()?))
+        .copied()
+        .unwrap_or(false)
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Window exploration data types
 // ────────────────────────────────────────────────────────────────────────────
@@ -242,7 +251,13 @@ impl WindowCoordinator {
                 // strengthen the buffer, so we skip blocking for unconnected
                 // ports.  This is critical for buffer_radius = 0 (single-shot
                 // QEC): each gadget decodes independently with no waits.
-                for sender in &gadget.outputs {
+                for (port, sender) in gadget.outputs.iter().enumerate() {
+                    // No check crosses a port without stabilizers, so the
+                    // gadget behind it adds no buffer. Waiting for it could
+                    // deadlock: it may be gated behind a branch on this decode.
+                    if gadget.check_free_outputs.get(port) == Some(&true) && sender.borrow().is_none() {
+                        continue;
+                    }
                     match get_or_future(sender, token.clone()) {
                         Ok(connector) => {
                             if explored.gadgets.contains(&connector.gid) {
@@ -528,9 +543,11 @@ impl WindowCoordinator {
             let gadget = &gadgets[&gid];
             let mut has_open_boundary = false;
 
-            // Check inputs: any connector from outside the window is boundary.
+            // Check inputs: any connector from outside the window is boundary,
+            // unless it arrives through a port without stabilizers: no check
+            // crosses such a port, so nothing outside constrains this decode.
             for connector in &gadget.instance.connectors {
-                if !explored.gadgets.contains(&connector.gid) {
+                if !explored.gadgets.contains(&connector.gid) && !check_free_output(gadgets, connector.gid, connector.port) {
                     has_open_boundary = true;
                     break;
                 }
@@ -538,7 +555,11 @@ impl WindowCoordinator {
 
             // Check outputs: any output going outside window or unconnected.
             if !has_open_boundary {
-                for sender in &gadget.outputs {
+                for (port, sender) in gadget.outputs.iter().enumerate() {
+                    // A port without stabilizers is no boundary either way.
+                    if gadget.check_free_outputs.get(port) == Some(&true) {
+                        continue;
+                    }
                     match sender.borrow().as_ref() {
                         Some(conn) => {
                             if !explored.gadgets.contains(&conn.gid) {

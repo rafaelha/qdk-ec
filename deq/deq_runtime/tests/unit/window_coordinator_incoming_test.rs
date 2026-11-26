@@ -32,6 +32,7 @@ async fn radius_zero_does_not_include_adjacent_free_hops() {
                 },
                 pauli_frame: watch::channel(None).0,
                 is_free_hop: true,
+                check_free_outputs: vec![],
                 state: watch::channel(GadgetState {
                     committed: false,
                     reserved_by: None,
@@ -80,6 +81,7 @@ async fn missing_window_state_is_internal_not_cancelled() {
                 outputs: vec![],
                 pauli_frame: watch::channel(None).0,
                 is_free_hop: false,
+                check_free_outputs: vec![],
                 state: watch::channel(GadgetState {
                     committed: false,
                     reserved_by: Some(11),

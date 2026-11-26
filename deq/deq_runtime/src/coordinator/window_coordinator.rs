@@ -260,6 +260,10 @@ pub struct WindowCoordinator {
     pub config: WindowCoordinatorConfig,
     /// library data
     pub port_types: RwLock<HashMap<u64, Arc<bin::PortType>>>,
+    /// Port types with no stabilizers. No check crosses such a port into the
+    /// next gadget, so no decode window needs that gadget as its buffer. The
+    /// JIT controller fills this: `bin::PortType` does not carry stabilizers.
+    pub check_free_port_types: RwLock<HashSet<u64>>,
     pub gadget_types: RwLock<HashMap<u64, Arc<bin::GadgetType>>>,
     pub check_model_types: Arc<RwLock<HashMap<u64, Arc<bin::CheckModelType>>>>,
     pub error_model_types: RwLock<HashMap<u64, Arc<bin::ErrorModelType>>>,
@@ -376,6 +380,10 @@ pub struct Gadget {
     /// They may still have check models and error models with physical
     /// errors that need to be corrected.
     pub is_free_hop: bool,
+    /// Per output port: whether its port type carries no stabilizers (see
+    /// `WindowCoordinator::check_free_port_types`). Exploration never waits
+    /// for such a port to be connected.
+    pub check_free_outputs: Vec<bool>,
     /// Commitment and reservation state. Other decode tasks watch this for release.
     pub state: watch::Sender<GadgetState>,
 }
@@ -497,6 +505,7 @@ impl WindowCoordinator {
         Self {
             config,
             port_types: Default::default(),
+            check_free_port_types: Default::default(),
             gadget_types: Default::default(),
             check_model_types: Default::default(),
             error_model_types: Default::default(),
@@ -539,6 +548,11 @@ impl WindowCoordinator {
 
     fn gap_decoder(&self) -> &DynDecoder {
         self.gap_decoder.as_ref().unwrap_or(&self.decoder)
+    }
+
+    /// Record port types without stabilizers (see `check_free_port_types`).
+    pub async fn mark_check_free_port_types(&self, ptypes: impl IntoIterator<Item = u64>) {
+        self.check_free_port_types.write().await.extend(ptypes);
     }
 
     /// Fire the cancellation token to abort pending decode tasks. Used by

@@ -981,6 +981,7 @@ async fn readout_collection_scales_batches_with_a_minimum_and_drains_quiescent_s
                     correction_count: 0,
                     correction_weight: 0.0,
                     is_free_hop: false,
+                    check_free_outputs: vec![],
                     state: watch::channel(GadgetState::default()).0,
                     loss_mask: None,
                     decoder_seed: None,
