@@ -35,6 +35,10 @@ pub struct RelayBPDecoderConfig {
     /// relay-BP decoder parameters
     #[serde(flatten)]
     pub relay_decoder_config: SerdeRelayDecoderConfig,
+    /// When Relay-BP does not converge, return its last decoding instead of an
+    /// error. That correction need not reproduce the syndrome.
+    #[serde(default)]
+    pub allow_unconverged: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,6 +152,8 @@ pub struct RelayBPDecoderInstance<N: RelayBPDecoderDataType + 'static = f64> {
     /// of the solver (an infinite log-likelihood ratio would poison the messages),
     /// so decoded columns are mapped back through this before being returned.
     active_edges: Arc<Vec<u64>>,
+    /// See [`RelayBPDecoderConfig::allow_unconverged`].
+    allow_unconverged: bool,
 }
 
 impl<N: RelayBPDecoderDataType + 'static> RelayBPDecoderInstance<N> {
@@ -212,6 +218,7 @@ impl<N: RelayBPDecoderDataType + 'static> RelayBPDecoderInstance<N> {
                 Arc::new(relay_decoder_config),
             ),
             active_edges: Arc::new(active_edges),
+            allow_unconverged: config.allow_unconverged,
         }
     }
 }
@@ -248,6 +255,7 @@ impl<N: RelayBPDecoderDataType + 'static> DecoderInstance for RelayBPDecoderInst
         Ok(Arc::new(move |_, _| Self {
             solver: prototype.solver.clone(),
             active_edges: Arc::clone(&prototype.active_edges),
+            allow_unconverged: prototype.allow_unconverged,
         }))
     }
 
@@ -257,7 +265,7 @@ impl<N: RelayBPDecoderDataType + 'static> DecoderInstance for RelayBPDecoderInst
             detectors[index as usize] = 1;
         }
         let result = self.solver.decode_detailed(detectors.view());
-        if !result.success {
+        if !result.success && !self.allow_unconverged {
             return Err(DecodeError::Backend(format!(
                 "Relay-BP did not converge after {} iterations",
                 result.iterations,
@@ -293,6 +301,37 @@ mod tests {
     use crate::decoder::blackbox_decoder::Hyperedge;
     use crate::misc::bit_vector::from_sparse_indices;
     use serde_json::json;
+
+    #[test]
+    fn allow_unconverged_returns_the_last_decoding_instead_of_an_error() {
+        let graph = DecodingHypergraph {
+            vertex_num: 2,
+            hyperedges: vec![Hyperedge {
+                vertices: vec![0, 1],
+                probability: 0.1,
+                observable_flips: None,
+            }],
+        };
+        let config = json!({
+            "seed": 42,
+            "num_sets": 3,
+            "pre_iter": 1,
+            "set_max_iter": 2,
+            "stopping_criterion": "All",
+            "allow_unconverged": true,
+        });
+        let mut decoder = RelayBPDecoderInstance::<f64>::new(&graph, &config);
+        // No set of edges reproduces a lone fired vertex.
+        let parity_factor = decoder
+            .decode(DecodeRequest {
+                syndrome: &from_sparse_indices(2, &[0]),
+                decoder_seed: None,
+                reweights: &[],
+                loss: None,
+            })
+            .unwrap();
+        assert!(parity_factor.subgraph.iter().all(|&edge| edge == 0));
+    }
 
     #[test]
     fn prepared_instances_remain_fresh_after_a_sibling_fails() {
