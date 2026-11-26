@@ -685,15 +685,26 @@ impl MonolithicCoordinator {
         };
 
         drop(decoding_slot);
+        // Resolve frames and deliver or keep every reply under one hold of the
+        // tracker (locks taken in field order): a concurrent decode that
+        // resolves one of this subgraph's frames must then find its reply kept.
+        let gadget_types = self.gadget_types.read().await;
+        let error_model_types = self.error_model_types.read().await;
+        let mut tracker = self.pauli_frame_tracker.lock().await;
         // `None`: a reset raced this decode; dropping the replies ends their decodes.
-        let Some(mut resolved) = self
-            .update_pauli_frame(&parity_factor, &errors, &relative_program, &mapping, &error_models)
-            .await
-        else {
+        let Some(mut resolved) = Self::update_pauli_frame(
+            &mut tracker,
+            &error_model_types,
+            &parity_factor,
+            &errors,
+            &relative_program,
+            &mapping,
+            &error_models,
+        ) else {
             return;
         };
+        drop(error_model_types);
 
-        let gadget_types = self.gadget_types.read().await;
         let mut probability_offset = 0;
         for &gid in &mapping.global_gid_of {
             let gadget = gadgets.remove(&gid).unwrap();
@@ -740,19 +751,21 @@ impl MonolithicCoordinator {
                 }));
             }
         }
+        drop(deferred);
+        drop(tracker);
     }
 
-    async fn update_pauli_frame(
-        &self,
+    /// Apply a decode's corrections to the frame tracker; the frames it
+    /// resolves, or `None` when a reset emptied the tracker meanwhile.
+    fn update_pauli_frame(
+        tracker: &mut PauliFrameTracker,
+        error_model_types: &HashMap<u64, Arc<bin::ErrorModelType>>,
         parity_factor: &blackbox_decoder::ParityFactor,
         errors: &ProjectedErrors,
         relative_program: &RelativeProgram,
         mapping: &RelativeMapping,
         error_models: &HashMap<u64, ErrorModel>,
     ) -> Option<HashMap<u64, BitVector>> {
-        let error_model_types = self.error_model_types.read().await;
-        let mut tracker = self.pauli_frame_tracker.lock().await;
-
         // construct the residuals and readout flips
         let mut residual_vec: Vec<BitVec> = Vec::with_capacity(relative_program.local_gadgets.len());
         let mut readout_flips_vec: Vec<BitVec> = Vec::with_capacity(relative_program.local_gadgets.len());
