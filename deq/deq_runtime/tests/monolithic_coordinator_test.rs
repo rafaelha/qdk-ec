@@ -3112,3 +3112,69 @@ async fn test_outcomes_modifier_is_sent_as_loaded_reweight() {
         "runtime update must not mutate the loaded graph"
     );
 }
+
+/// With `keep_decoded`, a decoded subgraph's check models (with their
+/// syndromes), error models and selected errors stay readable after decoding
+/// took them out of the execution maps, until the next reset.
+#[tokio::test]
+async fn decoded_subgraphs_are_kept_until_reset() {
+    let mock = make_mock_decoder();
+    let coordinator = MonolithicCoordinator::new(
+        serde_json::json!({
+            "persistent_decoder": false,
+            "merge_hyperedges": false,
+            "keep_decoded": true,
+        }),
+        DynDecoder::Mock(Arc::clone(&mock)),
+    );
+    Coordinator::load_library(&coordinator, Request::new(forced_gap_library()))
+        .await
+        .unwrap();
+    for create in [
+        instruction::Create::Gadget(make_gadget(1, 1, vec![])),
+        instruction::Create::CheckModel(make_check_model(1, 1, 1)),
+        instruction::Create::ErrorModel(make_error_model(1, 1, 1)),
+    ] {
+        Coordinator::execute(&coordinator, Request::new(bin::Instruction { create: Some(create) }))
+            .await
+            .unwrap();
+    }
+    // The check fires; the decoder explains it with error 0.
+    mock.set_response(vec![0b1000_0000], vec![0]).await;
+    Coordinator::decode(
+        &coordinator,
+        Request::new(deq_runtime::coordinator::Outcomes {
+            gid: 1,
+            outcomes: Some(BitVector {
+                size: 1,
+                data: vec![0b1000_0000],
+            }),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        coordinator.check_models.read().await.is_empty(),
+        "decoding takes the subgraph out"
+    );
+    {
+        let decoded = coordinator.decoded.lock().unwrap();
+        assert_eq!(decoded.check_models.len(), 1);
+        let (check_model, syndrome) = &decoded.check_models[0];
+        assert_eq!((check_model.gid, check_model.cid), (1, 1));
+        assert_eq!(syndrome.data, vec![0b1000_0000]);
+        assert_eq!(decoded.error_models.len(), 1);
+        assert_eq!(decoded.error_models[0].0.eid, 1);
+        assert_eq!(decoded.decodes.len(), 1);
+        assert_eq!(decoded.decodes[0].gids, vec![1]);
+        assert_eq!(decoded.decodes[0].selected, vec![(1, 0)]);
+    }
+
+    Coordinator::reset(&coordinator, Request::new(deq_runtime::coordinator::ResetRequest::default()))
+        .await
+        .unwrap();
+    let decoded = coordinator.decoded.lock().unwrap();
+    assert!(decoded.check_models.is_empty() && decoded.error_models.is_empty() && decoded.decodes.is_empty());
+}

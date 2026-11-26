@@ -554,6 +554,10 @@ impl WindowCoordinator {
         let selected_errors = Self::global_subgraph_of(&mapping, &errors, &parity_factor.subgraph);
         self.record_event(trace::event::Event::DecodeFinished(trace::DecodeFinishedEvent {
             leader_gid: center_gid,
+            selected_errors: selected_errors
+                .iter()
+                .map(|&(eid, error_index)| trace::SelectedError { eid, error_index })
+                .collect(),
         }))
         .await;
         span.add_property(|| ("parity_factor", format!("{selected_errors:?}")));

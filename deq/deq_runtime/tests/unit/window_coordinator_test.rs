@@ -2005,6 +2005,7 @@ async fn lookahead_waits_for_free_hop_publication_and_syndrome_without_blocking(
                     modified_remote_gadgets: Arc::new(vec![]),
                     expanded_remote_gadgets: Some(vec![]),
                     syndrome: watch::channel(syndrome_ready.then(BitVector::default)).0,
+                    raw_syndrome: watch::channel(None).0,
                     syndrome_count: 0,
                     referring_eids: vec![],
                 },
@@ -2489,6 +2490,7 @@ fn history_check_model(cid: u64, attaching_eid_vec: Vec<u64>) -> CheckModel {
         modified_remote_gadgets: Arc::new(vec![]),
         expanded_remote_gadgets: Some(vec![]),
         syndrome: watch::channel(None).0,
+        raw_syndrome: watch::channel(None).0,
         syndrome_count: 0,
         referring_eids: vec![],
     }

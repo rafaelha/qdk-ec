@@ -60,7 +60,7 @@ impl Drop for StatePins {
 impl WindowCoordinator {
     /// Whether history can be discarded without breaking forced-gap scoring or tracing.
     pub(crate) fn automatic_collection(&self) -> bool {
-        !self.config.forced_gap && self.config.trace_filepath.is_none()
+        !self.config.forced_gap && !self.config.tracing()
     }
 
     /// Retain unfinished, reserved, or extendable gadgets and their geometric decoding context.

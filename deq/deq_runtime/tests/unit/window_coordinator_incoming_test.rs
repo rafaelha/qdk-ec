@@ -105,6 +105,7 @@ async fn missing_window_state_is_internal_not_cancelled() {
                 modified_remote_gadgets: Arc::new(vec![]),
                 expanded_remote_gadgets: Some(vec![]),
                 syndrome: watch::channel(Some(BitVector::default())).0,
+                raw_syndrome: watch::channel(None).0,
                 referring_eids: vec![],
                 syndrome_count: 0,
             },

@@ -156,6 +156,33 @@ pub struct MonolithicCoordinatorConfig {
     #[serde(default)]
     #[cfg_attr(feature = "cli", structdoc(leaf = "JSON object"))]
     pub loss_config: serde_json::Value,
+    /// Record each decoded subgraph's check models, with their syndromes, its
+    /// error models and the errors its decode selected in `decoded` until the
+    /// next reset. Decoding takes a
+    /// subgraph out of the execution maps; this lets an in-process caller
+    /// still read what was decoded.
+    #[serde(default)]
+    pub keep_decoded: bool,
+}
+
+/// What the coordinator decoded since the last reset (see `keep_decoded`).
+#[derive(Debug, Clone, Default)]
+pub struct DecodedSubgraphs {
+    /// Each check model with its syndrome as computed from the outcomes.
+    pub check_models: Vec<(bin::CheckModel, BitVector)>,
+    /// Each error model with its remote check models as rerouted.
+    pub error_models: Vec<(bin::ErrorModel, Arc<Vec<Option<bin::error_model_type::RemoteCheckModel>>>)>,
+    /// Each decode, in order.
+    pub decodes: Vec<DecodedSubgraph>,
+}
+
+/// One decode of a subgraph (see `keep_decoded`).
+#[derive(Debug, Clone, Default)]
+pub struct DecodedSubgraph {
+    /// The subgraph's gadgets.
+    pub gids: Vec<u64>,
+    /// The errors the decoder selected, as global `(eid, error_index)`.
+    pub selected: Vec<(u64, u64)>,
 }
 
 fn default_true() -> bool {
@@ -216,6 +243,8 @@ pub struct MonolithicCoordinator {
     pub loss_handler: LossHandler,
     /// Whether this decoder accepts shot-scoped loaded reweights.
     pub use_loaded_reweights: bool,
+    /// Decoded subgraphs, recorded when `config.keep_decoded` is set.
+    pub decoded: std::sync::Mutex<DecodedSubgraphs>,
 }
 
 /// Per-coordinator [`FingerprintSource`] adapter for the monolithic
@@ -333,6 +362,7 @@ impl MonolithicCoordinator {
             loss_imputation_seed,
             loss_handler,
             use_loaded_reweights,
+            decoded: Default::default(),
         }
     }
 
@@ -596,6 +626,9 @@ impl MonolithicCoordinator {
         let (relative_program, mapping) = RelativeProgram::new(&expanded_gadgets);
 
         let (syndrome, syndrome_counts) = self.get_syndrome(&relative_program, &mapping, &gadgets, &check_models).await;
+        if self.config.keep_decoded {
+            self.record_decoded(&syndrome, &mapping, &check_models, &error_models);
+        }
         let decoded = self
             .decode_parity_factor(syndrome, &relative_program, &mapping, &gadgets, &check_models, &error_models)
             .await;
@@ -608,6 +641,20 @@ impl MonolithicCoordinator {
                 return;
             }
         };
+        if self.config.keep_decoded {
+            let selected = parity_factor
+                .subgraph
+                .iter()
+                .map(|&error_index| {
+                    let error = &errors[usize::try_from(error_index).unwrap()];
+                    (mapping.global_eid_of[error.eid], error.error_index as u64)
+                })
+                .collect();
+            self.decoded.lock().unwrap().decodes.push(DecodedSubgraph {
+                gids: mapping.global_gid_of.clone(),
+                selected,
+            });
+        }
         let mut correction_statistics = HashMap::new();
         for (&error_index, &weight) in parity_factor.subgraph.iter().zip(&correction_weights) {
             let eid = mapping.global_eid_of[errors[usize::try_from(error_index).unwrap()].eid];
@@ -1010,6 +1057,32 @@ impl MonolithicCoordinator {
             .collect();
         modifiers.sort_unstable_by_key(|&(local_eid, _)| local_eid);
         modifiers
+    }
+
+    /// Record a subgraph about to be decoded (see `keep_decoded`): each check
+    /// model with its slice of `syndrome`, and each error model.
+    fn record_decoded(
+        &self,
+        syndrome: &BitVector,
+        mapping: &RelativeMapping,
+        check_models: &HashMap<u64, CheckModel>,
+        error_models: &HashMap<u64, ErrorModel>,
+    ) {
+        let mut decoded = self.decoded.lock().unwrap();
+        for (index, &cid) in mapping.global_cid_of.iter().enumerate() {
+            let start = mapping.start_indices[index] as u64;
+            let end = mapping.start_indices.get(index + 1).map_or(syndrome.size, |&end| end as u64);
+            let mut bits = bit_vector::from_sparse_indices(end - start, &[]);
+            for bit in start..end {
+                set_bit(&mut bits, bit - start, get_bit(syndrome, bit));
+            }
+            decoded.check_models.push((check_models[&cid].instance.clone(), bits));
+        }
+        decoded.error_models.extend(
+            error_models
+                .values()
+                .map(|em| (em.instance.clone(), Arc::clone(&em.modified_remote_check_models))),
+        );
     }
 
     async fn get_syndrome(
@@ -1867,6 +1940,7 @@ impl coordinator::coordinator_server::Coordinator for MonolithicCoordinator {
         self.gadgets.write().await.clear();
         self.check_models.write().await.clear();
         self.error_models.write().await.clear();
+        *self.decoded.lock().unwrap() = DecodedSubgraphs::default();
         *self.next_gid.lock().await = 1;
         *self.next_cid.lock().await = 1;
         *self.next_eid.lock().await = 1;

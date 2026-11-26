@@ -197,6 +197,11 @@ pub struct WindowCoordinatorConfig {
     /// the trace is written on each reset() call
     #[serde(default)]
     pub trace_filepath: Option<String>,
+    /// Record the current shot's trace events in `trace_shot` without a
+    /// file, for an in-process caller to read before the next reset. Like
+    /// `trace_filepath`, this keeps history uncollected during the shot.
+    #[serde(default)]
+    pub trace_in_memory: bool,
     /// when ``true`` (the default), each bit of ``Outcomes.outcomes`` whose
     /// position is set in the accompanying ``Outcomes.loss_mask`` is `XOR`ed with
     /// a uniformly random bit before the coordinator computes the syndrome.
@@ -222,6 +227,11 @@ pub struct WindowCoordinatorConfig {
 }
 
 impl WindowCoordinatorConfig {
+    /// Whether trace events are recorded, to a file or in memory.
+    pub fn tracing(&self) -> bool {
+        self.trace_filepath.is_some() || self.trace_in_memory
+    }
+
     /// Resolved lookahead_radius: defaults to buffer_radius when not specified.
     /// Forced to 0 when buffer_radius is 0 (single-shot isolation mode).
     pub fn lookahead_radius(&self) -> usize {
@@ -399,6 +409,10 @@ pub struct CheckModel {
     pub expanded_remote_gadgets: Option<Vec<Option<u64>>>,
     /// the syndrome value
     pub syndrome: watch::Sender<Option<BitVector>>,
+    /// The syndrome as first computed from the measurement outcomes. Unlike
+    /// `syndrome`, which a committed correction rewrites in place, it never
+    /// changes once set.
+    pub raw_syndrome: watch::Sender<Option<BitVector>>,
     pub syndrome_count: u64,
     /// error models (by eid) from OTHER gadgets that reference this check model
     /// via remote check model chains. Used to determine safe terminal condition:
@@ -567,7 +581,7 @@ impl WindowCoordinator {
     }
 
     async fn record_event(&self, event: trace::event::Event) {
-        if self.config.trace_filepath.is_some() {
+        if self.config.tracing() {
             self.trace_shot.lock().await.events.push(trace::Event {
                 timestamp_ns: crate::misc::util::timestamp_ns(),
                 event: Some(event),

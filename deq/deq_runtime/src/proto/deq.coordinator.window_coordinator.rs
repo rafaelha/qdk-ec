@@ -86,10 +86,22 @@ pub struct DecodeEvent {
 /// Emitted after the decoder call returns for a leader window.
 /// Use timestamp_ns together with the DecodeEvent timestamp to measure
 /// decoder wall-clock time per window.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DecodeFinishedEvent {
     #[prost(uint64, tag = "1")]
     pub leader_gid: u64,
+    /// The errors the decoder selected for this window (its parity factor), as
+    /// global error ids, in commit and buffer regions alike.
+    #[prost(message, repeated, tag = "2")]
+    pub selected_errors: ::prost::alloc::vec::Vec<SelectedError>,
+}
+/// One error of an executed error model: error `error_index` of model `eid`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SelectedError {
+    #[prost(uint64, tag = "1")]
+    pub eid: u64,
+    #[prost(uint64, tag = "2")]
+    pub error_index: u64,
 }
 /// Emitted once per decode call, after the five-step exploration completes
 /// and before the actual decoder invocation.  Records which gadgets belong

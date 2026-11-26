@@ -417,6 +417,7 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                         modified_remote_gadgets: modified_remote.clone(),
                         expanded_remote_gadgets: None,
                         syndrome: watch::channel(None).0,
+                        raw_syndrome: watch::channel(None).0,
                         syndrome_count: 0,
                         referring_eids: deferred_referring_eids,
                     },
@@ -434,7 +435,7 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
                 let token = self.cancellation.read().await.clone();
                 let _guard = self.task_counter.guard();
                 let trace_shot = self.trace_shot.clone();
-                let has_trace = self.config.trace_filepath.is_some();
+                let has_trace = self.config.tracing();
                 tokio::spawn(async move {
                     let _guard = _guard;
                     let expanded_remote_gadgets =
@@ -1024,6 +1025,9 @@ impl coordinator::coordinator_server::Coordinator for WindowCoordinator {
             trace.shots.push(shot);
             let buf = trace.encode_to_vec();
             std::fs::write(filepath, buf).map_err(|e| Status::internal(format!("failed to write trace: {e}")))?;
+        } else {
+            // An in-memory trace keeps only the current shot.
+            self.trace_shot.lock().await.events.clear();
         }
         Ok(().into())
     }
@@ -1182,6 +1186,7 @@ impl WindowCoordinator {
             .get_mut(&cid)
             .ok_or_else(|| Status::internal(format!("missing syndrome check cid={cid}")))?;
         check.syndrome_count = count;
+        check.raw_syndrome.send_replace(Some(syndrome.clone()));
         check.syndrome.send_replace(Some(syndrome));
         Ok(Some(gid))
     }

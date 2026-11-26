@@ -73,6 +73,15 @@ message DecodeEvent {
 // decoder wall-clock time per window.
 message DecodeFinishedEvent {
   uint64 leader_gid = 1;
+  // The errors the decoder selected for this window (its parity factor), as
+  // global error ids, in commit and buffer regions alike.
+  repeated SelectedError selected_errors = 2;
+}
+
+// One error of an executed error model: error `error_index` of model `eid`.
+message SelectedError {
+  uint64 eid = 1;
+  uint64 error_index = 2;
 }
 
 // Emitted once per decode call, after the five-step exploration completes

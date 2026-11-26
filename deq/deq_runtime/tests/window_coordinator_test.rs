@@ -6525,3 +6525,72 @@ async fn test_window_forced_gap_reuses_hard_decoder_with_shot_frozen_scores() {
     assert_eq!(state.decode_calls.len(), 2);
     assert_eq!(coord.loaded_decoders.read().await.len(), 1);
 }
+
+/// An in-memory trace records each decode with the errors it selected, with no
+/// file; a check model's raw syndrome keeps the measured value after the
+/// committed correction rewrites `syndrome`; reset clears the shot's trace.
+#[tokio::test]
+async fn in_memory_trace_and_raw_syndrome_outlive_the_commit() {
+    let mock = make_mock_decoder();
+    let coord = WindowCoordinator::new(
+        serde_json::json!({
+            "persistent_decoder": false,
+            "merge_hyperedges": false,
+            "trace_in_memory": true,
+            "buffer_radius": 0,
+        }),
+        DynDecoder::Mock(mock.clone()),
+    );
+    Coordinator::load_library(&coord, Request::new(make_test_library()))
+        .await
+        .unwrap();
+    let gid = exec_gadget(&coord, make_gadget(0, 1, vec![])).await;
+    let cid = exec_check_model(&coord, make_check_model(0, 1, gid)).await;
+    let eid = exec_error_model(&coord, make_error_model(0, 1, cid)).await;
+    // The gadget's one check fires; the decoder explains it with error 0.
+    mock.set_response(vec![0b1000_0000], vec![0]).await;
+    Coordinator::decode(
+        &coord,
+        Request::new(deq_runtime::coordinator::Outcomes {
+            gid,
+            outcomes: Some(BitVector {
+                size: 1,
+                data: vec![0b1000_0000],
+            }),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    {
+        let check_models = coord.check_models.read().await;
+        let check_model = &check_models[&cid];
+        assert_eq!(check_model.raw_syndrome.borrow().as_ref().unwrap().data, vec![0b1000_0000]);
+        assert_eq!(check_model.syndrome.borrow().as_ref().unwrap().data, vec![0]);
+    }
+    let finished: Vec<_> = coord
+        .trace_shot
+        .lock()
+        .await
+        .events
+        .iter()
+        .filter_map(|e| match &e.event {
+            Some(trace::event::Event::DecodeFinished(f)) => Some(f.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0].leader_gid, gid);
+    assert_eq!(
+        finished[0].selected_errors,
+        vec![trace::SelectedError { eid, error_index: 0 }]
+    );
+
+    reset_shot(&coord).await;
+    assert!(coord.trace_shot.lock().await.events.is_empty());
+    assert!(
+        coord.trace.lock().await.shots.is_empty(),
+        "an in-memory trace keeps no past shots"
+    );
+}
